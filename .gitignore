@@ -1,0 +1,152 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+#  Usually these files are written by a CI, but useful for local builds too
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Translations
+*.mo
+*.pot
+
+# Django stuff:
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# Flask stuff:
+instance/
+.webassets-cache
+
+# Scrapy stuff:
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+
+# PyBuilder
+target/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# pyenv
+.python-version
+
+# pipenv
+#   According to https://github.com/pypa/pipenv/issues/119#issuecomment-341162839
+#   For Python projects, Pipfile.lock is required to be pushed to version control
+#   Optionally, if you prefer not to push the lock file:
+# Pipfile.lock
+
+# poetry
+#   Similar to Pipfile.lock, poetry.lock is required to be pushed to version control
+#   Optionally, if you prefer not to push the lock file:
+# poetry.lock
+
+# pdm
+#   Similar to Pipfile.lock, pdm.lock is required to be pushed to version control
+#   Optionally, if you prefer not to push the lock file:
+# pdm.lock
+pdm.toml
+
+# PEP 582; remove simple .__pypackages__ dir
+.# __pypackages__ is a PEP 582 proposed standard but not yet implemented in CPython.
+# It may yet be adopted by CPython or other Python implementations.
+# See https://peps.python.org/pep-0582 for more information.
+.__pypackages__/
+
+# Celery stuff
+celerybeat-schedule
+celerybeat.pid
+
+# SageMath stuff
+.sage/
+*.sage.py
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# PyCharm settings
+.idea/
+*.iml
+
+# VS Code settings
+.vscode/
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# pytype
+.pytype/
+
+# Cython debug symbols
+cython_debug/ 

@@ -1,0 +1,13 @@
+ccxt
+pandas
+numpy
+TA-Lib
+APScheduler
+aiohttp
+openpyxl
+SQLAlchemy
+python-dotenv
+PyYAML
+loguru
+python-telegram-bot
+discord.py 
