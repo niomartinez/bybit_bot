@@ -36,7 +36,14 @@
             "lookback_left": 5,
             "lookback_right": 5
         },
+        "swing_points_5m": {
+            "lookback_left": 3,
+            "lookback_right": 3
+        },
         "bos": {
+            "confirmation_candles": 1
+        },
+        "bos_5m": {
             "confirmation_candles": 1
         },
         "fvg": {
@@ -48,7 +55,9 @@
             "golden_pocket_lower": 0.618
         },
         "poi_confluence": {
-            "min_confidence_score": 3
+            "min_confidence_score": 3,
+            "bos_retest_tolerance_percent": 0.1, 
+            "fib_fvg_overlap_tolerance_percent": 0.05 
         },
         "entry_logic_5m": {
             "use_fvg_entry": true,

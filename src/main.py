@@ -3,6 +3,7 @@ import asyncio # Import asyncio
 from src.config_manager import config_manager
 from src.logging_service import logger_instance as logger # Renaming for convenience
 from src.data_ingestion import DataIngestionModule # Import DataIngestionModule
+from src.analysis_engine import AnalysisEngine # Import AnalysisEngine
 
 async def main(): # Make main async
     logger.info("Crypto Scanner Bot starting...")
@@ -12,11 +13,14 @@ async def main(): # Make main async
 
     # Initialize Data Ingestion Module
     data_module = DataIngestionModule(config_manager, logger)
-    initialized = await data_module.initialize() # Call the new async initialize method
-
-    if not initialized or not data_module.exchange: # Check initialization success
+    if not await data_module.initialize():
         logger.error("Failed to initialize Data Ingestion Module. Exiting.")
         return
+
+    # Pass data_module to AnalysisEngine
+    analysis_engine = AnalysisEngine(config_manager, logger, data_module)
+    # risk_manager = RiskManagementModule(config_manager, logger)
+    # signal_alerter = SignalAlerter(config_manager, logger)
 
     # Example: Fetch data for the first coin in the scan list
     coins_to_scan = config_manager.get("portfolio.coins_to_scan", [])

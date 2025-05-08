@@ -7,7 +7,7 @@
 
 This document outlines the technical and architectural plan for developing a Python-based system to support the "5m/15m BOS/FVG/Fib Confluence - $1 Fixed Risk" trading strategy.
 
-* **Primary Goal (Scanner):** Develop a Python application that connects to a Centralized Exchange (CEX) API to scan the top N cryptocurrencies by volume. The scanner will identify potential trading setups based on the predefined strategy rules, focusing on 15-minute contextual analysis and 5-minute entry signals.
+* **Primary Goal (Scanner):** Develop a Python application that connects to a Centralized Exchange (CEX) API to **continuously scan (e.g., every 5 minutes)** the **top N cryptocurrencies by volume (potentially filtered by category, e.g., USDT perpetuals)**. The scanner will identify potential trading setups based on the predefined strategy rules, focusing on 15-minute contextual analysis and 5-minute entry signals.
 * **Secondary Goal (Automated Journaling):** Automatically log identified setups, trade parameters, and (if bot is developed) trade outcomes to a structured format (e.g., CSV/Excel/Database).
 * **Tertiary Goal (Algorithmic Bot - Future Extension):** Extend the scanner into a fully algorithmic trading bot capable of executing trades (entry, stop-loss, take-profit) based on the scanner's signals and managing them according to the strategy's risk parameters ($1 fixed risk per trade).
 * **Quaternary Goal (AI Implementation - Future Research):** Explore the potential of integrating AI/ML models to refine subjective aspects of the strategy, such as optimizing SL/TP placement, dynamic confidence scoring, or market regime identification.
