@@ -36,16 +36,32 @@ class ConfigManager:
         # These keys in .env will take precedence if also defined (though unlikely) in config.json
         api_key_env = self.settings.get('cex_api', {}).get('api_key_env_var', 'BYBIT_API_KEY')
         api_secret_env = self.settings.get('cex_api', {}).get('api_secret_env_var', 'BYBIT_API_SECRET')
+        # Ensure cex_api dict exists if it wasn't in the original json
+        if 'cex_api' not in self.settings:
+            self.settings['cex_api'] = {}
         self.settings['cex_api']['api_key'] = os.getenv(api_key_env)
         self.settings['cex_api']['api_secret'] = os.getenv(api_secret_env)
 
-        # Determine active API URL based on testnet flag
-        is_testnet = self.settings.get('cex_api', {}).get('testnet', False)
-        api_urls = self.settings.get('cex_api', {}).get('api_urls', {})
+        # Determine active API URL based on testnet and demo_mode flags
+        cex_api_settings = self.settings.get('cex_api', {})
+        is_testnet = cex_api_settings.get('testnet', False)
+        is_demo = cex_api_settings.get('demo_mode', False)
+        api_urls = cex_api_settings.get('api_urls', {})
+        
         if is_testnet:
-            self.settings['cex_api']['active_api_url'] = api_urls.get('testnet')
+            active_url = api_urls.get('testnet')
+            print("ConfigManager: Using Testnet API URL.")
+        elif is_demo:
+            active_url = api_urls.get('demo_mainnet')
+            print("ConfigManager: Using Mainnet Demo API URL.")
         else:
-            self.settings['cex_api']['active_api_url'] = api_urls.get('mainnet')
+            active_url = api_urls.get('mainnet')
+            print("ConfigManager: Using Mainnet Live API URL.")
+            
+        if not active_url:
+            print(f"Warning: Could not determine active API URL for testnet={is_testnet}, demo={is_demo}. Check api_urls in config.")
+        
+        self.settings['cex_api']['active_api_url'] = active_url
 
         # Load notification secrets if enabled
         if self.settings.get('notifications', {}).get('enable_telegram', False):

@@ -1,16 +1,18 @@
 {
     "cex_api": {
         "exchange_id": "bybit",
-        "testnet": true,
+        "testnet": false,
+        "demo_mode": false,
         "api_urls": {
             "testnet": "https://api-testnet.bybit.com",
             "mainnet": "https://api.bybit.com",
             "demo_mainnet": "https://api-demo.bybit.com" 
         },
-        "api_key_env_var": "TESTNET_BYBIT_API_KEY",
-        "api_secret_env_var": "TESTNET_BYBIT_API_SECRET",
+        "api_key_env_var": "MAINNET_LIVE_BYBIT_API_KEY",
+        "api_secret_env_var": "MAINNET_LIVE_BYBIT_API_SECRET",
         "rate_limit_retry_attempts": 5,
-        "rate_limit_retry_delay_seconds": 60
+        "rate_limit_retry_delay_seconds": 60,
+        "rate_limit_test_delay_seconds": 1
     },
     "secrets_env_file": ".env",
     "logging": {
@@ -18,6 +20,10 @@
         "log_level": "INFO",
         "log_rotation_size_mb": 10,
         "log_backup_count": 5
+    },
+    "scanner": {
+        "scan_interval_minutes": 5,
+        "delay_between_symbols_seconds": 0.5 
     },
     "portfolio": {
         "coins_to_scan": [

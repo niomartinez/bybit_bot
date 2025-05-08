@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 from typing import Dict, Any, Optional, Tuple, List
+from pathlib import Path
 
 class AnalysisEngine:
     def __init__(self, config_manager, logger_object, data_ingestion_module=None):
@@ -558,7 +559,112 @@ class AnalysisEngine:
 
         return df_15m_with_entries
 
-# Example usage (for testing)
+    async def run_analysis(self, symbol: str) -> List[Dict[str, Any]]:
+        """
+        Runs the full analysis pipeline for a single symbol.
+        1. Fetch 15m data.
+        2. Run 15m analysis (Swings, BOS, Impulse, Fibs, FVGs, POIs).
+        3. If POIs found, run 5m analysis for entry signals.
+        4. Format and return found entry signals as a list of dictionaries.
+        """
+        self.logger.debug(f"Running full analysis for {symbol}...")
+        signals_found = []
+
+        try:
+            # --- 1. Fetch 15m Data --- 
+            timeframe_15m = self.strategy_params.get("strategy_params.timeframes.contextual", "15m")
+            # Fetch enough data for lookbacks and context
+            ohlcv_df_15m = await self.data_ingestion_module.fetch_ohlcv(symbol=symbol, timeframe=timeframe_15m, limit=500) 
+
+            if ohlcv_df_15m is None or ohlcv_df_15m.empty:
+                self.logger.warning(f"Could not fetch 15m OHLCV data for {symbol}. Skipping analysis.")
+                return []
+            
+            # --- 2. Run 15m Analysis --- 
+            df_15m_swings = self.detect_swing_points(ohlcv_df_15m.copy(), timeframe_key=None)
+            df_15m_bos = self.detect_bos(df_15m_swings, timeframe_key=None)
+            df_15m_impulse = self.identify_impulse_leg(df_15m_bos)
+            df_15m_fvg = self.detect_fvg(df_15m_impulse.copy(), timeframe_key=None) 
+            df_15m_poi = self.find_poi_confluence(df_15m_fvg)
+
+            # --- 3. Find 5m Entry Signals based on 15m POIs --- 
+            df_with_5m_entries = await self.find_5m_entry_signals(df_15m_poi.copy(), symbol)
+
+            # --- 4. Format Output --- 
+            entry_signals_df = df_with_5m_entries[df_with_5m_entries['entry_5m_time'].notna()].copy()
+            
+            if not entry_signals_df.empty:
+                self.logger.info(f"Formatting {len(entry_signals_df)} entry signals found for {symbol}.")
+                # Select and rename columns for the final signal dictionary
+                entry_signals_df.rename(columns={
+                    'entry_5m_time': 'timestamp', # Use 5m entry time as signal time
+                    'poi_type': 'direction', 
+                    'entry_5m_price': 'entry_price',
+                    'entry_5m_sl_price': 'stop_loss_price',
+                    'poi_confidence_score': 'confidence_score',
+                    'bullish_bos_level': 'bos_level_15m_bullish', # Keep separate potentially?
+                    'bearish_bos_level': 'bos_level_15m_bearish',
+                    'poi_low_price': 'fvg_low_15m', # POI range represents FVG generally
+                    'poi_high_price': 'fvg_high_15m',
+                    'fib_levels': 'fib_levels_15m_data', # Keep the dict
+                    'entry_5m_type': 'entry_trigger_5m'
+                }, inplace=True)
+
+                # Add symbol column
+                entry_signals_df['symbol'] = symbol
+                
+                # Convert fib_levels dict to string representation for easier logging/alerting
+                # Also maybe extract which specific fib levels were touched
+                entry_signals_df['fib_levels_15m_touched'] = entry_signals_df.apply(self._format_fib_levels, axis=1)
+                
+                # Select columns needed for alerting/journaling
+                output_columns = [
+                    'timestamp', 'symbol', 'direction', 'confidence_score',
+                    'entry_price', 'stop_loss_price', 
+                    'bos_level_15m_bullish', 'bos_level_15m_bearish',
+                    'fvg_low_15m', 'fvg_high_15m', 'fib_levels_15m_touched',
+                    'entry_trigger_5m'
+                    # Position size, risk, TPs will be added in main loop
+                ]
+                # Filter for columns that actually exist in the dataframe
+                existing_output_columns = [col for col in output_columns if col in entry_signals_df.columns]
+                signals_df_final = entry_signals_df[existing_output_columns]
+                
+                # Convert DataFrame rows to list of dictionaries
+                signals_found = signals_df_final.to_dict(orient='records')
+                
+                # Convert Timestamps to ISO strings
+                for signal in signals_found:
+                    if pd.notna(signal.get('timestamp')):
+                        signal['timestamp'] = signal['timestamp'].isoformat()
+                    # Combine bullish/bearish BOS levels into one field for simplicity?
+                    signal['bos_level_15m'] = signal.pop('bos_level_15m_bullish', None) or signal.pop('bos_level_15m_bearish', None)
+                    if signal['bos_level_15m'] is None: signal['bos_level_15m'] = 'N/A'
+
+            else:
+                 self.logger.debug(f"No 5m entry signals met criteria for {symbol}.")
+
+        except Exception as e:
+            self.logger.error(f"Error during analysis pipeline for {symbol}: {e}", exc_info=True)
+            return [] # Return empty list on error
+
+        self.logger.debug(f"Finished analysis for {symbol}, found {len(signals_found)} signals.")
+        return signals_found
+
+    def _format_fib_levels(self, row) -> str:
+        """Helper function to format Fibonacci levels data for output."""
+        fib_dict = row.get('fib_levels_15m_data')
+        fvg_low = row.get('fvg_low_15m')
+        fvg_high = row.get('fvg_high_15m')
+        touched = []
+        if isinstance(fib_dict, dict) and pd.notna(fvg_low) and pd.notna(fvg_high):
+            for level_key, level_price in fib_dict.items():
+                # Check if the fib level is within the FVG/POI range
+                if fvg_low <= level_price <= fvg_high:
+                    touched.append(level_key)
+        return str(touched) if touched else "N/A"
+
+# Example usage remains the same, but now calls run_analysis
 if __name__ == '__main__':
     import asyncio
     from .config_manager import config_manager
@@ -576,51 +682,26 @@ if __name__ == '__main__':
 
         analysis_engine = AnalysisEngine(config_manager, logger_instance, data_module) 
         
-        symbol_to_test = config_manager.get("portfolio.coins_to_scan", ["BTCUSDT"])[0]
-        timeframe_15m = config_manager.get("strategy_params.timeframes.contextual", "15m")
+        symbols_to_test = config_manager.get("portfolio.coins_to_scan", ["BTCUSDT", "ETHUSDT"])
         
-        logger_instance.info(f"Fetching 15m data for {symbol_to_test} ({timeframe_15m})...")
-        ohlcv_df_15m = await data_module.fetch_ohlcv(symbol=symbol_to_test, timeframe=timeframe_15m, limit=500) 
+        all_test_signals = []
+        for symbol in symbols_to_test:
+            logger_instance.info(f"--- Running analysis for {symbol} ---")
+            signals = await analysis_engine.run_analysis(symbol)
+            logger_instance.info(f"Analysis for {symbol} completed. Found {len(signals)} signals.")
+            if signals:
+                logger_instance.info(f"Signal(s) for {symbol}: {signals}")
+                all_test_signals.extend(signals)
+            await asyncio.sleep(1) # Avoid rate limits
 
-        if ohlcv_df_15m is None or ohlcv_df_15m.empty:
-            logger_instance.error(f"Could not fetch 15m OHLCV data for {symbol_to_test}. Aborting test.")
-            await data_module.close()
-            return
-        
-        logger_instance.info(f"Fetched {len(ohlcv_df_15m)} 15m candles for {symbol_to_test}.")
-
-        logger_instance.info("Running 15m analysis (Swing Points, BOS, Impulse Legs, Fibs, FVGs, POIs)...")
-        df_15m_swings = analysis_engine.detect_swing_points(ohlcv_df_15m.copy(), timeframe_key=None)
-        df_15m_bos = analysis_engine.detect_bos(df_15m_swings, timeframe_key=None)
-        df_15m_impulse = analysis_engine.identify_impulse_leg(df_15m_bos)
-        df_15m_fvg = analysis_engine.detect_fvg(df_15m_impulse.copy(), timeframe_key=None) 
-        df_15m_poi = analysis_engine.find_poi_confluence(df_15m_fvg)
-
-        # Log 15m POIs
-        min_conf_score_15m_test = analysis_engine.strategy_params.get('poi_confluence', {}).get('min_confidence_score', 3)
-        pois_15m_found = df_15m_poi[df_15m_poi['poi_confidence_score'] >= min_conf_score_15m_test]
-        # Format POI output safely before logging
-        poi_log_output = pois_15m_found[['poi_type', 'poi_low_price', 'poi_high_price', 'poi_confidence_score', 'poi_contributing_factors', 'fib_levels']].to_string() if not pois_15m_found.empty else 'None'
-        logger_instance.info(f"Detected {len(pois_15m_found)} 15m POIs with min_confidence_score>={min_conf_score_15m_test}:\n{poi_log_output}") # Use \n for newline
-
-        # --- 5m Entry Signal Logic ---
-        if not pois_15m_found.empty:
-            logger_instance.info(f"Proceeding to find 5m entry signals for {symbol_to_test} based on {len(pois_15m_found)} 15m POIs...")
-            df_with_5m_entries = await analysis_engine.find_5m_entry_signals(df_15m_poi.copy(), symbol_to_test)
-            
-            # Log 5m entries found (they are stored on the 15m POI rows)
-            entry_signals_5m = df_with_5m_entries[df_with_5m_entries['entry_5m_time'].notna()]
-            # Format entry signal output safely
-            entry_log_output = entry_signals_5m[[
-                'poi_type', 'poi_low_price', 'poi_high_price', 
-                'entry_5m_time', 'entry_5m_price', 'entry_5m_type', 'entry_5m_sl_price', 
-                'entry_5m_raw_data_range_start', 'entry_5m_raw_data_range_end'
-            ]].to_string() if not entry_signals_5m.empty else 'None'
-            logger_instance.info(f"Found {len(entry_signals_5m)} 5m entry signals:\n{entry_log_output}") # Use \n for newline
-        else:
-            logger_instance.info("No 15m POIs found, skipping 5m entry signal detection.")
+        logger_instance.info(f"--- Total Signals Found Across Symbols: {len(all_test_signals)} ---")
 
         await data_module.close()
         logger_instance.info("AnalysisEngine test finished.")
+
+    # Ensure logs directory exists
+    log_config = config_manager.get_logging_config()
+    log_file_path = Path(log_config.get("log_file", "logs/bot.log"))
+    log_file_path.parent.mkdir(parents=True, exist_ok=True)
 
     asyncio.run(test_analysis_engine()) 
