@@ -112,8 +112,10 @@ class AnalysisEngine:
                         
                         if confirmed:
                             bos_confirm_time = df.index[i + confirmation_candles - 1]
+                            # First set the numeric value
                             df.loc[bos_confirm_time, 'bullish_bos_level'] = active_sh_price
-                            df.loc[bos_confirm_time, 'bullish_bos_src_time'] = active_sh_time
+                            # Then set the datetime value using proper conversion to avoid FutureWarning
+                            df.at[bos_confirm_time, 'bullish_bos_src_time'] = pd.to_datetime(active_sh_time)
                             active_sh_price = np.nan 
                             active_sh_time = pd.NaT
             
@@ -128,8 +130,10 @@ class AnalysisEngine:
                         
                         if confirmed:
                             bos_confirm_time = df.index[i + confirmation_candles - 1]
+                            # First set the numeric value
                             df.loc[bos_confirm_time, 'bearish_bos_level'] = active_sl_price
-                            df.loc[bos_confirm_time, 'bearish_bos_src_time'] = active_sl_time
+                            # Then set the datetime value using proper conversion to avoid FutureWarning
+                            df.at[bos_confirm_time, 'bearish_bos_src_time'] = pd.to_datetime(active_sl_time)
                             active_sl_price = np.nan 
                             active_sl_time = pd.NaT
         return df
@@ -170,21 +174,15 @@ class AnalysisEngine:
                         impulse_end_price = subsequent_swing_highs.iloc[0]
                         
                         if impulse_end_price > impulse_start_price:
-                            df.at[current_event_time, 'impulse_leg_start_time'] = impulse_start_time
+                            # Use pd.to_datetime to convert timestamps properly
+                            df.at[current_event_time, 'impulse_leg_start_time'] = pd.to_datetime(impulse_start_time)
                             df.at[current_event_time, 'impulse_leg_start_price'] = impulse_start_price
-                            df.at[current_event_time, 'impulse_leg_end_time'] = impulse_end_time
+                            df.at[current_event_time, 'impulse_leg_end_time'] = pd.to_datetime(impulse_end_time)
                             df.at[current_event_time, 'impulse_leg_end_price'] = impulse_end_price
                             df.at[current_event_time, 'impulse_direction'] = 'bullish'
                             
                             fib_data = self.calculate_fibonacci_levels(impulse_end_price, impulse_start_price, 'bullish')
                             df.at[current_event_time, 'fib_levels'] = fib_data
-
-                        # else:
-                            # self.logger.warning(f"Bullish BOS at {current_event_time}: Identified impulse end {impulse_end_price}@{impulse_end_time} is not higher than start {impulse_start_price}@{impulse_start_time}. Leg ignored.")
-                    # else:
-                        # self.logger.debug(f"Bullish BOS at {current_event_time}: No subsequent swing high found after BOS to define impulse end.")
-                # else:
-                    # self.logger.debug(f"Bullish BOS at {current_event_time}: No prior swing low found to define impulse start.")
 
             elif pd.notna(df['bearish_bos_level'].iloc[i]):
                 bos_src_time = df['bearish_bos_src_time'].iloc[i]
@@ -204,21 +202,15 @@ class AnalysisEngine:
                         impulse_end_price = subsequent_swing_lows.iloc[0]
 
                         if impulse_end_price < impulse_start_price:
-                            df.at[current_event_time, 'impulse_leg_start_time'] = impulse_start_time
+                            # Use pd.to_datetime to convert timestamps properly
+                            df.at[current_event_time, 'impulse_leg_start_time'] = pd.to_datetime(impulse_start_time)
                             df.at[current_event_time, 'impulse_leg_start_price'] = impulse_start_price
-                            df.at[current_event_time, 'impulse_leg_end_time'] = impulse_end_time
+                            df.at[current_event_time, 'impulse_leg_end_time'] = pd.to_datetime(impulse_end_time)
                             df.at[current_event_time, 'impulse_leg_end_price'] = impulse_end_price
                             df.at[current_event_time, 'impulse_direction'] = 'bearish'
 
                             fib_data = self.calculate_fibonacci_levels(impulse_start_price, impulse_end_price, 'bearish')
                             df.at[current_event_time, 'fib_levels'] = fib_data
-                            # self.logger.debug(f"Bearish Impulse Leg for BOS at {current_event_time}: Starts {impulse_start_price}@{impulse_start_time}, Ends {impulse_end_price}@{impulse_end_time}")
-                        # else:
-                            # self.logger.warning(f"Bearish BOS at {current_event_time}: Identified impulse end {impulse_end_price}@{impulse_end_time} is not lower than start {impulse_start_price}@{impulse_start_time}. Leg ignored.")
-                    # else:
-                        # self.logger.debug(f"Bearish BOS at {current_event_time}: No subsequent swing low found after BOS to define impulse end.")
-                # else:
-                    # self.logger.debug(f"Bearish BOS at {current_event_time}: No prior swing high found to define impulse start.")
         return df
 
     def calculate_fibonacci_levels(self, impulse_leg_high: float, impulse_leg_low: float, direction: str) -> Dict[str, float]:
@@ -376,10 +368,11 @@ class AnalysisEngine:
                         # self.logger.info(f"POI Confirmed at {fvg_time} ({direction}): Score={current_confidence}, Factors={contributing_factors}, POI Range=({fvg_low}-{fvg_high})")
         return df
 
-    async def find_5m_entry_signals(self, df_15m_processed: pd.DataFrame, symbol: str) -> pd.DataFrame:
+    async def find_5m_entry_signals(self, df_15m_processed: pd.DataFrame, symbol: str, ohlcv_df_15m_context: pd.DataFrame) -> pd.DataFrame:
         """
         Identifies 5m entry signals based on 15m POIs.
         Fetches 5m data, runs 5m analysis (swings, BOS, FVGs), and checks entry conditions.
+        Uses ohlcv_df_15m_context for Stage 2 validation against the latest 15m close.
         """
         if self.data_ingestion_module is None:
             self.logger.error("DataIngestionModule not available. Cannot fetch 5m data or find 5m entry signals.")
@@ -390,6 +383,8 @@ class AnalysisEngine:
         df_15m_with_entries['entry_5m_price'] = np.nan
         df_15m_with_entries['entry_5m_type'] = None # 'FVG_MITIGATION', 'MSS_RETEST'
         df_15m_with_entries['entry_5m_sl_price'] = np.nan
+        # Add column for hypothetical TP
+        df_15m_with_entries['hypothetical_tp_price'] = np.nan 
         df_15m_with_entries['entry_5m_raw_data_range_start'] = pd.Series(index=df_15m_with_entries.index, dtype='datetime64[ns]')
         df_15m_with_entries['entry_5m_raw_data_range_end'] = pd.Series(index=df_15m_with_entries.index, dtype='datetime64[ns]')
 
@@ -417,8 +412,9 @@ class AnalysisEngine:
             fetch_5m_start_time = poi_15m_time - pd.Timedelta(minutes=num_15m_candles_back_for_5m * context_timeframe_duration_minutes)
             fetch_5m_end_time = poi_15m_time + pd.Timedelta(minutes=num_15m_candles_forward_for_5m * context_timeframe_duration_minutes)
             
-            df_15m_with_entries.at[poi_15m_time, 'entry_5m_raw_data_range_start'] = fetch_5m_start_time
-            df_15m_with_entries.at[poi_15m_time, 'entry_5m_raw_data_range_end'] = fetch_5m_end_time
+            # Use pd.to_datetime to properly convert timestamps
+            df_15m_with_entries.at[poi_15m_time, 'entry_5m_raw_data_range_start'] = pd.to_datetime(fetch_5m_start_time)
+            df_15m_with_entries.at[poi_15m_time, 'entry_5m_raw_data_range_end'] = pd.to_datetime(fetch_5m_end_time)
 
             df_5m = await self.data_ingestion_module.fetch_ohlcv(
                 symbol=symbol, 
@@ -440,10 +436,6 @@ class AnalysisEngine:
 
             df_5m = self.detect_swing_points(df_5m, timeframe_key='5m')
             df_5m = self.detect_fvg(df_5m, timeframe_key='5m')
-            
-            # Iterate through 5m candles *after* price has entered the 15m POI zone
-            # The POI time (fvg_time on 15m) is our reference. We look for entries *after* this time.
-            # candles_after_poi_touch_or_entry_into_poi = df_5m[df_5m.index >= poi_15m_time] # Start looking from the 15m POI candle forward
             
             # State variables for tracking 5m interaction within the POI
             has_entered_poi = False
@@ -545,124 +537,111 @@ class AnalysisEngine:
                 if pd.notna(entry_price) and pd.notna(sl_price):
                     # Check if an entry wasn't already recorded for this 15m POI
                     if pd.isna(df_15m_with_entries.at[poi_15m_time, 'entry_5m_time']):
-                         df_15m_with_entries.at[poi_15m_time, 'entry_5m_time'] = idx_5m
+                         # Calculate hypothetical TP1 (e.g., 2R)
+                         hypothetical_tp = np.nan
+                         try:
+                             sl_distance = abs(entry_price - sl_price)
+                             if sl_distance > 0: # Avoid division by zero
+                                 # Get first RR target from config
+                                 tp_params = self.strategy_params.get('strategy_params.take_profit', {})
+                                 fixed_rr_ratios = tp_params.get('fixed_rr_ratios', [2.0]) # Default to 2R
+                                 primary_rr_target = fixed_rr_ratios[0] if fixed_rr_ratios else 2.0
+                                 
+                                 if poi_15m_type == 'bullish':
+                                     hypothetical_tp = entry_price + (sl_distance * primary_rr_target)
+                                 elif poi_15m_type == 'bearish':
+                                     hypothetical_tp = entry_price - (sl_distance * primary_rr_target)
+                         except Exception as e:
+                             self.logger.warning(f"Could not calculate hypothetical TP for {symbol} at {idx_5m}: {e}")
+
+                         # Use pd.to_datetime to properly convert timestamps
+                         df_15m_with_entries.at[poi_15m_time, 'entry_5m_time'] = pd.to_datetime(idx_5m)
                          df_15m_with_entries.at[poi_15m_time, 'entry_5m_price'] = entry_price
                          df_15m_with_entries.at[poi_15m_time, 'entry_5m_type'] = entry_type
                          df_15m_with_entries.at[poi_15m_time, 'entry_5m_sl_price'] = sl_price
-                         entry_found_for_poi = True # Mark entry found for this POI
-                         # Don't break here immediately, allow loop to finish current candle analysis (in case multiple conditions met, though unlikely with current logic)
+                         df_15m_with_entries.at[poi_15m_time, 'hypothetical_tp_price'] = hypothetical_tp # Store it
+
+                         # --- NEW VALIDATION STEP (LOCAL 5M) --- 
+                         is_valid_entry = True
+                         if pd.notna(hypothetical_tp):
+                             # --- TEMP DEBUG LOG ---
+                             self.logger.debug(f"LOCAL 5M VALIDATION for {symbol} at {idx_5m}: Entry={entry_price}, SL={sl_price}, HypoTP={hypothetical_tp}")
+                             subsequent_candles_for_debug = df_5m.loc[idx_5m:]
+                             if not subsequent_candles_for_debug.empty:
+                                 self.logger.debug(f"Subsequent 5m Highs for local validation: {subsequent_candles_for_debug['high'].tolist()}")
+                                 self.logger.debug(f"Subsequent 5m Lows for local validation: {subsequent_candles_for_debug['low'].tolist()}")
+                             else:
+                                 self.logger.debug("No subsequent 5m candles for local validation check.")
+                             # --- END TEMP DEBUG LOG ---
+
+                             # Check subsequent 5m candles from the entry candle onwards
+                             subsequent_candles = df_5m.loc[idx_5m:] 
+                             if poi_15m_type == 'bullish':
+                                 if not subsequent_candles.empty and (subsequent_candles['high'] >= hypothetical_tp).any():
+                                     self.logger.info(f"LOCAL INVALIDATION (Post-Entry Check): Bullish 5m entry at {idx_5m} for {symbol} already hit/exceeded hypo TP {hypothetical_tp:.4f}")
+                                     is_valid_entry = False
+                             elif poi_15m_type == 'bearish':
+                                 if not subsequent_candles.empty and (subsequent_candles['low'] <= hypothetical_tp).any():
+                                     self.logger.info(f"LOCAL INVALIDATION (Post-Entry Check): Bearish 5m entry at {idx_5m} for {symbol} already hit/exceeded hypo TP {hypothetical_tp:.4f}")
+                                     is_valid_entry = False
+                         
+                         if not is_valid_entry:
+                             # Clear the potential entry info for this POI if invalidated
+                             df_15m_with_entries.loc[poi_15m_time, ['entry_5m_time', 'entry_5m_price', 'entry_5m_type', 'entry_5m_sl_price', 'hypothetical_tp_price']] = [pd.NaT, np.nan, None, np.nan, np.nan]
+                             continue # Skip to next 5m candle, maybe another trigger will appear later?
+                         # --- END NEW VALIDATION STEP (LOCAL 5M) ---
+
+                         entry_found_for_poi = True # Mark entry found for this POI (and validated)
                     # else: Log that an entry was already found? Maybe not necessary.
 
             
             if not entry_found_for_poi:
                  self.logger.info(f"No 5m entry signal found for 15m POI at {poi_15m_time} for {symbol} within the scanned 5m window.")
 
-        return df_15m_with_entries
+        # --- 4. Format and Filter Output --- 
+        # This df_15m_with_entries is actually what we want to return with all annotations
+        # The filtering to entry_signals_df should happen in run_analysis if needed, 
+        # or we rename this to make it clear it contains all info for potential signals.
+        
+        # --- STAGE 2 VALIDATION (using latest 15m close from the passed context DF) ---
+        # This should be applied to the signals identified within *this* function call for *this* symbol
+        # before returning the DataFrame.
+        
+        # Create a temporary DataFrame of only the rows that have potential 5m entries for this POI set
+        potential_entries_df = df_15m_with_entries[df_15m_with_entries['entry_5m_time'].notna()].copy()
 
-    async def run_analysis(self, symbol: str) -> List[Dict[str, Any]]:
-        """
-        Runs the full analysis pipeline for a single symbol.
-        1. Fetch 15m data.
-        2. Run 15m analysis (Swings, BOS, Impulse, Fibs, FVGs, POIs).
-        3. If POIs found, run 5m analysis for entry signals.
-        4. Format and return found entry signals as a list of dictionaries.
-        """
-        self.logger.debug(f"Running full analysis for {symbol}...")
-        signals_found = []
+        if not potential_entries_df.empty and not ohlcv_df_15m_context.empty:
+            current_15m_close_price = ohlcv_df_15m_context['close'].iloc[-1]
+            current_15m_time = ohlcv_df_15m_context.index[-1]
+            self.logger.debug(f"STAGE 2 VALIDATION for {symbol} (within find_5m_entry_signals): Current 15m Close={current_15m_close_price} at {current_15m_time}")
 
-        try:
-            # --- 1. Fetch 15m Data --- 
-            timeframe_15m = self.strategy_params.get("strategy_params.timeframes.contextual", "15m")
-            # Fetch enough data for lookbacks and context
-            ohlcv_df_15m = await self.data_ingestion_module.fetch_ohlcv(symbol=symbol, timeframe=timeframe_15m, limit=500) 
+            rows_to_invalidate_indices = []
 
-            if ohlcv_df_15m is None or ohlcv_df_15m.empty:
-                self.logger.warning(f"Could not fetch 15m OHLCV data for {symbol}. Skipping analysis.")
-                return []
+            for index, signal_row in potential_entries_df.iterrows():
+                hypo_tp = signal_row.get('hypothetical_tp_price')
+                entry_price = signal_row.get('entry_5m_price')
+                direction = signal_row.get('poi_type') # Original direction
+                entry_time = signal_row.get('entry_5m_time')
+
+                if pd.notna(hypo_tp) and pd.notna(entry_price) and direction:
+                    if direction == 'bullish' and current_15m_close_price >= hypo_tp:
+                        self.logger.info(f"STAGE 2 INVALIDATION: Bullish signal for {symbol} at {entry_time}. Entry: {entry_price:.4f}, Hypo TP: {hypo_tp:.4f}, Current 15m Close: {current_15m_close_price:.4f}")
+                        rows_to_invalidate_indices.append(index)
+                    elif direction == 'bearish' and current_15m_close_price <= hypo_tp:
+                        self.logger.info(f"STAGE 2 INVALIDATION: Bearish signal for {symbol} at {entry_time}. Entry: {entry_price:.4f}, Hypo TP: {hypo_tp:.4f}, Current 15m Close: {current_15m_close_price:.4f}")
+                        rows_to_invalidate_indices.append(index)
+                else:
+                    self.logger.warning(f"STAGE 2 VALIDATION: Skipping check for signal {symbol} at {entry_time} due to missing hypo_tp, entry_price, or direction. Signal kept (for now).")
             
-            # --- 2. Run 15m Analysis --- 
-            df_15m_swings = self.detect_swing_points(ohlcv_df_15m.copy(), timeframe_key=None)
-            df_15m_bos = self.detect_bos(df_15m_swings, timeframe_key=None)
-            df_15m_impulse = self.identify_impulse_leg(df_15m_bos)
-            df_15m_fvg = self.detect_fvg(df_15m_impulse.copy(), timeframe_key=None) 
-            df_15m_poi = self.find_poi_confluence(df_15m_fvg)
+            if rows_to_invalidate_indices:
+                # Reset the invalidated entries in the main df_15m_with_entries DataFrame
+                self.logger.info(f"Invalidating {len(rows_to_invalidate_indices)} signals for {symbol} at Stage 2 based on 15m close.")
+                for inv_idx in rows_to_invalidate_indices:
+                    df_15m_with_entries.loc[inv_idx, ['entry_5m_time', 'entry_5m_price', 'entry_5m_type', 'entry_5m_sl_price', 'hypothetical_tp_price']] = [pd.NaT, np.nan, None, np.nan, np.nan]
+        
+        # --- END STAGE 2 VALIDATION ---
 
-            # --- 3. Find 5m Entry Signals based on 15m POIs --- 
-            df_with_5m_entries = await self.find_5m_entry_signals(df_15m_poi.copy(), symbol)
-
-            # --- 4. Format Output --- 
-            entry_signals_df = df_with_5m_entries[df_with_5m_entries['entry_5m_time'].notna()].copy()
-            
-            if not entry_signals_df.empty:
-                self.logger.info(f"Formatting {len(entry_signals_df)} entry signals found for {symbol}.")
-                # Select and rename columns for the final signal dictionary
-                entry_signals_df.rename(columns={
-                    'entry_5m_time': 'timestamp', # Use 5m entry time as signal time
-                    'poi_type': 'direction', 
-                    'entry_5m_price': 'entry_price',
-                    'entry_5m_sl_price': 'stop_loss_price',
-                    'poi_confidence_score': 'confidence_score',
-                    'bullish_bos_level': 'bos_level_15m_bullish', # Keep separate potentially?
-                    'bearish_bos_level': 'bos_level_15m_bearish',
-                    'poi_low_price': 'fvg_low_15m', # POI range represents FVG generally
-                    'poi_high_price': 'fvg_high_15m',
-                    'fib_levels': 'fib_levels_15m_data', # Keep the dict
-                    'entry_5m_type': 'entry_trigger_5m'
-                }, inplace=True)
-
-                # Add symbol column
-                entry_signals_df['symbol'] = symbol
-                
-                # Convert fib_levels dict to string representation for easier logging/alerting
-                # Also maybe extract which specific fib levels were touched
-                entry_signals_df['fib_levels_15m_touched'] = entry_signals_df.apply(self._format_fib_levels, axis=1)
-                
-                # Select columns needed for alerting/journaling
-                output_columns = [
-                    'timestamp', 'symbol', 'direction', 'confidence_score',
-                    'entry_price', 'stop_loss_price', 
-                    'bos_level_15m_bullish', 'bos_level_15m_bearish',
-                    'fvg_low_15m', 'fvg_high_15m', 'fib_levels_15m_touched',
-                    'entry_trigger_5m'
-                    # Position size, risk, TPs will be added in main loop
-                ]
-                # Filter for columns that actually exist in the dataframe
-                existing_output_columns = [col for col in output_columns if col in entry_signals_df.columns]
-                signals_df_final = entry_signals_df[existing_output_columns]
-                
-                # Convert DataFrame rows to list of dictionaries
-                signals_found = signals_df_final.to_dict(orient='records')
-                
-                # Convert Timestamps to ISO strings
-                for signal in signals_found:
-                    if pd.notna(signal.get('timestamp')):
-                        signal['timestamp'] = signal['timestamp'].isoformat()
-                    # Combine bullish/bearish BOS levels into one field for simplicity?
-                    signal['bos_level_15m'] = signal.pop('bos_level_15m_bullish', None) or signal.pop('bos_level_15m_bearish', None)
-                    if signal['bos_level_15m'] is None: signal['bos_level_15m'] = 'N/A'
-
-                # --- Map direction string to Buy/Sell ---
-                for signal_to_map in signals_found:
-                    direction_raw = signal_to_map.get('direction') # Should be 'bullish' or 'bearish'
-                    if direction_raw == 'bullish':
-                        signal_to_map['direction'] = "Buy"
-                    elif direction_raw == 'bearish':
-                        signal_to_map['direction'] = "Sell"
-                    else:
-                        self.logger.warning(f"Unknown raw direction '{direction_raw}' in signal: {signal_to_map}. Cannot map to Buy/Sell.")
-                        # Consider how to handle this - e.g. remove the signal or flag it
-                        # For now, if it's not bullish/bearish, it might cause issues downstream if not caught.
-                # --- End map ---
-
-            else:
-                 self.logger.debug(f"No 5m entry signals met criteria for {symbol}.")
-
-        except Exception as e:
-            self.logger.error(f"Error during analysis pipeline for {symbol}: {e}", exc_info=True)
-            return [] # Return empty list on error
-
-        self.logger.debug(f"Finished analysis for {symbol}, found {len(signals_found)} signals.")
-        return signals_found
+        return df_15m_with_entries # Return the main DataFrame with invalidated entries reset
 
     def _format_fib_levels(self, row) -> str:
         """Helper function to format Fibonacci levels data for output."""
@@ -676,6 +655,187 @@ class AnalysisEngine:
                 if fvg_low <= level_price <= fvg_high:
                     touched.append(level_key)
         return str(touched) if touched else "N/A"
+
+    async def run_analysis(self, symbol: str) -> List[Dict[str, Any]]:
+        """
+        Runs the full analysis pipeline for a single symbol.
+        1. Fetch 15m data.
+        2. Run 15m analysis (Swings, BOS, Impulse, Fibs, FVGs, POIs).
+        3. If POIs found, run 5m analysis for entry signals (includes local 5m validation using its initial 5m data window).
+        4. Perform final validation of signals against fresh 5m data up to current time.
+        5. Format and return valid signals.
+        """
+        self.logger.debug(f"Running full analysis for {symbol}...")
+        signals_found = []
+        ohlcv_df_15m = pd.DataFrame() # Initialize
+
+        try:
+            # --- 1. Fetch 15m Data --- 
+            timeframe_15m = self.strategy_params.get("strategy_params.timeframes.contextual", "15m")
+            ohlcv_df_15m = await self.data_ingestion_module.fetch_ohlcv(symbol=symbol, timeframe=timeframe_15m, limit=500) 
+
+            if ohlcv_df_15m is None or ohlcv_df_15m.empty:
+                self.logger.warning(f"Could not fetch 15m OHLCV data for {symbol}. Skipping analysis.")
+                return []
+            
+            # --- 2. Run 15m Analysis --- 
+            df_15m_swings = self.detect_swing_points(ohlcv_df_15m.copy(), timeframe_key=None)
+            df_15m_bos = self.detect_bos(df_15m_swings, timeframe_key=None)
+            df_15m_impulse = self.identify_impulse_leg(df_15m_bos)
+            df_15m_fvg = self.detect_fvg(df_15m_impulse.copy(), timeframe_key=None) 
+            df_15m_poi = self.find_poi_confluence(df_15m_fvg)
+
+            # --- 3. Find 5m Entry Signals based on 15m POIs (includes local 5m validation) --- 
+            # Pass ohlcv_df_15m (the full 15m context) to find_5m_entry_signals for Stage 2 validation within it.
+            df_with_potential_5m_entries = await self.find_5m_entry_signals(df_15m_poi.copy(), symbol, ohlcv_df_15m.copy())
+
+            # Extract signals that have an entry_5m_time (passed local and Stage 2 (15m close) validations within find_5m_entry_signals)
+            candidate_signals_df = df_with_potential_5m_entries[df_with_potential_5m_entries['entry_5m_time'].notna()].copy()
+
+            # --- 4. Final Validation against Fresh 5m Data (up to current time) --- 
+            truly_valid_signals = []
+            if not candidate_signals_df.empty:
+                self.logger.info(f"Performing FINAL VALIDATION for {len(candidate_signals_df)} candidate signal(s) for {symbol}...")
+                timeframe_5m = self.strategy_params.get("strategy_params.timeframes.execution", "5m")
+                # How many recent 5m candles to fetch for this final check, e.g., last 12 hours = 144 candles
+                # Max Bybit limit is 1000. We need enough to cover from signal time to now if signal is old.
+                # Let's fetch a fixed recent window and then filter from signal time if signal is recent,
+                # or fetch from signal time if signal is older than this window.
+                recent_window_candles = self.strategy_params.get('analysis_engine.final_validation_recent_candles', 288) # e.g., 24 hours
+
+                # Fetch one batch of recent 5m data for the symbol to avoid multiple small API calls
+                # This data will be from (now - recent_window_candles) up to now.
+                latest_5m_data_for_symbol = await self.data_ingestion_module.fetch_ohlcv(
+                    symbol=symbol,
+                    timeframe=timeframe_5m,
+                    limit=recent_window_candles 
+                )
+
+                if latest_5m_data_for_symbol is None or latest_5m_data_for_symbol.empty:
+                    self.logger.warning(f"Could not fetch latest 5m data for {symbol} for final validation. Signals will be kept without this check.")
+                    # If we can't get fresh data, we might have to skip this validation for these signals
+                    # or handle it by keeping them (less safe) or discarding them (safer but might miss opportunities if API is flaky)
+                    # For now, let's keep them with a warning.
+                    for _, signal_row in candidate_signals_df.iterrows():
+                         truly_valid_signals.append(signal_row.to_dict())
+                else:
+                    for _, signal_row in candidate_signals_df.iterrows():
+                        entry_timestamp_dt = pd.to_datetime(signal_row['entry_5m_time'])
+                        hypo_tp = signal_row.get('hypothetical_tp_price')
+                        entry_price = signal_row.get('entry_5m_price')
+                        direction = signal_row.get('poi_type') # Original direction bullish/bearish
+
+                        if not all([pd.notna(entry_timestamp_dt), pd.notna(hypo_tp), pd.notna(entry_price), direction]):
+                            self.logger.warning(f"Signal at {entry_timestamp_dt} for {symbol} missing data for final validation (in run_analysis). Keeping it.")
+                            truly_valid_signals.append(signal_row.to_dict())
+                            continue
+
+                        # Filter the already fetched latest_5m_data_for_symbol to get candles from the signal's entry time onwards
+                        validation_data_segment = latest_5m_data_for_symbol[latest_5m_data_for_symbol.index >= entry_timestamp_dt]
+                        
+                        # If the signal is older than our `recent_window_candles` fetch, we need to fetch specifically for it.
+                        # This condition checks if the earliest time in our fresh batch is still after the signal's entry time.
+                        if validation_data_segment.empty and not latest_5m_data_for_symbol.empty and latest_5m_data_for_symbol.index.min() > entry_timestamp_dt:
+                            self.logger.info(f"Signal for {symbol} at {entry_timestamp_dt} is older than recent data window. Fetching specific segment for final validation...")
+                            validation_data_segment = await self.data_ingestion_module.fetch_ohlcv(
+                                symbol=symbol,
+                                timeframe=timeframe_5m,
+                                since=int(entry_timestamp_dt.timestamp() * 1000),
+                                limit=self.strategy_params.get('analysis_engine.final_validation_old_signal_candles', 500) # Fetch more for older signals
+                            )
+                            if validation_data_segment is not None and not validation_data_segment.empty:
+                                validation_data_segment = validation_data_segment[validation_data_segment.index >= entry_timestamp_dt]
+                            else:
+                                self.logger.warning(f"Could not fetch specific older 5m data for final validation of signal at {entry_timestamp_dt} for {symbol}. Signal kept.")
+                                truly_valid_signals.append(signal_row.to_dict())
+                                continue # Next signal
+                        
+                        is_invalid_final = False
+                        if validation_data_segment is not None and not validation_data_segment.empty:
+                            if direction == 'bullish':
+                                if (validation_data_segment['high'] >= hypo_tp).any():
+                                    is_invalid_final = True
+                                    self.logger.info(f"FINAL VALIDATION: Bullish signal for {symbol} at {entry_timestamp_dt} (Entry: {entry_price:.4f}, Hypo TP: {hypo_tp:.4f}) invalidated by recent 5m data (Highs: {validation_data_segment['high'].max()}).")
+                            elif direction == 'bearish':
+                                if (validation_data_segment['low'] <= hypo_tp).any():
+                                    is_invalid_final = True
+                                    self.logger.info(f"FINAL VALIDATION: Bearish signal for {symbol} at {entry_timestamp_dt} (Entry: {entry_price:.4f}, Hypo TP: {hypo_tp:.4f}) invalidated by recent 5m data (Lows: {validation_data_segment['low'].min()}).")
+                        else:
+                            # This case means either the initial fetch failed (handled above) or the signal is too recent for validation_data_segment to be populated
+                            # (e.g. signal time is in the future relative to latest_5m_data_for_symbol, which shouldn't happen for valid past signals)
+                            # Or the specific fetch for an old signal failed.
+                            self.logger.debug(f"No relevant fresh 5m data for final validation of signal at {entry_timestamp_dt} for {symbol}. Signal kept.")
+
+                        if not is_invalid_final:
+                            truly_valid_signals.append(signal_row.to_dict())
+            
+            if truly_valid_signals:
+                entry_signals_df = pd.DataFrame(truly_valid_signals)
+            else:
+                entry_signals_df = pd.DataFrame() # Empty if all invalidated or no candidates
+
+            # --- 5. Format Output --- 
+            if not entry_signals_df.empty:
+                self.logger.info(f"Formatting {len(entry_signals_df)} signals for {symbol} (after ALL validations). ")
+                # ... (rest of the formatting code remains the same)
+                entry_signals_df.rename(columns={
+                    'entry_5m_time': 'timestamp', 
+                    'poi_type': 'direction', 
+                    'entry_5m_price': 'entry_price',
+                    'entry_5m_sl_price': 'stop_loss_price',
+                    'poi_confidence_score': 'confidence_score',
+                    'bullish_bos_level': 'bos_level_15m_bullish',
+                    'bearish_bos_level': 'bos_level_15m_bearish',
+                    'poi_low_price': 'fvg_low_15m',
+                    'poi_high_price': 'fvg_high_15m',
+                    'fib_levels': 'fib_levels_15m_data', 
+                    'entry_5m_type': 'entry_trigger_5m'
+                }, inplace=True)
+
+                entry_signals_df['symbol'] = symbol
+                entry_signals_df['fib_levels_15m_touched'] = entry_signals_df.apply(self._format_fib_levels, axis=1)
+                
+                output_columns = [
+                    'timestamp', 'symbol', 'direction', 'confidence_score',
+                    'entry_price', 'stop_loss_price', 
+                    'bos_level_15m_bullish', 'bearish_bos_level',
+                    'fvg_low_15m', 'fvg_high_15m', 'fib_levels_15m_touched',
+                    'entry_trigger_5m'
+                ]
+                existing_output_columns = [col for col in output_columns if col in entry_signals_df.columns]
+                signals_df_final = entry_signals_df[existing_output_columns]
+                signals_found = signals_df_final.to_dict(orient='records')
+                
+                for signal in signals_found:
+                    signal_entry_time = signal.get('timestamp')
+                    if isinstance(signal_entry_time, pd.Timestamp):
+                        signal['timestamp'] = signal_entry_time.isoformat()
+                    elif signal_entry_time is not None: 
+                         pass 
+                    else:
+                         self.logger.warning(f"Missing timestamp in final signal dict for {signal.get('symbol')}")
+                         signal['timestamp'] = pd.Timestamp.now(tz='UTC').isoformat()
+
+                    signal['bos_level_15m'] = signal.pop('bos_level_15m_bullish', None) or signal.pop('bos_level_15m_bearish', None)
+                    if signal['bos_level_15m'] is None: signal['bos_level_15m'] = 'N/A'
+
+                for signal_to_map in signals_found:
+                    direction_raw = signal_to_map.get('direction') 
+                    if direction_raw == 'bullish':
+                        signal_to_map['direction'] = "Buy"
+                    elif direction_raw == 'bearish':
+                        signal_to_map['direction'] = "Sell"
+                    else:
+                        self.logger.warning(f"Unknown raw direction '{direction_raw}' in signal: {signal_to_map}.")
+            else:
+                 self.logger.debug(f"No entry signals remained for {symbol} after final validation.")
+        
+        except Exception as e:
+            self.logger.error(f"Error during analysis pipeline for {symbol}: {e}", exc_info=True)
+            return [] 
+
+        self.logger.debug(f"Finished analysis for {symbol}, found {len(signals_found)} signals.")
+        return signals_found
 
 # Example usage remains the same, but now calls run_analysis
 if __name__ == '__main__':

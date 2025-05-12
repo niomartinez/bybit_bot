@@ -11,25 +11,18 @@ class StateManager:
         self.journal_config = config_manager.get_journaling_config()
         self.logger = main_logger.bind(name="StateManager")
         
-        # Use the db_journal_uri from config for the state database
-        db_path_str = self.journal_config.get("db_journal_uri", "sqlite:///logs/bot_state.db")
-        # Ensure the URI starts with sqlite:///
-        if not db_path_str.startswith("sqlite:///"):
-            self.logger.warning(f"Invalid db_journal_uri format: {db_path_str}. Using default sqlite:///logs/bot_state.db")
-            db_path_str = "sqlite:///logs/bot_state.db"
-            
-        self.db_path = Path(db_path_str[len("sqlite:///"):])
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        
+        self.db_path = Path(self.journal_config.get("db_journal_file", "logs/trade_journal.db"))
+        if not self.db_path:
+            self.db_path = Path(self.config.get("database.path", "logs/trade_journal.db"))
+
         self.logger.info(f"Using state database: {self.db_path}")
         self._init_db()
 
     def _get_db_connection(self):
-        """Establishes and returns a database connection."""
         try:
-            conn = sqlite3.connect(self.db_path, timeout=10) # Add timeout
-            conn.row_factory = sqlite3.Row # Return rows as dict-like objects
-            # Enable Write-Ahead Logging for better concurrency (optional but good practice)
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(self.db_path, timeout=10)
+            conn.row_factory = sqlite3.Row 
             conn.execute("PRAGMA journal_mode=WAL;") 
             return conn
         except sqlite3.Error as e:
@@ -37,69 +30,64 @@ class StateManager:
             raise
 
     def _init_db(self):
-        """Initializes the database table if it doesn't exist."""
+        conn = self._get_db_connection()
         try:
-            with self._get_db_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute("""
+            cursor = conn.cursor()
+            cursor.execute("""
                 CREATE TABLE IF NOT EXISTS tracked_signals (
                     signal_id TEXT PRIMARY KEY,
                     symbol TEXT NOT NULL,
                     direction TEXT NOT NULL,
-                    poi_key TEXT,  -- e.g., timestamp or hash of POI details
-                    status TEXT NOT NULL, -- PENDING_ENTRY, ENTRY_FILLED, POSITION_OPEN, SL_FILLED, TP_FILLED, CANCELLED, ERROR, etc.
+                    poi_key TEXT,
+                    status TEXT NOT NULL,
                     entry_order_id TEXT,
                     sl_order_id TEXT,
                     tp_order_id TEXT, 
                     entry_signal_price REAL,
                     entry_fill_price REAL,
-                    closed_price REAL, -- Added field for closed price
-                    closed_by TEXT, -- Added field for closure reason (SL/TP)
                     sl_price REAL,
-                    tp_price REAL, -- Could store primary TP price or JSON of multiple TPs
+                    tp_price REAL, 
                     position_size REAL,
-                    filled_qty REAL, -- Added field for actual filled quantity
-                    signal_data TEXT, -- Stores the original signal data as JSON
+                    hypothetical_tp_price REAL, -- Store the initially calculated TP for validation
+                    actual_tp_ordered REAL, -- Actual TP price sent in the order
+                    signal_timestamp DATETIME, -- Timestamp of the 5m signal candle
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    signal_data TEXT, 
+                    filled_qty REAL, 
+                    closed_price REAL, 
+                    closed_by TEXT
                 )
-                """)
-                
-                # --- Add new columns if they don't exist (for existing databases) ---
-                # Function to check if a column exists
-                def column_exists(cursor, table_name, column_name):
-                    cursor.execute(f"PRAGMA table_info({table_name});")
-                    columns = [info[1] for info in cursor.fetchall()]
-                    return column_name in columns
+            """)
+            
+            table_info = cursor.execute("PRAGMA table_info(tracked_signals)").fetchall()
+            column_names = [info[1] for info in table_info]
 
-                if not column_exists(cursor, 'tracked_signals', 'signal_data'):
-                    cursor.execute("ALTER TABLE tracked_signals ADD COLUMN signal_data TEXT;")
-                    self.logger.info("Added missing column 'signal_data' to tracked_signals table.")
-                if not column_exists(cursor, 'tracked_signals', 'filled_qty'):
-                    cursor.execute("ALTER TABLE tracked_signals ADD COLUMN filled_qty REAL;")
-                    self.logger.info("Added missing column 'filled_qty' to tracked_signals table.")
-                if not column_exists(cursor, 'tracked_signals', 'closed_price'):
-                    cursor.execute("ALTER TABLE tracked_signals ADD COLUMN closed_price REAL;")
-                    self.logger.info("Added missing column 'closed_price' to tracked_signals table.")
-                if not column_exists(cursor, 'tracked_signals', 'closed_by'):
-                    cursor.execute("ALTER TABLE tracked_signals ADD COLUMN closed_by TEXT;")
-                    self.logger.info("Added missing column 'closed_by' to tracked_signals table.")
-                # --- End Add new columns ---
+            def add_column_if_not_exists(col_name, col_type):
+                if col_name not in column_names:
+                    cursor.execute(f"ALTER TABLE tracked_signals ADD COLUMN {col_name} {col_type}")
+                    self.logger.info(f"Added '{col_name}' column to 'tracked_signals' table.")
 
-                # Add indexes for faster lookups
-                cursor.execute("CREATE INDEX IF NOT EXISTS idx_status ON tracked_signals (status);")
-                cursor.execute("CREATE INDEX IF NOT EXISTS idx_symbol_status ON tracked_signals (symbol, status);")
-                conn.commit()
+            add_column_if_not_exists('signal_timestamp', 'DATETIME')
+            add_column_if_not_exists('hypothetical_tp_price', 'REAL')
+            add_column_if_not_exists('actual_tp_ordered', 'REAL')
+            add_column_if_not_exists('filled_qty', 'REAL')
+            add_column_if_not_exists('closed_price', 'REAL')
+            add_column_if_not_exists('closed_by', 'TEXT')
+            add_column_if_not_exists('poi_key', 'TEXT')
+
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_symbol_status ON tracked_signals (symbol, status)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_status ON tracked_signals (status)")
+            
+            conn.commit()
             self.logger.info("Database initialized and 'tracked_signals' table ensured.")
         except sqlite3.Error as e:
             self.logger.error(f"Database initialization error: {e}", exc_info=True)
+        finally:
+            if conn:
+                conn.close()
 
     def generate_signal_id(self, signal_data: Dict[str, Any]) -> Optional[str]:
-        """
-        Generates a reasonably unique ID for a signal based on key characteristics.
-        Using POI details if available, otherwise falls back to entry details.
-        """
-        # Use POI details for uniqueness if available
         poi_key_data = {
             'symbol': signal_data.get('symbol'),
             'direction': signal_data.get('direction'),
@@ -107,31 +95,27 @@ class StateManager:
             'fvg_low': signal_data.get('fvg_low_15m'),
             'fvg_high': signal_data.get('fvg_high_15m'),
             'fibs': signal_data.get('fib_levels_15m_touched'),
+            'entry_ts': signal_data.get('timestamp')[:16] # Use 5m entry timestamp up to minute for POI key part
         }
-        # Fallback to entry details if POI details are sparse
-        # Check if all values *other than* symbol and direction are None or 'N/A'
-        if all(v is None or v == 'N/A' for k, v in poi_key_data.items() if k not in ['symbol', 'direction']):
+        if all(v is None or v == 'N/A' for k, v in poi_key_data.items() if k not in ['symbol', 'direction', 'entry_ts']):
              poi_key_data = {
                 'symbol': signal_data.get('symbol'),
                 'direction': signal_data.get('direction'),
                 'entry': signal_data.get('entry_price'),
                 'sl': signal_data.get('stop_loss_price'),
-                'timestamp': signal_data.get('timestamp')[:16] # Use timestamp up to minute
+                'timestamp': signal_data.get('timestamp')[:16]
              }
-
-        # Create a stable string representation and hash it
         try:
             stable_string = json.dumps(poi_key_data, sort_keys=True)
-            return hashlib.sha256(stable_string.encode()).hexdigest()[:16] # Shortened hash
+            return hashlib.sha256(stable_string.encode()).hexdigest()[:16]
         except Exception as e:
             self.logger.error(f"Error generating signal ID: {e}", exc_info=True)
             return None
 
-    def add_signal_entry(self, signal_id: str, signal_data: Dict[str, Any], entry_order_id: str) -> bool:
-        """Adds a new signal to track with its pending entry order."""
+    def add_signal_entry(self, signal_id: str, signal_data: Dict[str, Any], entry_order_id: str, actual_tp_ordered: Optional[float] = None) -> bool:
         now = datetime.datetime.now(datetime.timezone.utc)
         try:
-            signal_data_json = json.dumps(signal_data) # Serialize the full signal data
+            signal_data_json = json.dumps(signal_data)
         except TypeError as e:
             self.logger.error(f"Failed to serialize signal_data to JSON for signal {signal_id}: {e}")
             return False
@@ -139,26 +123,35 @@ class StateManager:
         try:
             with self._get_db_connection() as conn:
                 cursor = conn.cursor()
-                # Update INSERT statement to include signal_data column
+                
+                symbol_val = signal_data.get('symbol')
+                direction_val = signal_data.get('direction')
+                poi_key_val = self.generate_signal_id(signal_data) 
+                status_val = 'PENDING_ENTRY'
+                entry_order_id_val = entry_order_id
+                entry_signal_price_val = signal_data.get('entry_price')
+                sl_price_val = signal_data.get('stop_loss_price')
+                position_size_val = signal_data.get('position_size')
+                hypothetical_tp_price_val = signal_data.get('hypothetical_tp_price')
+                signal_timestamp_val = signal_data.get('timestamp') 
+                actual_tp_ordered_val = actual_tp_ordered
+
                 cursor.execute("""
-                INSERT INTO tracked_signals 
-                (signal_id, symbol, direction, poi_key, status, entry_order_id, entry_signal_price, sl_price, signal_data, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO tracked_signals (
+                    signal_id, symbol, direction, poi_key, status, 
+                    entry_order_id, entry_signal_price, sl_price, position_size, 
+                    hypothetical_tp_price, actual_tp_ordered, signal_timestamp, signal_data, 
+                    created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
-                    signal_id,
-                    signal_data.get('symbol'),
-                    signal_data.get('direction'),
-                    self.generate_signal_id(signal_data), # Store the key used for ID generation
-                    'PENDING_ENTRY',
-                    entry_order_id,
-                    signal_data.get('entry_price'),
-                    signal_data.get('stop_loss_price'),
-                    signal_data_json, # Store the serialized dictionary
-                    now,
-                    now
+                    signal_id, symbol_val, direction_val, poi_key_val, status_val,
+                    entry_order_id_val, entry_signal_price_val, sl_price_val, position_size_val,
+                    hypothetical_tp_price_val, actual_tp_ordered_val, signal_timestamp_val, signal_data_json,
+                    now, now
                 ))
                 conn.commit()
-            self.logger.info(f"Added signal {signal_id} for {signal_data.get('symbol')} with entry order {entry_order_id} to state DB.")
+            self.logger.info(f"Added signal {signal_id} for {symbol_val} with entry order {entry_order_id_val}, signal time {signal_timestamp_val}, hypo TP {hypothetical_tp_price_val}, actual TP ordered {actual_tp_ordered_val} to state DB.")
             return True
         except sqlite3.IntegrityError:
             self.logger.warning(f"Signal ID {signal_id} already exists in the database. Did not add.")
@@ -167,34 +160,7 @@ class StateManager:
             self.logger.error(f"Database error adding signal {signal_id}: {e}", exc_info=True)
             return False
 
-    def update_signal_status(self, signal_id: str, new_status: str, update_data: Optional[Dict[str, Any]] = None) -> bool:
-        """Updates the status and optionally other fields for a tracked signal."""
-        now_str = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        fields_to_update = {'status': new_status, 'updated_at': now_str}
-        if update_data:
-            fields_to_update.update(update_data)
-        
-        set_clause = ", ".join([f"{key} = ?" for key in fields_to_update.keys()])
-        values = list(fields_to_update.values()) + [signal_id]
-        
-        sql = f"UPDATE tracked_signals SET {set_clause} WHERE signal_id = ?"
-        
-        try:
-            with self._get_db_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute(sql, values)
-                conn.commit()
-                if cursor.rowcount == 0:
-                    self.logger.warning(f"Attempted to update signal ID {signal_id} but it was not found.")
-                    return False
-            self.logger.info(f"Updated signal {signal_id} status to {new_status}. Update data: {update_data or {}}")
-            return True
-        except sqlite3.Error as e:
-            self.logger.error(f"Database error updating signal {signal_id}: {e}", exc_info=True)
-            return False
-
     def get_signal(self, signal_id: str) -> Optional[Dict[str, Any]]:
-        """Retrieves the current state of a specific signal."""
         try:
             with self._get_db_connection() as conn:
                 cursor = conn.cursor()
@@ -206,7 +172,6 @@ class StateManager:
             return None
             
     def get_signal_by_order_id(self, order_id: str) -> Optional[Dict[str, Any]]:
-         """Retrieves the current state of a specific signal by one of its order IDs."""
          if not order_id: return None
          try:
              with self._get_db_connection() as conn:
@@ -222,7 +187,6 @@ class StateManager:
              return None
 
     def get_signals_by_status(self, status: str) -> List[Dict[str, Any]]:
-        """Retrieves all signals with a specific status."""
         signals = []
         try:
             with self._get_db_connection() as conn:
@@ -236,7 +200,6 @@ class StateManager:
             return []
             
     def get_active_signals_by_symbol(self, symbol: str) -> List[Dict[str, Any]]:
-        """Retrieves signals for a symbol that are potentially active (pending or open position)."""
         signals = []
         active_statuses = ('PENDING_ENTRY', 'ENTRY_FILLED', 'POSITION_OPEN')
         status_placeholders = ', '.join('?' * len(active_statuses))
@@ -251,96 +214,120 @@ class StateManager:
             self.logger.error(f"Database error getting active signals for symbol {symbol}: {e}", exc_info=True)
             return []
 
-# --- Example Usage --- #
+    def update_signal_status(self, signal_id: str, new_status: str, update_payload: Optional[Dict[str, Any]] = None) -> bool:
+        if not signal_id or not new_status:
+            self.logger.error("Signal ID or new_status missing for update.")
+            return False
+
+        self.logger.info(f"Updating signal {signal_id} to status: {new_status}. Payload: {update_payload}")
+        
+        fields_to_update = {'status': new_status, 'updated_at': datetime.datetime.now(datetime.timezone.utc).isoformat()}
+        if update_payload:
+            for key, value in update_payload.items():
+                # Ensure key is a valid column name to prevent SQL injection (basic check)
+                # Add 'error_message' to the list of whitelisted keys
+                if key in ["entry_fill_price", "sl_order_id", "tp_order_id", "filled_qty", 
+                           "closed_price", "closed_by", "hypothetical_tp_price", 
+                           "actual_tp_ordered", "tp_price", "sl_price", 
+                           "entry_order_id", "position_size", "entry_signal_price", 
+                           "signal_data", "poi_key", "error_message"]: 
+                    if key == "signal_data" and isinstance(value, dict):
+                        fields_to_update[key] = json.dumps(value)
+                    else:
+                        fields_to_update[key] = value
+                else:
+                    self.logger.warning(f"Attempted to update non-whitelisted field '{key}' in StateManager. Skipping this field.")
+
+        set_clause_parts = []
+        values = []
+        for key, value in fields_to_update.items():
+            set_clause_parts.append(f"{key} = ?")
+            values.append(value)
+        
+        set_clause = ", ".join(set_clause_parts)
+        values.append(signal_id)
+        
+        sql = f"UPDATE tracked_signals SET {set_clause} WHERE signal_id = ?"
+        
+        try:
+            with self._get_db_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(sql, tuple(values))
+                conn.commit()
+                if cursor.rowcount == 0:
+                    self.logger.warning(f"Attempted to update signal ID {signal_id} but it was not found.")
+                    return False
+            self.logger.info(f"Signal {signal_id} successfully updated. Status: {new_status}. Data: {update_payload or {}}.")
+            return True
+        except sqlite3.Error as e:
+            self.logger.error(f"Database error updating signal {signal_id}: {e}", exc_info=True)
+            return False
+
+# Example usage (for standalone testing if needed)
 if __name__ == '__main__':
-    # Mock components for testing
     class MockConfigManager:
         def get_journaling_config(self):
-            # Use a dedicated test DB
-            return {"db_journal_uri": "sqlite:///logs/test_state_manager.db"}
+            return {"db_journal_file": "logs/test_statemanager.db"}
+        def get(self, key, default=None):
+            if key == "database.path": return "logs/test_statemanager.db"
+            return default
 
     class MockLogger:
-        def bind(self, name):
-            print(f"Logger bound to: {name}")
-            return self
-        def info(self, msg): print(f"INFO: {msg}")
-        def error(self, msg): print(f"ERROR: {msg}")
-        def warning(self, msg): print(f"WARNING: {msg}")
+        def bind(self, name): return self
+        def info(self, msg, **kwargs): print(f"INFO: {msg}")
+        def error(self, msg, **kwargs): print(f"ERROR: {msg}")
+        def warning(self, msg, **kwargs): print(f"WARNING: {msg}")
+        def debug(self, msg, **kwargs): print(f"DEBUG: {msg}")
 
     print("--- Testing StateManager ---")
-    mock_config = MockConfigManager()
-    mock_logger = MockLogger()
+    mock_config_mgr = MockConfigManager()
+    mock_main_logger = MockLogger()
     
-    # Clean up previous test DB if exists
-    test_db_path = Path("logs/test_state_manager.db")
-    if test_db_path.exists():
-        print(f"Removing old test DB: {test_db_path}")
-        test_db_path.unlink()
+    db_file_to_test = Path(mock_config_mgr.get_journaling_config()['db_journal_file'])
+    if db_file_to_test.exists():
+        db_file_to_test.unlink()
 
-    state_manager = StateManager(config_manager=mock_config, main_logger=mock_logger)
+    state_mgr = StateManager(config_manager=mock_config_mgr, main_logger=mock_main_logger)
 
-    # Sample signal data
-    signal_1 = {
-        'symbol': 'BTCUSDT', 'direction': 'LONG', 'entry_price': 60000, 'stop_loss_price': 59500,
-        'bos_level_15m': 59800, 'fvg_low_15m': 59600, 'fvg_high_15m': 59700, 'fib_levels_15m_touched': "[0.5]"
+    sample_ts_now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    sample_signal_data_1 = {
+        'timestamp': sample_ts_now, 
+        'symbol': 'BTCUSDT', 'direction': 'Buy', 'entry_price': 60000, 
+        'stop_loss_price': 59500, 'position_size': 0.01,
+        'hypothetical_tp_price': 61000 
     }
-    signal_id_1 = state_manager.generate_signal_id(signal_1)
-    print(f"Generated Signal ID 1: {signal_id_1}")
-
-    signal_2 = {
-        'symbol': 'ETHUSDT', 'direction': 'SHORT', 'entry_price': 3000, 'stop_loss_price': 3050,
-        'bos_level_15m': 3010, 'fvg_low_15m': 3020, 'fvg_high_15m': 3040, 'fib_levels_15m_touched': "[0.618]"
-    }
-    signal_id_2 = state_manager.generate_signal_id(signal_2)
-    print(f"Generated Signal ID 2: {signal_id_2}")
-
-    # Test adding signals
-    print("\n--- Adding Signals ---")
-    state_manager.add_signal_entry(signal_id_1, signal_1, "ORDER_BTC_ENTRY_1")
-    state_manager.add_signal_entry(signal_id_2, signal_2, "ORDER_ETH_ENTRY_1")
-    # Test adding duplicate
-    state_manager.add_signal_entry(signal_id_1, signal_1, "ORDER_BTC_ENTRY_DUPLICATE") 
-
-    # Test getting signals
-    print("\n--- Getting Signals ---")
-    retrieved_1 = state_manager.get_signal(signal_id_1)
-    print(f"Retrieved Signal 1: {retrieved_1}")
-    retrieved_nonexistent = state_manager.get_signal("nonexistent_id")
-    print(f"Retrieved Nonexistent: {retrieved_nonexistent}")
-    retrieved_by_order = state_manager.get_signal_by_order_id("ORDER_ETH_ENTRY_1")
-    print(f"Retrieved by Order ID ('ORDER_ETH_ENTRY_1'): {retrieved_by_order}")
-
-    # Test getting by status
-    print("\n--- Getting Pending Signals ---")
-    pending_signals = state_manager.get_signals_by_status('PENDING_ENTRY')
-    print(f"Found {len(pending_signals)} pending signals: {pending_signals}")
-
-    # Test updating status
-    print("\n--- Updating Signal 1 ---")
-    update_info_1 = {
-        'status': 'ENTRY_FILLED',
-        'entry_fill_price': 60005.0,
-        'position_size': 0.01
-    }
-    state_manager.update_signal_status(signal_id_1, 'ENTRY_FILLED', update_info_1)
-    retrieved_1_updated = state_manager.get_signal(signal_id_1)
-    print(f"Retrieved Signal 1 Updated: {retrieved_1_updated}")
+    signal_id_1 = state_mgr.generate_signal_id(sample_signal_data_1)
     
-    # Test updating SL/TP orders
-    update_info_sl = {
-         'sl_order_id': 'ORDER_BTC_SL_1'
-    }
-    state_manager.update_signal_status(signal_id_1, 'POSITION_OPEN', update_info_sl)
-    retrieved_1_sl_set = state_manager.get_signal(signal_id_1)
-    print(f"Retrieved Signal 1 SL Set: {retrieved_1_sl_set}")
+    print(f"Generated Signal ID: {signal_id_1}")
 
-    # Test getting active signals by symbol
-    print("\n--- Getting Active Signals for BTCUSDT ---")
-    active_btc = state_manager.get_active_signals_by_symbol('BTCUSDT')
-    print(f"Active BTC signals: {active_btc}")
+    added = state_mgr.add_signal_entry(signal_id_1, sample_signal_data_1, "entry_order_123")
+    print(f"Signal 1 added: {added}")
+
+    retrieved_signal = state_mgr.get_signal(signal_id_1)
+    print(f"Retrieved Signal 1: {retrieved_signal}")
+    if retrieved_signal:
+        print(f"  Signal Timestamp from DB: {retrieved_signal.get('signal_timestamp')}")
+        print(f"  Hypothetical TP from DB: {retrieved_signal.get('hypothetical_tp_price')}")
+        print(f"  DB Record Created At: {retrieved_signal.get('created_at')}")
+        try:
+            original_data_blob = json.loads(retrieved_signal.get('signal_data', '{}'))
+            print(f"  Original 'timestamp' from blob: {original_data_blob.get('timestamp')}")
+            print(f"  Original 'hypothetical_tp_price' from blob: {original_data_blob.get('hypothetical_tp_price')}")
+        except: pass
+
+    updated = state_mgr.update_signal_status(signal_id_1, "ENTRY_FILLED", {'entry_fill_price': 60001, 'sl_order_id': 'sl_abc'})
+    print(f"Signal 1 updated to ENTRY_FILLED: {updated}")
     
-    print("\n--- Getting Active Signals for ETHUSDT ---")
-    active_eth = state_manager.get_active_signals_by_symbol('ETHUSDT')
-    print(f"Active ETH signals: {active_eth}")
+    retrieved_signal_updated = state_mgr.get_signal(signal_id_1)
+    print(f"Retrieved Updated Signal 1: {retrieved_signal_updated}")
 
-    print("\n--- StateManager Test Done ---") 
+    pending_signals = state_mgr.get_signals_by_status("PENDING_ENTRY")
+    print(f"Pending Entry Signals: {pending_signals}")
+    
+    filled_signals = state_mgr.get_signals_by_status("ENTRY_FILLED")
+    print(f"Entry Filled Signals: {filled_signals}")
+
+    active_btc_signals = state_mgr.get_active_signals_by_symbol("BTCUSDT")
+    print(f"Active BTCUSDT signals: {active_btc_signals}")
+
+    print("--- StateManager Test Done ---") 

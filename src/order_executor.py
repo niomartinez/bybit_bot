@@ -2,6 +2,7 @@ import ccxt.async_support as ccxt
 from typing import Dict, Optional, Tuple, Any
 import time
 import math # For formatting
+import asyncio # Required for sleep in retry mechanism
 
 class OrderExecutor:
     def __init__(self, data_ingestion_module, config_manager, main_logger):
@@ -77,7 +78,7 @@ class OrderExecutor:
              return None
 
     # --- Order Placement Methods --- 
-    async def place_limit_entry_order(self, symbol: str, side: str, qty: float, price: float, params: Optional[Dict] = None) -> Optional[Dict]:
+    async def place_limit_entry_order(self, symbol: str, side: str, qty: float, price: float, params: Optional[Dict] = None, sl_price: Optional[float] = None, tp_price: Optional[float] = None) -> Optional[Dict]:
         """Places a limit entry order."""
         if not self.exchange:
             self.logger.error("Exchange not available.")
@@ -98,13 +99,39 @@ class OrderExecutor:
             
         order_type = 'Limit'
         ccxt_side = side.lower()
-        self.logger.info(f"[OrderExecutor] Placing {ccxt_side} {order_type} entry order: {symbol}, Qty: {formatted_qty}, Price: {formatted_price}")
         
+        # Default params for order
         default_params = {
             'timeInForce': 'GTC',
-            'category': 'linear' # Explicitly for Bybit V5 USDT Perps
+            'category': 'linear', # Explicitly for Bybit V5 USDT Perps
+            'positionIdx': 0      # 0 for one-way mode
+            # No orderFilter here
         } 
-        if params: default_params.update(params)
+        
+        # Add SL/TP parameters directly to the order if provided
+        if sl_price is not None or tp_price is not None:
+            # Bybit V5 requires tpslMode for any TP/SL setting
+            default_params['tpslMode'] = 'Full'  # Full mode required for TP/SL
+            
+            if sl_price is not None:
+                formatted_sl_price = self._format_price(symbol, sl_price, specs)
+                if formatted_sl_price is not None:
+                    self.logger.info(f"[OrderExecutor] Including stopLoss {formatted_sl_price} in entry order {symbol}")
+                    default_params['stopLoss'] = formatted_sl_price
+                    default_params['slTriggerBy'] = 'LastPrice'  # Can be LastPrice, MarkPrice, or IndexPrice
+            
+            if tp_price is not None:
+                formatted_tp_price = self._format_price(symbol, tp_price, specs)
+                if formatted_tp_price is not None:
+                    self.logger.info(f"[OrderExecutor] Including takeProfit {formatted_tp_price} in entry order {symbol}")
+                    default_params['takeProfit'] = formatted_tp_price
+                    default_params['tpTriggerBy'] = 'LastPrice'  # Can be LastPrice, MarkPrice, or IndexPrice
+        
+        # Detailed logging of all parameters
+        self.logger.info(f"[OrderExecutor] Placing {ccxt_side} {order_type} entry order: {symbol}, Qty: {formatted_qty}, Price: {formatted_price} with params: {default_params}")
+        
+        if params: 
+            default_params.update(params)
 
         order_response = None # Initialize before try
         try:
@@ -119,6 +146,26 @@ class OrderExecutor:
             )
             # This log is reached if create_order returns without raising an exception itself.
             self.logger.info(f"[OrderExecutor] Successfully called self.exchange.create_order for {symbol}. Raw response: {order_response}")
+            
+            # Log specific details about SL/TP in the response
+            if 'stopLoss' in default_params or 'takeProfit' in default_params:
+                sl_in_params = 'stopLoss' in default_params
+                tp_in_params = 'takeProfit' in default_params
+                sl_in_response = False
+                tp_in_response = False
+                
+                # Try to find SL/TP in various parts of the response
+                if isinstance(order_response, dict):
+                    info = order_response.get('info', {})
+                    if isinstance(info, dict):
+                        if 'stopLoss' in info or 'sl' in info:
+                            sl_in_response = True
+                        if 'takeProfit' in info or 'tp' in info:
+                            tp_in_response = True
+                
+                self.logger.info(f"[OrderExecutor] SL/TP status in order {order_response.get('id')}: "
+                                f"SL requested: {sl_in_params}, SL confirmed: {sl_in_response}, "
+                                f"TP requested: {tp_in_params}, TP confirmed: {tp_in_response}")
 
             # Proceed with robust checking of the response we got if create_order itself didn't fail.
             if not isinstance(order_response, dict):
@@ -155,6 +202,15 @@ class OrderExecutor:
                             return None 
                 
                 self.logger.info(f"[OrderExecutor] Limit entry order placed successfully via CCXT for {symbol}. Order ID: {ccxt_order_id}")
+                
+                # Add SL/TP details to the response
+                if sl_price is not None or tp_price is not None:
+                    order_response['has_sltp'] = True
+                    if sl_price is not None:
+                        order_response['sl_price'] = sl_price
+                    if tp_price is not None:
+                        order_response['tp_price'] = tp_price
+                    
                 return order_response
             else:
                 self.logger.error(f"[OrderExecutor] Order placement response (after create_order call) for {symbol} lacks CCXT ID. Top-level retCode was {bybit_ret_code_raw}. Raw: {order_response}")
@@ -170,7 +226,7 @@ class OrderExecutor:
 
         # Fallback return, though all paths should be covered.
         # self.logger.error(f"[OrderExecutor] Fell through all checks in place_limit_entry_order for {symbol}. Order_response: {order_response}. Returning None.")
-        # return None 
+        # return None
 
     async def place_stop_loss_order(self, symbol: str, side: str, qty: float, stop_price: float, params: Optional[Dict] = None) -> Optional[Dict]:
         """Places a stop-loss order (typically STOP_MARKET)."""
@@ -191,25 +247,34 @@ class OrderExecutor:
             return None
 
         # Determine the side for the closing stop order (opposite of position)
-        sl_side = 'sell' if side.lower() == 'buy' else 'buy'
-        order_type = 'Stop' # This implies StopMarket on many exchanges
+        sl_side = 'sell' if side.lower() in ('buy', 'long') else 'buy'
         
-        self.logger.info(f"[OrderExecutor] Placing {sl_side} {order_type} stop loss order: {symbol}, Qty: {formatted_qty}, Stop Price: {formatted_stop_price}")
+        self.logger.info(f"[OrderExecutor] Placing {sl_side} stop loss order: {symbol}, Qty: {formatted_qty}, Stop Price: {formatted_stop_price}")
 
+        # CRITICAL FIX: For Bybit V5, SL orders require specific parameters
         default_params = {
-            'reduceOnly': True, 
-            'timeInForce': 'GTC', 
-            'triggerBy': 'LastPrice',
-            'category': 'linear' # Explicitly for Bybit V5 USDT Perps
-        } 
-        if params: default_params.update(params)
+            'category': 'linear',  # Explicitly for Bybit V5 USDT Perps
+            'reduceOnly': True,    # This ensures it only reduces position
+            'closeOnTrigger': True,  # Critical for SL orders
+            'stopLoss': formatted_stop_price,  # The direct stopLoss parameter
+            'slTriggerBy': 'LastPrice',  # Can be LastPrice, MarkPrice, or IndexPrice
+            'timeInForce': 'GoodTillCancel',
+            'positionIdx': 0      # 0 for one-way mode, which we're using
+        }
+        
+        if params: 
+            default_params.update(params)
 
         order_response = None # Initialize before try
         try:
             self.logger.debug(f"Calling exchange.create_order for SL: {symbol}...")
+            # Change order type to 'MARKET' for Bybit SL orders
             order_response = await self.exchange.create_order(
-                symbol=symbol, type=order_type, side=sl_side, amount=float(formatted_qty),
-                stopPrice=float(formatted_stop_price), params=default_params
+                symbol=symbol, 
+                type='market', 
+                side=sl_side, 
+                amount=float(formatted_qty),
+                params=default_params
             )
             self.logger.debug(f"Received response from exchange.create_order (SL): {order_response}")
 
@@ -284,24 +349,33 @@ class OrderExecutor:
             return None
             
         # Determine the side for the closing TP order (opposite of position)
-        tp_side = 'sell' if side.lower() == 'buy' else 'buy'
-        order_type = 'Limit' 
+        tp_side = 'sell' if side.lower() in ('buy', 'long') else 'buy'
         
-        self.logger.info(f"[OrderExecutor] Placing {tp_side} {order_type} take profit order: {symbol}, Qty: {formatted_qty}, Price: {formatted_price}")
+        self.logger.info(f"[OrderExecutor] Placing {tp_side} take profit order: {symbol}, Qty: {formatted_qty}, Price: {formatted_price}")
 
+        # CRITICAL FIX: For Bybit V5, TP orders require specific parameters
         default_params = {
-            'reduceOnly': True, 
-            'timeInForce': 'GTC',
-            'category': 'linear' # Explicitly for Bybit V5 USDT Perps
-        } 
-        if params: default_params.update(params)
+            'category': 'linear',  # Explicitly for Bybit V5 USDT Perps
+            'reduceOnly': True,    # This ensures it only reduces position
+            'takeProfit': formatted_price,  # The direct takeProfit parameter  
+            'tpTriggerBy': 'LastPrice',  # Can be LastPrice, MarkPrice, or IndexPrice
+            'timeInForce': 'GoodTillCancel',
+            'positionIdx': 0      # 0 for one-way mode, which we're using
+        }
+         
+        if params: 
+            default_params.update(params)
 
         order_response = None # Initialize before try
         try:
             self.logger.debug(f"Calling exchange.create_order for TP: {symbol}...")
             order_response = await self.exchange.create_order(
-                symbol=symbol, type=order_type, side=tp_side, amount=float(formatted_qty),
-                price=float(formatted_price), params=default_params
+                symbol=symbol, 
+                type='limit', 
+                side=tp_side, 
+                amount=float(formatted_qty),
+                price=float(formatted_price), 
+                params=default_params
             )
             self.logger.debug(f"Received response from exchange.create_order (TP): {order_response}")
 
@@ -370,64 +444,97 @@ class OrderExecutor:
         self.logger.debug(f"[OrderExecutor] Checking status for order ID: {order_id} on {symbol}")
         
         order_to_return = None
-
-        try:
-            # 1. Check open orders first
-            if self.exchange.has.get('fetchOpenOrders'):
-                self.logger.debug(f"[OrderExecutor] Attempting to find order {order_id} in open orders for {symbol}...")
-                open_orders = await self.exchange.fetch_open_orders(symbol, params=params if params else {})
-                for order in open_orders:
-                    if order.get('id') == order_id:
-                        self.logger.info(f"[OrderExecutor] Order {order_id} found in OPEN orders. Status: {order.get('status')}")
-                        order_to_return = order
-                        break
-            else:
-                self.logger.warning("[OrderExecutor] fetchOpenOrders not supported by exchange. Skipping this check.")
-
-            # 2. If not found in open, check closed/filled orders
-            if order_to_return is None and self.exchange.has.get('fetchClosedOrders'):
-                self.logger.debug(f"[OrderExecutor] Order {order_id} not in open orders. Attempting to find in closed orders for {symbol}...")
-                # Fetch recent closed orders. Bybit might return a lot, so limit if possible or filter by time if order had a timestamp.
-                # For now, a reasonable limit like 20-50 might be okay.
-                closed_orders_params = params.copy() if params else {}
-                if 'limit' not in closed_orders_params: # Add a default limit if not provided
-                    closed_orders_params['limit'] = 50 # Fetch last 50 closed orders
-                
-                closed_orders = await self.exchange.fetch_closed_orders(symbol, params=closed_orders_params)
-                for order in closed_orders:
-                    if order.get('id') == order_id:
-                        self.logger.info(f"[OrderExecutor] Order {order_id} found in CLOSED orders. Status: {order.get('status')}")
-                        order_to_return = order
-                        break
-            elif order_to_return is None: # If fetchClosedOrders not supported
-                 self.logger.warning("[OrderExecutor] fetchClosedOrders not supported by exchange. Cannot check closed orders.")
-
-            if order_to_return:
-                return order_to_return
-            else:
-                self.logger.warning(f"[OrderExecutor] Order {order_id} for {symbol} not found in open or recent closed orders.")
-                # Fallback to fetchOrder if absolutely necessary, though it gives warnings for Bybit
-                # Or, more simply, return a 'notFound' status if other methods fail.
-                # For now, let's be explicit it wasn't found via preferred methods.
-                return {'id': order_id, 'symbol': symbol, 'status': 'notFoundByPreferredMethods'}
-
-        except ccxt.NetworkError as ne:
-            self.logger.error(f"[OrderExecutor] CCXT NetworkError checking order status for {order_id}: {ne}", exc_info=True)
-        except ccxt.ExchangeError as e:
-            # The original warning was an ExchangeError, but not specific to OrderNotFound for fetchOrder
-            self.logger.error(f"[OrderExecutor] CCXT ExchangeError checking order status for {order_id}: {type(e).__name__} - {e}", exc_info=True)
-            if "fetchOrder() can only access an order if it is in last 500 orders" in str(e):
-                 self.logger.warning(f"[OrderExecutor] Encountered known fetchOrder limitation for {order_id}. The new method should avoid this.")
-                 return {'id': order_id, 'symbol': symbol, 'status': 'fetchOrderLimitationHit'}
-        except Exception as e:
-            self.logger.error(f"[OrderExecutor] Unexpected error checking order status for {order_id}: {e}", exc_info=True)
-            
-        # If any exception occurred or order_to_return is still None after all checks
-        if order_to_return is None:
-            self.logger.warning(f"[OrderExecutor] Final fallback: Could not reliably determine status for order {order_id} on {symbol}.")
-            return {'id': order_id, 'symbol': symbol, 'status': 'unknown'} # Generic unknown or error status
+        max_attempts = 3  # Maximum number of retry attempts
+        attempt = 0
         
-        return order_to_return # Should be redundant if logic above is correct
+        while attempt < max_attempts:
+            try:
+                order_info = None # Reset for each attempt
+                # 1. Check open orders first
+                if self.exchange.has.get('fetchOpenOrders'):
+                    self.logger.debug(f"[OrderExecutor] Attempting to find order {order_id} in open orders for {symbol}... (Attempt {attempt+1}/{max_attempts})")
+                    open_orders = await self.exchange.fetch_open_orders(symbol, params=params if params else {})
+                    for order in open_orders:
+                        if order.get('id') == order_id:
+                            self.logger.info(f"[OrderExecutor] Order {order_id} found in OPEN orders. Status: {order.get('status')}")
+                            order_info = order
+                            break
+                
+                # 2. If not found in open, check closed/filled orders
+                if order_info is None and self.exchange.has.get('fetchClosedOrders'):
+                    self.logger.debug(f"[OrderExecutor] Order {order_id} not in open. Attempting to find in closed orders for {symbol}... (Attempt {attempt+1}/{max_attempts})")
+                    closed_orders_params = params.copy() if params else {}
+                    if 'limit' not in closed_orders_params: 
+                        closed_orders_params['limit'] = 50 
+                    
+                    closed_orders = await self.exchange.fetch_closed_orders(symbol, params=closed_orders_params)
+                    for order in closed_orders:
+                        if order.get('id') == order_id:
+                            self.logger.info(f"[OrderExecutor] Order {order_id} found in CLOSED orders. Status: {order.get('status')}")
+                            order_info = order
+                            break
+                
+                # 3. As a final fallback, try fetch_order if still not found
+                if order_info is None and self.exchange.has.get('fetchOrder'):
+                    self.logger.debug(f"[OrderExecutor] Order {order_id} not found in open/closed lists. Attempting fetch_order for {symbol}... (Attempt {attempt+1}/{max_attempts})")
+                    try:
+                        order_info = await self.exchange.fetch_order(order_id, symbol, params=params if params else {})
+                        if order_info:
+                            self.logger.info(f"[OrderExecutor] Order {order_id} found via fetch_order. Status: {order_info.get('status')}")
+                    except ccxt.OrderNotFound:
+                        self.logger.warning(f"[OrderExecutor] Order {order_id} explicitly not found by fetch_order (OrderNotFound).")
+                        order_info = {'id': order_id, 'symbol': symbol, 'status': 'notfound'} 
+                    except ccxt.ExchangeError as e_fetch:
+                        if "can only access an order if it is in last 500 orders" in str(e_fetch):
+                            self.logger.warning(f"[OrderExecutor] Order {order_id} not found by fetch_order due to 500 orders limit. Marking as 'historical_notfound'.")
+                            order_info = {'id': order_id, 'symbol': symbol, 'status': 'historical_notfound'}
+                        else:
+                            self.logger.error(f"[OrderExecutor] ExchangeError during fetch_order for {order_id}: {e_fetch}")
+                            # Keep order_info as None to trigger retry or final notfound status
+                    except Exception as e_fetch_order:
+                        self.logger.error(f"[OrderExecutor] Error during fetch_order for {order_id}: {e_fetch_order}")
+                        # Keep order_info as None to trigger retry or final notfound
+
+                # 4. If order found by any method, return it
+                if order_info and order_info.get('status') != 'notfound': # Ensure we don't return our internal 'notfound' from OrderNotFound immediately
+                    return order_info
+                elif order_info and order_info.get('status') == 'notfound': # If fetch_order confirmed not found
+                    self.logger.warning(f"[OrderExecutor] Order {order_id} for {symbol} confirmed NOT FOUND by fetch_order.")
+                    return order_info # Return the explicit notfound status
+                
+                # 5. If not found and not at last attempt, wait and retry
+                if attempt < max_attempts - 1:
+                    self.logger.info(f"[OrderExecutor] Order {order_id} for {symbol} not found yet (attempt {attempt+1}). Waiting before retry...")
+                    await asyncio.sleep(2)  # Wait 2 seconds before retrying
+                    attempt += 1
+                else:
+                    # Last attempt, order not found by any primary method
+                    self.logger.warning(f"[OrderExecutor] Order {order_id} for {symbol} not found by open/closed/fetch_order after {max_attempts} attempts.")
+                    return {'id': order_id, 'symbol': symbol, 'status': 'unknown_after_retries'} # More specific unknown status
+
+            except ccxt.NetworkError as ne:
+                self.logger.error(f"[OrderExecutor] CCXT NetworkError checking order status for {order_id}: {ne}", exc_info=True)
+                # Potentially retry or return a specific network error status if needed
+                if attempt < max_attempts - 1:
+                    await asyncio.sleep(delay) # Use configured delay for network issues too
+                    attempt += 1
+                else:
+                    return {'id': order_id, 'symbol': symbol, 'status': 'network_error'}
+            except ccxt.ExchangeError as e:
+                self.logger.error(f"[OrderExecutor] CCXT ExchangeError checking order status for {order_id}: {type(e).__name__} - {e}", exc_info=True)
+                if attempt < max_attempts - 1:
+                    await asyncio.sleep(delay)
+                    attempt += 1
+                else:
+                    return {'id': order_id, 'symbol': symbol, 'status': 'exchange_error'}
+            except Exception as e:
+                self.logger.error(f"[OrderExecutor] Unexpected error checking order status for {order_id}: {e}", exc_info=True)
+                # Don't retry on truly unexpected errors, bail out
+                return {'id': order_id, 'symbol': symbol, 'status': 'unexpected_error_check_status'}
+            
+        # Fallback if loop finishes unexpectedly (shouldn't happen with logic above)
+        self.logger.error(f"[OrderExecutor] Exited check_order_status loop unexpectedly for {order_id}.")
+        return {'id': order_id, 'symbol': symbol, 'status': 'unknown_loop_exit'}
 
     async def cancel_order(self, order_id: str, symbol: str, params: Optional[Dict] = None) -> bool:
         """Cancels a specific order by ID."""

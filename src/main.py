@@ -72,6 +72,16 @@ async def place_sl_tp_orders_for_signal(
         main_logger.error(f"Invalid numeric value for qty/sl/filled_price for SL/TP placement (Signal ID: {signal_id}): {ve}. Aborting.")
         return
 
+    # Check if SL/TP was already included with the entry order
+    entry_order_data = full_signal_data_from_db.get('entry_order_data', {})
+    if isinstance(entry_order_data, dict) and entry_order_data.get('has_sltp'):
+        main_logger.info(f"Signal {signal_id} already has SL/TP included in the entry order. Updating state directly to POSITION_OPEN.")
+        state_manager.update_signal_status(signal_id, 'POSITION_OPEN', {
+            'sl_order_id': 'included_in_entry', 
+            'tp_order_id': 'included_in_entry'
+        })
+        return
+
     sl_order_id = None
     tp_order_id = None
 
@@ -114,9 +124,9 @@ async def place_sl_tp_orders_for_signal(
             state_manager.update_signal_status(signal_id, 'TP_CALC_FAILED_NO_TICK_SIZE', {'sl_order_id': sl_order_id})
             return
 
-        if direction.upper() == "LONG":
+        if direction.upper() == "BUY":
             raw_tp = filled_price_f + (sl_distance * primary_rr_target)
-        elif direction.upper() == "SHORT":
+        elif direction.upper() == "SELL":
             raw_tp = filled_price_f - (sl_distance * primary_rr_target)
         else:
             main_logger.error(f"Invalid direction '{direction}' for TP calculation on signal {signal_id}.")
@@ -135,9 +145,14 @@ async def place_sl_tp_orders_for_signal(
 
     if tp_price_f:
         main_logger.info(f"Placing TP order for signal {signal_id} ({symbol} {direction} Qty: {filled_qty_f} @ TP: {tp_price_f})")
+        
+        # Determine the correct side for the TP limit order (opposite of entry direction)
+        tp_side = "Sell" if direction.upper() == "BUY" else "Buy"
+        main_logger.debug(f"Determined TP side as '{tp_side}' for original direction '{direction}'.")
+
         tp_order = await order_executor.place_take_profit_order(
             symbol=symbol,
-            side=direction, # TP side is opposite of trade direction for a limit order
+            side=tp_side, # Use the inverted side for the TP limit order
             qty=filled_qty_f,
             price=tp_price_f
         )
@@ -152,16 +167,28 @@ async def place_sl_tp_orders_for_signal(
 
     # 3. Update State Manager to POSITION_OPEN
     if sl_order_id and tp_order_id: # Only if both are successful
-        update_payload = {'sl_order_id': sl_order_id, 'tp_order_id': tp_order_id}
+        update_payload = {
+            'sl_order_id': sl_order_id, 
+            'tp_order_id': tp_order_id,
+            'tp_price': tp_price_f # Store the actual TP price used for the order
+        }
         state_manager.update_signal_status(signal_id, 'POSITION_OPEN', update_payload)
-        main_logger.info(f"Signal {signal_id} status updated to POSITION_OPEN with SL {sl_order_id} and TP {tp_order_id}.")
+        main_logger.info(f"Signal {signal_id} status updated to POSITION_OPEN with SL {sl_order_id}, TP {tp_order_id} (Price: {tp_price_f}).")
     elif sl_order_id and not tp_order_id:
-        # This case should have been handled by returns above, but as a safeguard:
-        main_logger.warning(f"Signal {signal_id} has SL {sl_order_id} but TP placement failed or was skipped. Status should reflect this from earlier log.")
-        # State was already updated to TP_CALCULATION_FAILED or TP_PLACEMENT_FAILED
+        # This case means TP placement failed or was skipped.
+        # We should still update the status to reflect that SL is on, but potentially store that TP failed.
+        update_payload_sl_only = {
+            'sl_order_id': sl_order_id,
+            'tp_order_id': None, # Explicitly set tp_order_id to None
+            'tp_price': None     # Explicitly set tp_price to None
+        }
+        # The status was already updated to TP_CALCULATION_FAILED or TP_PLACEMENT_FAILED by earlier logic.
+        # We might just need to ensure sl_order_id is in the DB for that status.
+        state_manager.update_signal_status(signal_id, state_manager.get_signal(signal_id).get('status', 'SL_OK_TP_FAILED'), update_payload_sl_only)
+        main_logger.warning(f"Signal {signal_id} has SL {sl_order_id} but TP placement failed/skipped. Current status in DB should reflect this.")
     else:
-        # This case should also be impossible due to return on SL failure.
-        main_logger.error(f"Signal {signal_id} reached end of SL/TP placement without successful SL. This should not happen.")
+        # This case means SL placement failed.
+        main_logger.error(f"Signal {signal_id} reached end of SL/TP placement without successful SL. Status was set to SL_PLACEMENT_FAILED.")
 
 async def run_scanner():
     """
@@ -296,149 +323,235 @@ async def run_scanner():
                              
                         existing_signal = state_manager.get_signal(signal_id)
                         if existing_signal:
-                            main_logger.debug(f"Signal ID {signal_id} ({symbol}) already tracked with status {existing_signal['status']}. Skipping.")
-                            continue 
+                            # Skip if signal is already in a final state or a non-retryable error state
+                            non_actionable_statuses = ['ENTRY_FILLED', 'POSITION_OPEN', 'SL_FILLED', 'TP_FILLED', 'CANCELLED', 'REJECTED', 'CLOSED_SL', 'CLOSED_TP', 'CANCELLED_STALE', 'CANCELLED_TP_HIT_PENDING', 'CANCELLED_STALE_NOT_FOUND', 'CLOSED_OR_CANCELLED_HISTORICAL', 'SL_PLACEMENT_FAILED', 'TP_PLACEMENT_FAILED', 'TP_CALCULATION_FAILED']
+                            # Also skip UNKNOWN_API_STATUS to prevent reprocessing until manually checked or status changes
+                            if existing_signal['status'] in non_actionable_statuses or existing_signal['status'] == 'UNKNOWN_API_STATUS':
+                                main_logger.debug(f"Signal ID {signal_id} ({symbol}) already tracked with status {existing_signal['status']}. Skipping.")
+                                continue 
+                            # If PENDING_ENTRY, it will be handled by the order status monitoring section later
+                            elif existing_signal['status'] == 'PENDING_ENTRY':
+                                main_logger.debug(f"Signal ID {signal_id} ({symbol}) is PENDING_ENTRY. Will be checked by monitor. Skipping new order placement.")
+                                continue
+                            # Check for other active trades for the *same symbol*
+                            active_symbol_signals = state_manager.get_active_signals_by_symbol(symbol)
+                            if len(active_symbol_signals) >= max_concurrent_trades:
+                                main_logger.info(f"Skipping new signal for {symbol} as {len(active_symbol_signals)} active trade(s) already exist (max: {max_concurrent_trades}).")
+                                continue
                             
-                        # Check for other active trades for the *same symbol*
-                        active_symbol_signals = state_manager.get_active_signals_by_symbol(symbol)
-                        if len(active_symbol_signals) >= max_concurrent_trades:
-                            main_logger.info(f"Skipping new signal for {symbol} as {len(active_symbol_signals)} active trade(s) already exist (max: {max_concurrent_trades}).")
-                            continue
-                            
-                        # --- New Signal Processing --- 
-                        main_logger.info(f"New unique signal identified for {symbol} (ID: {signal_id}). Processing entry...") 
+                            # --- New Signal Processing --- 
+                            main_logger.info(f"New unique signal identified for {symbol} (ID: {signal_id}). Processing entry...") 
 
-                        entry = signal_data.get('entry_price')
-                        sl = signal_data.get('stop_loss_price')
-                        direction = signal_data.get('direction')
-                        if not all([entry, sl, direction]):
-                             main_logger.warning(f"Incomplete signal data for {signal_id}, missing entry/sl/direction. Skipping.")
-                             continue
-                             
-                        # 2. Calculate Position Size
-                        try:
-                            entry_f = float(entry)
-                            sl_f = float(sl)
-                        except (ValueError, TypeError):
-                            main_logger.error(f"Invalid numeric value for entry or SL in signal {signal_id}. Entry: {entry}, SL: {sl}. Skipping.")
-                            continue
+                            entry = signal_data.get('entry_price')
+                            sl = signal_data.get('stop_loss_price')
+                            direction = signal_data.get('direction')
+                            if not all([entry, sl, direction]):
+                                 main_logger.warning(f"Incomplete signal data for {signal_id}, missing entry/sl/direction. Skipping.")
+                                 continue
+                                 
+                            # 2. Calculate Position Size
+                            try:
+                                entry_f = float(entry)
+                                sl_f = float(sl)
+                            except (ValueError, TypeError):
+                                main_logger.error(f"Invalid numeric value for entry or SL in signal {signal_id}. Entry: {entry}, SL: {sl}. Skipping.")
+                                continue
 
-                        # Wrap the calculate_position_size call in a specific try-except
-                        pos_size = None
-                        actual_risk = None
-                        try:
-                            pos_size, actual_risk = await risk_management_module.calculate_position_size(
-                                symbol=symbol,
-                                entry_price=entry_f, 
-                                stop_loss_price=sl_f, 
-                                fixed_dollar_risk=fixed_dollar_risk
-                            )
-                        except KeyError as ke:
-                            # Check if this is the specific KeyError we are hunting
-                            problematic_key = '"retCode"' # The key causing the error, with literal quotes
-                            # Check if the problematic key string is present in the exception arguments
-                            if any(problematic_key in str(arg) for arg in ke.args):
-                                main_logger.error(f"Caught specific KeyError involving '\\\"retCode\\\"' during calculate_position_size for {signal_id}. Origin likely within RiskManagement or DataIngestion specs fetch.", exc_info=True)
-                            else:
-                                main_logger.error(f"Caught unexpected KeyError during calculate_position_size for {signal_id}: {ke}", exc_info=True)
-                            continue # Skip this signal if position size calculation fails
-                        except Exception as calc_e:
-                             main_logger.error(f"Caught general exception during calculate_position_size for {signal_id}: {calc_e}", exc_info=True)
-                             continue # Skip this signal
+                            # Wrap the calculate_position_size call in a specific try-except
+                            pos_size = None
+                            actual_risk = None
+                            try:
+                                pos_size, actual_risk = await risk_management_module.calculate_position_size(
+                                    symbol=symbol,
+                                    entry_price=entry_f, 
+                                    stop_loss_price=sl_f, 
+                                    fixed_dollar_risk=fixed_dollar_risk
+                                )
+                            except KeyError as ke:
+                                # Check if this is the specific KeyError we are hunting
+                                problematic_key = '"retCode"' # The key causing the error, with literal quotes
+                                # Check if the problematic key string is present in the exception arguments
+                                if any(problematic_key in str(arg) for arg in ke.args):
+                                    main_logger.error(f"Caught specific KeyError involving '\\\"retCode\\\"' during calculate_position_size for {signal_id}. Origin likely within RiskManagement or DataIngestion specs fetch.", exc_info=True)
+                                else:
+                                    main_logger.error(f"Caught unexpected KeyError during calculate_position_size for {signal_id}: {ke}", exc_info=True)
+                                continue # Skip this signal if position size calculation fails
+                            except Exception as calc_e:
+                                 main_logger.error(f"Caught general exception during calculate_position_size for {signal_id}: {calc_e}", exc_info=True)
+                                 continue # Skip this signal
 
-                        if pos_size is None or actual_risk is None:
-                            main_logger.error(f"Could not calculate position size for {signal_id} ({symbol}) (returned None). Skipping entry.")
-                            continue
-                        
-                        # --- Granular Logging Before Final Steps --- 
-                        main_logger.debug(f"[{signal_id}] Calculated pos_size: {pos_size} (Type: {type(pos_size)}), actual_risk: {actual_risk} (Type: {type(actual_risk)}) ")
-                        main_logger.debug(f"[{signal_id}] signal_data before assignment: {signal_data}")
-                        
-                        signal_data['position_size'] = pos_size 
-                        signal_data['actual_risk_usd'] = actual_risk
-                        
-                        main_logger.debug(f"[{signal_id}] signal_data after assignment: {signal_data}")
-                        main_logger.debug(f"[{signal_id}] Values for warning log - symbol: {symbol}, direction: {direction}, entry_f: {entry_f}")
-                        # --- End Granular Logging ---
-                        
-                        main_logger.warning(f"ATTEMPTING TO PLACE LIVE ORDER for signal {signal_id} ({symbol} {direction} @ {entry_f})")
-                        
-                        # --- Add specific try-except around the order placement call ---
-                        entry_order = None # Initialize to None before the try block
-                        try:
-                            main_logger.info(f"[{signal_id}] About to call order_executor.place_limit_entry_order")
-                            entry_order = await order_executor.place_limit_entry_order(
-                                symbol=symbol,
-                                side=direction, 
-                                qty=pos_size,
-                                price=entry_f 
-                            )
-                            main_logger.info(f"[{signal_id}] Returned from order_executor.place_limit_entry_order. Response: {entry_order}")
-                        except KeyError as ke_order_call:
-                            main_logger.error(f"KeyError specifically during place_limit_entry_order call for {signal_id}: {ke_order_call}", exc_info=True)
-                            # entry_order remains None, will be caught by subsequent checks or main exception handler
-                        except Exception as e_order_call:
-                            main_logger.error(f"Exception specifically during place_limit_entry_order call for {signal_id}: {e_order_call}", exc_info=True)
-                            # entry_order remains None
-                        # --- End specific try-except ---
+                            if pos_size is None or actual_risk is None:
+                                main_logger.error(f"Could not calculate position size for {signal_id} ({symbol}) (returned None). Skipping entry.")
+                                continue
+                            
+                            # --- >>> PRE-ORDER VALIDATION AGAINST CURRENT MARKET PRICE <<< ---
+                            proceed_to_place_order = True # Assume true, set to false if validation fails
+                            try:
+                                ticker = await order_executor.exchange.fetch_ticker(symbol)
+                                current_market_price = float(ticker['last'])
+                                main_logger.info(f"[{signal_id}] PRE-ORDER CHECK for {symbol}: Entry={entry_f}, SL={sl_f}, Current Market={current_market_price}")
 
-                        # --- Explicitly check if order placement failed --- 
-                        if entry_order is None:
-                            main_logger.error(f"Order placement failed for signal {signal_id} (returned None). Skipping further processing for this signal. Check OrderExecutor logs for details.")
-                            continue # Skip to the next potential signal
-                        # --- End explicit check ---
-                        
-                        # Check if the response *still* looks like a Bybit error (shouldn't happen with new executor logic, but safeguard)
-                        if isinstance(entry_order, dict) and entry_order.get('retCode') != 0 and not entry_order.get('id'):
-                            main_logger.error(f"Order placement seems to have failed for signal {signal_id} despite not returning None. Raw response: {entry_order}. Skipping.")
-                            continue
-                        
-                        # Proceed only if entry_order looks valid (has an 'id')
-                        entry_order_id = entry_order.get('id')
-                        if entry_order_id:
-                            main_logger.info(f"Successfully placed entry order {entry_order_id} for signal {signal_id} ({symbol}).")
+                                if direction.upper() == "BUY":
+                                    if sl_f >= current_market_price:
+                                        main_logger.warning(f"[{signal_id}] STALE/INVALID BUY (SL validation): SL ({sl_f}) is at or above current market ({current_market_price}). Invalidating pre-order.")
+                                        proceed_to_place_order = False
+                                    # Optional: Check if entry_f is too far from current_market_price (e.g., > 5% away, making it a chase)
+                                    # elif entry_f > current_market_price * 1.05: 
+                                    #     main_logger.warning(f"[{signal_id}] STALE BUY (Entry validation): Entry ({entry_f}) is >5% above current market ({current_market_price}). Invalidating pre-order.")
+                                    #     proceed_to_place_order = False
+                                elif direction.upper() == "SELL":
+                                    if sl_f <= current_market_price:
+                                        main_logger.warning(f"[{signal_id}] STALE/INVALID SELL (SL validation): SL ({sl_f}) is at or below current market ({current_market_price}). Invalidating pre-order.")
+                                        proceed_to_place_order = False
+                                    # Optional: Check if entry_f is too far from current_market_price
+                                    # elif entry_f < current_market_price * 0.95:
+                                    #     main_logger.warning(f"[{signal_id}] STALE SELL (Entry validation): Entry ({entry_f}) is <5% below current market ({current_market_price}). Invalidating pre-order.")
+                                    #     proceed_to_place_order = False
+                                
+                                if not proceed_to_place_order:
+                                    main_logger.info(f"[{signal_id}] Skipping order placement due to pre-order validation failure.")
+                                    continue # Skip to the next signal_data
+
+                            except Exception as e_ticker_val:
+                                main_logger.error(f"[{signal_id}] Error during pre-order ticker validation for {symbol}: {e_ticker_val}. Order will NOT be placed as a precaution.", exc_info=True)
+                                proceed_to_place_order = False # Do not proceed if ticker check fails
+                                continue # Skip to next signal if ticker fetch fails
+                            # --- >>> END PRE-ORDER VALIDATION <<< ---
                             
-                            # 4. Add to State Manager
-                            added = state_manager.add_signal_entry(signal_id, signal_data, entry_order_id)
-                            if not added:
-                                 main_logger.error(f"Failed to add signal {signal_id} to StateManager DB, but order {entry_order_id} was placed! Manual intervention may be required. Consider cancelling.")
-                                 # If this fails, we have an order without state tracking - needs manual check
+                            # This check is now redundant if continue is used above, but as a safeguard:
+                            # if not proceed_to_place_order:
+                            #    main_logger.debug(f"[{signal_id}] Double check: Not proceeding to order placement.")
+                            #    continue
+
+                            main_logger.info(f"[{signal_id}] Pre-order validation passed. Proceeding to place order for {symbol}.")
+                            # --- Granular Logging Before Final Steps --- 
+                            main_logger.debug(f"[{signal_id}] Calculated pos_size: {pos_size} (Type: {type(pos_size)}), actual_risk: {actual_risk} (Type: {type(actual_risk)}) ")
+                            main_logger.debug(f"[{signal_id}] signal_data before assignment: {signal_data}")
                             
-                            # 5. Enrich for Alert/Journal (Now that order is placed)
-                            specs = await risk_management_module.get_contract_specifications(symbol) 
-                            signal_data['tick_size'] = specs.get('tick_size') if specs else None
+                            signal_data['position_size'] = pos_size 
+                            signal_data['actual_risk_usd'] = actual_risk
                             
-                            tp_levels_str = "N/A"
-                            if signal_data['tick_size']:
+                            main_logger.debug(f"[{signal_id}] signal_data after assignment: {signal_data}")
+                            main_logger.debug(f"[{signal_id}] Values for warning log - symbol: {symbol}, direction: {direction}, entry_f: {entry_f}")
+                            # --- End Granular Logging ---
+                            
+                            main_logger.warning(f"ATTEMPTING TO PLACE LIVE ORDER for signal {signal_id} ({symbol} {direction} @ {entry_f})")
+                            
+                            # --- Add specific try-except around the order placement call ---
+                            entry_order = None # Initialize to None before the try block
+                            try:
+                                main_logger.info(f"[{signal_id}] About to call order_executor.place_limit_entry_order")
+                                
+                                # Calculate TP price for this order based on R:R
+                                tp_price_f = None
                                 try:
-                                     sl_distance = abs(entry_f - sl_f)
-                                     price_precision = SignalAlerter._get_price_precision(signal_data['tick_size'])
-                                     tp_ratios = config_manager.get('strategy_params.take_profit', {}).get('fixed_rr_ratios', [1.0, 2.0, 3.0])
-                                     tps = []
-                                     if sl_distance > 0:
-                                         for ratio in tp_ratios:
-                                             raw_tp = 0
-                                             if direction.upper() == "LONG": raw_tp = entry_f + (sl_distance * ratio)
-                                             elif direction.upper() == "SHORT": raw_tp = entry_f - (sl_distance * ratio)
-                                             else: continue
-                                             adjusted_tp = SignalAlerter._adjust_price_to_tick_size(raw_tp, signal_data['tick_size'], direction)
-                                             tps.append(f"TP{len(tps)+1} ({ratio}R): {adjusted_tp:.{price_precision}f}")
-                                         tp_levels_str = ", ".join(tps) if tps else "N/A"
-                                except Exception as calc_e:
-                                    main_logger.error(f"Error calculating TPs for alert/journal: {calc_e}")
-                            signal_data['take_profit_targets_str'] = tp_levels_str
-                            signal_data['entry_order_id'] = entry_order_id # Add order ID for logging
-                            signal_data['status'] = 'PENDING_ENTRY' # Add status for logging
-                            
-                            # 6. Log NEW PENDING signal to Journal & Alert
-                            main_logger.info(f"Logging and Alerting NEW PENDING signal: {signal_id}")
-                            journaling_module.log_trade_signal(signal_data) 
-                            signal_alerter.alert(signal_data) 
+                                    sl_distance = abs(entry_f - sl_f)
+                                    tp_params = config_manager.get('strategy_params.take_profit', {})
+                                    fixed_rr_ratios = tp_params.get('fixed_rr_ratios', [2.0])  # Default to 2R
+                                    primary_rr_target = fixed_rr_ratios[0] if fixed_rr_ratios else 2.0
+                                    
+                                    if direction.upper() == "BUY":
+                                        tp_price_f = entry_f + (sl_distance * primary_rr_target)
+                                    elif direction.upper() == "SELL":
+                                        tp_price_f = entry_f - (sl_distance * primary_rr_target)
+                                    else:
+                                        # This warning should now be less likely
+                                        tp_price_f = None
+                                except Exception as tp_calc_e:
+                                    main_logger.error(f"Error calculating TP price for entry order: {tp_calc_e}", exc_info=True)
+                                    tp_price_f = None
+                                
+                                # Place order with SL/TP included
+                                entry_order = await order_executor.place_limit_entry_order(
+                                    symbol=symbol,
+                                    side=direction, 
+                                    qty=pos_size,
+                                    price=entry_f,
+                                    sl_price=sl_f,  # Include SL price directly in order
+                                    tp_price=tp_price_f  # Include TP price if calculated
+                                )
+                                main_logger.info(f"[{signal_id}] Returned from order_executor.place_limit_entry_order. Response: {entry_order}")
+                            except KeyError as ke_order_call:
+                                main_logger.error(f"KeyError specifically during place_limit_entry_order call for {signal_id}: {ke_order_call}", exc_info=True)
+                                # entry_order remains None, will be caught by subsequent checks or main exception handler
+                            except Exception as e_order_call:
+                                main_logger.error(f"Exception specifically during place_limit_entry_order call for {signal_id}: {e_order_call}", exc_info=True)
+                                # entry_order remains None
+                            # --- End specific try-except ---
 
-                        else:
-                            # OrderExecutor now logs the specific Bybit error if retCode != 0
-                            main_logger.error(f"Failed to place entry order for signal {signal_id} ({symbol}). See OrderExecutor logs for details.")
-                            # No need to update state here as it wasn't added
+                            # --- Explicitly check if order placement failed --- 
+                            if entry_order is None:
+                                main_logger.error(f"Order placement failed for signal {signal_id} (returned None). Skipping further processing for this signal. Check OrderExecutor logs for details.")
+                                continue # Skip to the next potential signal
+                            # --- End explicit check ---
+                            
+                            # Check if the response *still* looks like a Bybit error (shouldn't happen with new executor logic, but safeguard)
+                            if isinstance(entry_order, dict) and entry_order.get('retCode') != 0 and not entry_order.get('id'):
+                                main_logger.error(f"Order placement seems to have failed for signal {signal_id} despite not returning None. Raw response: {entry_order}. Skipping.")
+                                continue
+                            
+                            # Proceed only if entry_order looks valid (has an 'id')
+                            entry_order_id = entry_order.get('id')
+                            if entry_order_id:
+                                main_logger.info(f"Successfully placed entry order {entry_order_id} for signal {signal_id} ({symbol}).")
+                                
+                                # Store SL/TP details if they were included with the order
+                                signal_data['entry_order_data'] = {
+                                    'id': entry_order_id,
+                                    'has_sltp': entry_order.get('has_sltp', False),
+                                    'sl_price': entry_order.get('sl_price'), # Original SL sent
+                                    'tp_price': entry_order.get('tp_price')  # Actual TP sent
+                                }
+                                
+                                if signal_data['entry_order_data']['has_sltp']:
+                                    main_logger.info(f"Entry order {entry_order_id} for {signal_id} includes SL ({signal_data['entry_order_data']['sl_price']}) & TP ({signal_data['entry_order_data']['tp_price']}) directly.")
+                                
+                                # 4. Add to State Manager, now including the actual_tp_ordered if available
+                                actual_tp_ordered_for_db = signal_data['entry_order_data'].get('tp_price') if signal_data['entry_order_data'].get('has_sltp') else None
+                                added = state_manager.add_signal_entry(
+                                    signal_id,
+                                    signal_data, 
+                                    entry_order_id,
+                                    actual_tp_ordered=actual_tp_ordered_for_db
+                                )
+                                if not added:
+                                     main_logger.error(f"Failed to add signal {signal_id} to StateManager DB, but order {entry_order_id} was placed! Manual intervention required.")
+                                
+                                # 5. Enrich for Alert/Journal (Now that order is placed)
+                                specs = await risk_management_module.get_contract_specifications(symbol) 
+                                signal_data['tick_size'] = specs.get('tick_size') if specs else None
+                                
+                                tp_levels_str = "N/A"
+                                if signal_data['tick_size']:
+                                    try:
+                                         sl_distance = abs(entry_f - sl_f)
+                                         price_precision = SignalAlerter._get_price_precision(signal_data['tick_size'])
+                                         tp_ratios = config_manager.get('strategy_params.take_profit', {}).get('fixed_rr_ratios', [1.0, 2.0, 3.0])
+                                         tps = []
+                                         if sl_distance > 0:
+                                             for ratio in tp_ratios:
+                                                 raw_tp = 0
+                                                 if direction.upper() == "BUY": raw_tp = entry_f + (sl_distance * ratio)
+                                                 elif direction.upper() == "SELL": raw_tp = entry_f - (sl_distance * ratio)
+                                                 else: continue
+                                                 adjusted_tp = SignalAlerter._adjust_price_to_tick_size(raw_tp, signal_data['tick_size'], direction)
+                                                 tps.append(f"TP{len(tps)+1} ({ratio}R): {adjusted_tp:.{price_precision}f}")
+                                             tp_levels_str = ", ".join(tps) if tps else "N/A"
+                                    except Exception as calc_e:
+                                        main_logger.error(f"Error calculating TPs for alert/journal: {calc_e}")
+                                signal_data['take_profit_targets_str'] = tp_levels_str
+                                signal_data['entry_order_id'] = entry_order_id # Add order ID for logging
+                                signal_data['status'] = 'PENDING_ENTRY' # Add status for logging
+                                
+                                # 6. Log NEW PENDING signal to Journal & Alert
+                                main_logger.info(f"Logging and Alerting NEW PENDING signal: {signal_id}")
+                                journaling_module.log_trade_signal(signal_data) 
+                                signal_alerter.alert(signal_data) 
+
+                            else:
+                                # OrderExecutor now logs the specific Bybit error if retCode != 0
+                                main_logger.error(f"Failed to place entry order for signal {signal_id} ({symbol}). See OrderExecutor logs for details.")
+                                # No need to update state here as it wasn't added
 
                     except Exception as e:
                          # Log which signal ID (if generated) failed and the specific exception
@@ -488,9 +601,9 @@ async def run_scanner():
                             status = order_status_details.get('status')
                             main_logger.info(f"Order {order_id} (Signal ID: {signal_id}) status: {status}")
 
-                            if status == 'filled': # 'filled' is a common status, ccxt might use 'closed' for fully filled.
-                                main_logger.info(f"Entry order {order_id} for signal {signal_id} ({symbol}) is FILLED.")
-                                filled_price = order_status_details.get('averagePrice', signal_data.get('entry_price')) # Use averagePrice if available
+                            if status == 'filled' or status == 'closed': 
+                                main_logger.info(f"Entry order {order_id} for signal {signal_id} ({symbol}) is FILLED/CLOSED.")
+                                filled_price = order_status_details.get('averagePrice', signal_data.get('entry_price')) 
                                 filled_qty = order_status_details.get('filled', signal_data.get('position_size'))
                                 
                                 state_manager.update_signal_status(signal_id, 'ENTRY_FILLED', {'filled_price': filled_price, 'filled_qty': filled_qty})
@@ -508,23 +621,25 @@ async def run_scanner():
                                     main_logger=main_logger
                                 )
 
-                            elif status in ['canceled', 'rejected', 'expired']:
-                                main_logger.warning(f"Entry order {order_id} for signal {signal_id} ({symbol}) is {status}.")
-                                state_manager.update_signal_status(signal_id, status.upper()) # e.g., CANCELLED, REJECTED
                             elif status == 'open':
                                 main_logger.info(f"Entry order {order_id} for signal {signal_id} ({symbol}) is still OPEN.")
-                            else: # Other statuses like 'new', 'partially_filled' (if not 'closed')
-                                main_logger.info(f"Order {order_id} (Signal ID: {signal_id}) has status '{status}'. No action taken yet.")
+                            # Handle new statuses from check_order_status
+                            elif status in ['notfound', 'unknown_after_retries', 'historical_notfound']:
+                                new_db_status = 'CANCELLED_STALE_NOT_FOUND' if status == 'historical_notfound' else 'UNKNOWN_API_STATUS'
+                                main_logger.error(f"Order {order_id} for signal {signal_id} ({symbol}) reported as '{status}' by OrderExecutor. Marking as {new_db_status} in DB.")
+                                state_manager.update_signal_status(signal_id, new_db_status, {'error_message': f'Order status check returned {status}'})
+                            elif status in ['network_error', 'exchange_error', 'unexpected_error_check_status', 'unknown_loop_exit']:
+                                main_logger.error(f"Order {order_id} for signal {signal_id} ({symbol}) encountered error: '{status}'. Marking as CHECK_STATUS_FAILED in DB.")
+                                state_manager.update_signal_status(signal_id, 'CHECK_STATUS_FAILED', {'error_message': f'Order status check returned {status}.'})
+                            else: 
+                                main_logger.info(f"Order {order_id} (Signal ID: {signal_id}) has status '{status}'. No status update action taken in DB yet.")
                         else:
-                            main_logger.warning(f"Could not retrieve status for order {order_id} (Signal ID: {signal_id}). It might have been cancelled or does not exist anymore.")
+                            main_logger.warning(f"Could not retrieve status details for order {order_id} (Signal ID: {signal_id}) from OrderExecutor (returned None/empty). This should ideally not happen.")
                             # Consider updating status to ERROR or UNKNOWN if consistently not found.
-                            # For now, let's assume it might be a temporary issue or already processed/cancelled.
-                            # If an order is not found, it's often equivalent to 'canceled' or 'filled and removed from history'
-                            # Check if signal still PENDING_ENTRY, if so, might be an issue.
-                            current_db_signal = state_manager.get_signal(signal_id)
-                            if current_db_signal and current_db_signal['status'] == 'PENDING_ENTRY':
-                                main_logger.error(f"Order {order_id} for signal {signal_id} not found by API, but still PENDING_ENTRY in DB. Marking as UNKNOWN_API_STATUS.")
-                                state_manager.update_signal_status(signal_id, 'UNKNOWN_API_STATUS')
+                            # current_db_signal = state_manager.get_signal(signal_id)
+                            # if current_db_signal and current_db_signal['status'] == 'PENDING_ENTRY':
+                            #     main_logger.error(f"Order {order_id} for signal {signal_id} status check failed, but still PENDING_ENTRY in DB. Marking as CHECK_STATUS_FAILED.")
+                            #     state_manager.update_signal_status(signal_id, 'CHECK_STATUS_FAILED')
 
                     except Exception as e:
                         main_logger.error(f"Error checking status for order {order_id} (Signal ID: {signal_id}): {e}", exc_info=True)

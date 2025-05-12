@@ -18,7 +18,7 @@ class JournalingModule:
         self.csv_headers = [
             "TimestampUTC", "Symbol", "Direction", "ConfidenceScore",
             "EntryPrice", "StopLossPrice", "PositionSize", "ActualRiskUSD",
-            "CalculatedTPs", # This could be a string representation of multiple TPs
+            "CalculatedTPs", "HypotheticalTPPrice", # Add new header
             "BOSLevel15m", "FVGLow15m", "FVGHigh15m", "FibLevels15mTouched",
             "EntryTrigger5m", "TickSize",
             # Future bot fields (can be empty for scanner)
@@ -73,7 +73,8 @@ class JournalingModule:
             row_to_write["StopLossPrice"] = signal_data.get('stop_loss_price')
             row_to_write["PositionSize"] = signal_data.get('position_size')
             row_to_write["ActualRiskUSD"] = signal_data.get('actual_risk_usd')
-            row_to_write["CalculatedTPs"] = signal_data.get('take_profit_targets_str') # Assuming SignalAlerter might pass this formatted string
+            row_to_write["CalculatedTPs"] = signal_data.get('take_profit_targets_str')
+            row_to_write["HypotheticalTPPrice"] = signal_data.get('hypothetical_tp_price')
             row_to_write["BOSLevel15m"] = signal_data.get('bos_level_15m')
             row_to_write["FVGLow15m"] = signal_data.get('fvg_low_15m')
             row_to_write["FVGHigh15m"] = signal_data.get('fvg_high_15m')
