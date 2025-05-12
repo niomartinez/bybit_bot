@@ -23,7 +23,8 @@
     },
     "scanner": {
         "scan_interval_minutes": 5,
-        "delay_between_symbols_seconds": 0.5 
+        "delay_between_symbols_seconds": 0.5,
+        "staleness_entry_deviation_percent": 2.0
     },
     "portfolio": {
         "coins_to_scan": [
@@ -31,7 +32,35 @@
             "ETHUSDT",
             "SOLUSDT",
             "XRPUSDT",
-            "DOGEUSDT"
+            "DOGEUSDT",
+            "SUIUSDT",
+            "RENDERUSDT",
+            "OMUSDT",
+            "ONDOUSDT",
+            "WIFUSDT",
+            "POPCATUSDT",
+            "ADAUSDT",
+            "FARTCOINUSDT",
+            "MOODENGUSDT",
+            "1000PEPEUSDT",
+            "1000BONKUSDT",
+            "TRUMPUSDT",
+            "ENAUSDT",
+            "NEARUSDT",
+            "AVAXUSDT",
+            "AAVEUSDT",
+            "HBARUSDT",
+            "BNBUSDT",
+            "HYPEUSDT",
+            "HYPERUSDT",
+            "KAITOUSDT",
+            "TAOUSDT",
+            "TIAUSDT",
+            "SEIUSDT",
+            "ARKMUSDT",
+            "GRASSUSDT",
+            "PLUMUSDT",
+            "GUNUSDT"
         ],
         "max_concurrent_trades": 1
     },
@@ -55,7 +84,7 @@
             "confirmation_candles": 1
         },
         "fvg": {
-            "sensitivity_factor": 0.2
+            "sensitivity_factor": 0.1
         },
         "fibonacci": {
             "levels_to_watch": [0.50, 0.618, 0.786],

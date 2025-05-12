@@ -606,23 +606,156 @@ async def run_scanner():
                                 filled_price = order_status_details.get('averagePrice', signal_data.get('entry_price')) 
                                 filled_qty = order_status_details.get('filled', signal_data.get('position_size'))
                                 
+                                # Ensure status update happens *before* triggering next step
                                 state_manager.update_signal_status(signal_id, 'ENTRY_FILLED', {'filled_price': filled_price, 'filled_qty': filled_qty})
                                 main_logger.info(f"Updated signal {signal_id} status to ENTRY_FILLED in StateManager.")
                                 
                                 # --- Trigger SL/TP Placement ---
                                 main_logger.info(f"Attempting to place SL/TP orders for filled signal {signal_id}...")
-                                await place_sl_tp_orders_for_signal(
-                                    signal_id=signal_id, 
-                                    signal_data=signal_data, # This is the recently JSON loaded one from this loop
-                                    order_executor=order_executor, 
-                                    state_manager=state_manager, 
-                                    risk_management_module=risk_management_module, 
-                                    config_manager=config_manager,
-                                    main_logger=main_logger
-                                )
-
+                                # Fetch the *updated* signal details from DB which now include filled_price/qty
+                                updated_db_signal_details = state_manager.get_signal(signal_id)
+                                if updated_db_signal_details and updated_db_signal_details['status'] == 'ENTRY_FILLED':
+                                    try:
+                                        updated_signal_data_for_sltp = json.loads(updated_db_signal_details['signal_data']) if isinstance(updated_db_signal_details['signal_data'], str) else updated_db_signal_details['signal_data']
+                                        # Enrich with DB fields
+                                        updated_signal_data_for_sltp['filled_price'] = updated_db_signal_details.get('filled_price')
+                                        updated_signal_data_for_sltp['filled_qty'] = updated_db_signal_details.get('filled_qty')
+                                        
+                                        await place_sl_tp_orders_for_signal(
+                                            signal_id=signal_id, 
+                                            signal_data=updated_signal_data_for_sltp, # Pass data possibly enriched with filled details
+                                            order_executor=order_executor, 
+                                            state_manager=state_manager, 
+                                            risk_management_module=risk_management_module, 
+                                            config_manager=config_manager,
+                                            main_logger=main_logger
+                                        )
+                                    except json.JSONDecodeError as jde_sltp:
+                                        main_logger.error(f"Error decoding updated signal_data for SL/TP placement (Signal ID: {signal_id}): {jde_sltp}. SL/TP placement aborted.")
+                                        state_manager.update_signal_status(signal_id, 'SLTP_PLACEMENT_FAILED_JSON_ERROR', {'error_message': f"JSON decode error before SL/TP placement: {jde_sltp}"})
+                                    except Exception as e_sltp:
+                                        main_logger.error(f"Unexpected error during SL/TP placement call for signal {signal_id}: {e_sltp}", exc_info=True)
+                                        state_manager.update_signal_status(signal_id, 'SLTP_PLACEMENT_FAILED_UNKNOWN_ERROR', {'error_message': f"Unknown error during SL/TP placement: {e_sltp}"})
+                                else:
+                                     main_logger.error(f"Could not retrieve updated ENTRY_FILLED signal {signal_id} from DB before placing SL/TP. Aborting SL/TP.")
+                                     # Status remains ENTRY_FILLED, but needs manual check for SL/TP
+                            
                             elif status == 'open':
                                 main_logger.info(f"Entry order {order_id} for signal {signal_id} ({symbol}) is still OPEN.")
+                                # --- >>> Stale Order Cancellation Logic <<< ---
+                                try:
+                                    # Retrieve necessary details from signal_data (already loaded from JSON)
+                                    # and signal_in_db (which is the direct DB record)
+                                    entry_price_f = float(signal_data.get('entry_price'))
+                                    sl_price_f = float(signal_data.get('stop_loss_price'))
+                                    direction = signal_data.get('direction')
+                                    # Get hypothetical_tp_price from the database record for the signal
+                                    hypothetical_tp_price_str = signal_in_db.get('hypothetical_tp_price')
+                                    hypothetical_tp_price_f = None # Initialize
+
+                                    if hypothetical_tp_price_str is not None:
+                                        try:
+                                            hypothetical_tp_price_f = float(hypothetical_tp_price_str)
+                                        except ValueError:
+                                            main_logger.error(f"[{signal_id}] Invalid format for hypothetical_tp_price ('{hypothetical_tp_price_str}'). Skipping market-based staleness check for TP.")
+                                    else:
+                                         main_logger.warning(f"[{signal_id}] Missing hypothetical_tp_price for stale check. Skipping market-based staleness check for TP.")
+
+                                    main_logger.debug(f"[{signal_id}] Performing market-based staleness check for OPEN PENDING_ENTRY order {order_id}.")
+                                    
+                                    ticker = await order_executor.exchange.fetch_ticker(symbol)
+                                    current_market_price = float(ticker['last'])
+                                    main_logger.info(f"[{signal_id}] Stale Check: Current Market Price for {symbol} is {current_market_price}. Entry: {entry_price_f}, SL: {sl_price_f}, Hypo TP: {hypothetical_tp_price_f if hypothetical_tp_price_f is not None else 'N/A'}")
+
+                                    cancel_reason = None
+                                    cancellation_details_for_db = {}
+
+                                    # 1. Check TP Hit
+                                    if hypothetical_tp_price_f is not None:
+                                        if direction.upper() == "BUY" and current_market_price >= hypothetical_tp_price_f:
+                                            cancel_reason = "CANCELLED_STALE_TP_HIT_MARKET"
+                                            main_logger.warning(f"[{signal_id}] STALE (TP Hit Market): Buy order {order_id}, Current Price ({current_market_price}) >= Hypo TP ({hypothetical_tp_price_f})")
+                                        elif direction.upper() == "SELL" and current_market_price <= hypothetical_tp_price_f:
+                                            cancel_reason = "CANCELLED_STALE_TP_HIT_MARKET"
+                                            main_logger.warning(f"[{signal_id}] STALE (TP Hit Market): Sell order {order_id}, Current Price ({current_market_price}) <= Hypo TP ({hypothetical_tp_price_f})")
+                                    
+                                    # 2. Check SL Hit/Invalidated (if not already TP hit)
+                                    if not cancel_reason:
+                                        if direction.upper() == "BUY" and current_market_price <= sl_price_f:
+                                            cancel_reason = "CANCELLED_STALE_SL_HIT_MARKET"
+                                            main_logger.warning(f"[{signal_id}] STALE (SL Hit Market): Buy order {order_id}, Current Price ({current_market_price}) <= SL ({sl_price_f})")
+                                        elif direction.upper() == "SELL" and current_market_price >= sl_price_f:
+                                            cancel_reason = "CANCELLED_STALE_SL_HIT_MARKET"
+                                            main_logger.warning(f"[{signal_id}] STALE (SL Hit Market): Sell order {order_id}, Current Price ({current_market_price}) >= SL ({sl_price_f})")
+
+                                    # 3. Check if entry is too far from current market (market moved away)
+                                    if not cancel_reason:
+                                        staleness_deviation_percent = config_manager.get("scanner.staleness_entry_deviation_percent", 2.0) / 100.0
+                                        if direction.upper() == "BUY" and entry_price_f < current_market_price * (1 - staleness_deviation_percent):
+                                            # For a buy, if entry is significantly *below* current market (market ran up)
+                                            cancel_reason = "CANCELLED_STALE_MARKET_MOVED_AWAY"
+                                            main_logger.warning(f"[{signal_id}] STALE (Market Moved Away): Buy order {order_id}, Entry ({entry_price_f}) < Current Price ({current_market_price}) by > {staleness_deviation_percent*100:.2f}%")
+                                        elif direction.upper() == "SELL" and entry_price_f > current_market_price * (1 + staleness_deviation_percent):
+                                            # For a sell, if entry is significantly *above* current market (market ran down)
+                                            cancel_reason = "CANCELLED_STALE_MARKET_MOVED_AWAY"
+                                            main_logger.warning(f"[{signal_id}] STALE (Market Moved Away): Sell order {order_id}, Entry ({entry_price_f}) > Current Price ({current_market_price}) by > {staleness_deviation_percent*100:.2f}%")
+
+                                    # --- Attempt Cancellation If Stale ---
+                                    if cancel_reason:
+                                        main_logger.info(f"[{signal_id}] Order {order_id} for {symbol} is STALE due to '{cancel_reason}'. Attempting cancellation.")
+                                        cancellation_details_for_db = {
+                                            'cancellation_reason': cancel_reason,
+                                            'market_price_at_cancellation': current_market_price,
+                                            'original_entry': entry_price_f,
+                                            'original_sl': sl_price_f,
+                                            'hypothetical_tp': hypothetical_tp_price_f if hypothetical_tp_price_f is not None else None
+                                        }
+                                        # Cancel the order
+                                        cancel_api_response = await order_executor.cancel_order(order_id, symbol)
+                                        
+                                        # Check Bybit V5 response structure for cancellation confirmation
+                                        # Successful cancellation often returns the order details with status 'Cancelled' or 'Canceled'
+                                        if cancel_api_response and (
+                                            cancel_api_response.get('id') == order_id or 
+                                            cancel_api_response.get('status', '').lower() in ['canceled', 'cancelled'] or
+                                            cancel_api_response.get('orderStatus', '').lower() in ['canceled', 'cancelled'] # Common Bybit V5 field
+                                            ):
+                                            main_logger.info(f"[{signal_id}] Successfully cancelled stale order {order_id}. API Response: {cancel_api_response}")
+                                            cancellation_details_for_db['cancel_api_response_status'] = cancel_api_response.get('status', cancel_api_response.get('orderStatus', 'Success'))
+                                            state_manager.update_signal_status(signal_id, cancel_reason, cancellation_details_for_db)
+                                        else:
+                                            # Handle potential errors like "Order has been filled" or "Order not found / already cancelled" gracefully
+                                            # These might not be 'failures' in cancelling, but indicate the order state changed before cancellation could execute.
+                                            ret_code = cancel_api_response.get('retCode') if isinstance(cancel_api_response, dict) else None
+                                            ret_msg = cancel_api_response.get('retMsg', 'Unknown error or non-dict response') if isinstance(cancel_api_response, dict) else str(cancel_api_response)
+
+                                            # Specific Bybit error codes for "already filled/cancelled" etc. should be checked here if known.
+                                            # Example: 110007 often means order not found or already processed
+                                            if ret_code == 110007 or "order not exists" in ret_msg.lower() or "order has been filled" in ret_msg.lower() or "order has been cancelled" in ret_msg.lower():
+                                                 main_logger.warning(f"[{signal_id}] Attempted to cancel stale order {order_id}, but it was likely already filled/cancelled. API Response: {cancel_api_response}. Will re-check status normally.")
+                                                 # Don't update status to CANCELLATION_FAILED here, let the normal status check proceed
+                                            else:
+                                                 main_logger.error(f"[{signal_id}] Failed to cancel stale order {order_id} or cancellation not confirmed by API. API Response: {cancel_api_response}")
+                                                 cancellation_details_for_db['cancel_api_response_status'] = 'FAILURE_OR_UNKNOWN'
+                                                 cancellation_details_for_db['cancel_api_raw_response'] = str(cancel_api_response) # Store raw response for debugging
+                                                 state_manager.update_signal_status(signal_id, "CANCELLATION_FAILED_STALE", cancellation_details_for_db)
+                                        
+                                        # IMPORTANT: After cancellation attempt (success or fail), skip further API status checks for this order *in this cycle*.
+                                        # The state is updated, or normal check will happen next cycle if cancellation failed non-terminally.
+                                        continue # Skip to the next signal_in_db in pending_entry_signals
+                                        
+                                except Exception as stale_check_e:
+                                    main_logger.error(f"[{signal_id}] Error during market-based stale check for order {order_id}: {stale_check_e}", exc_info=True)
+                                    # Log error but allow loop to continue to check other orders or potentially re-check this one next cycle
+                                # --- <<< End Stale Order Cancellation Logic >>> ---
+
+                            # Handle other API statuses ('canceled', 'rejected', etc.) - This part remains unchanged
+                            elif status in ['canceled', 'cancelled']:
+                                main_logger.info(f"Order {order_id} (Signal ID: {signal_id}) has status '{status}'. Updating DB status.")
+                                state_manager.update_signal_status(signal_id, 'CANCELLED', {'cancellation_reason': 'API reported Canceled'})
+                            elif status in ['rejected', 'expired']:
+                                main_logger.warning(f"Order {order_id} (Signal ID: {signal_id}) has status '{status}'. Updating DB status.")
+                                state_manager.update_signal_status(signal_id, status.upper(), {'rejection_reason': f'API reported {status}'})
                             # Handle new statuses from check_order_status
                             elif status in ['notfound', 'unknown_after_retries', 'historical_notfound']:
                                 new_db_status = 'CANCELLED_STALE_NOT_FOUND' if status == 'historical_notfound' else 'UNKNOWN_API_STATUS'
