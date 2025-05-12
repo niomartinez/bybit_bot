@@ -76,71 +76,84 @@ class RiskManagementModule:
             self.logger.error(f"Could not calculate position size for {symbol} due to missing contract specs.")
             return None, None
 
-        if specs['quote_currency'] != 'USDT' and specs['is_linear']: # Add more robust check later
-             self.logger.warning(f"Calculating position size for {symbol} which is {specs['quote_currency']} margined. Ensure logic is correct.")
+        # Add try block around calculations using specs
+        try: 
+            if specs['quote_currency'] != 'USDT' and specs['is_linear']: # Add more robust check later
+                 self.logger.warning(f"Calculating position size for {symbol} which is {specs['quote_currency']} margined. Ensure logic is correct.")
 
-        if entry_price == stop_loss_price:
-            self.logger.error("Entry price cannot be equal to stop-loss price.")
-            return None, None
-
-        sl_distance_price = abs(entry_price - stop_loss_price)
-        if sl_distance_price == 0:
-            self.logger.error("Stop-loss distance is zero.")
-            return None, None
-        
-        # For linear contracts (e.g., BTC/USDT where profit/loss is in USDT):
-        # Risk per contract = SL distance in price * contract_size (e.g., 1 for BTCUSDT means 1 contract = 1 BTC)
-        # Contract size is the amount of base currency per contract.
-        risk_per_contract_if_sl_hit = sl_distance_price * float(specs['contract_size'])
-
-        if risk_per_contract_if_sl_hit <= 0:
-            self.logger.error(f"Risk per contract is zero or negative for {symbol}: {risk_per_contract_if_sl_hit}. Check contract specs and prices.")
-            return None, None
-
-        initial_position_size = fixed_dollar_risk / risk_per_contract_if_sl_hit
-        self.logger.debug(f"Initial calculated position size for {symbol}: {initial_position_size}")
-
-        # Adjust to meet exchange's quantity step (lot size for quantity)
-        # E.g., if quantity_step is 0.001, position size must be a multiple of 0.001
-        quantity_step = float(specs['quantity_step'])
-        adjusted_position_size = math.floor(initial_position_size / quantity_step) * quantity_step
-        
-        # Ensure it's not rounded down to zero if initial size was very small but > 0
-        if adjusted_position_size == 0 and initial_position_size > 0:
-             # Try rounding to the smallest possible step if fixed risk allows
-            adjusted_position_size = quantity_step 
-            if (risk_per_contract_if_sl_hit * adjusted_position_size) > (fixed_dollar_risk * 1.5): # Allow some margin for very small risk
-                 self.logger.warning(f"Calculated position size {initial_position_size} for {symbol} is too small, rounding to {quantity_step} leads to risk {(risk_per_contract_if_sl_hit * adjusted_position_size):.2f} which exceeds target ${fixed_dollar_risk} significantly. Min order qty might not be met.")
-                 adjusted_position_size = 0 # Reset if it would cause too much risk
-
-        self.logger.debug(f"Position size for {symbol} after adjusting for quantity_step ({quantity_step}): {adjusted_position_size}")
-
-        min_order_qty = float(specs['min_order_qty'])
-        if adjusted_position_size < min_order_qty:
-            self.logger.warning(f"Adjusted position size {adjusted_position_size} for {symbol} is below min_order_qty {min_order_qty}. Attempting to use min_order_qty.")
-            # Check if using min_order_qty is within acceptable risk (e.g., not more than 1.5x fixed_dollar_risk)
-            risk_at_min_qty = risk_per_contract_if_sl_hit * min_order_qty
-            if risk_at_min_qty > (fixed_dollar_risk * 1.5): # Arbitrary 50% over risk budget
-                self.logger.error(f"Using min_order_qty {min_order_qty} for {symbol} would result in risk ${risk_at_min_qty:.2f}, exceeding target ${fixed_dollar_risk} by too much. Cannot place trade.")
+            if entry_price == stop_loss_price:
+                self.logger.error("Entry price cannot be equal to stop-loss price.")
                 return None, None
-            adjusted_position_size = min_order_qty
-            self.logger.info(f"Using min_order_qty {min_order_qty} for {symbol}. Actual risk will be ${risk_at_min_qty:.2f}.")
+
+            sl_distance_price = abs(entry_price - stop_loss_price)
+            if sl_distance_price == 0:
+                self.logger.error("Stop-loss distance is zero.")
+                return None, None
+            
+            # For linear contracts (e.g., BTC/USDT where profit/loss is in USDT):
+            # Risk per contract = SL distance in price * contract_size (e.g., 1 for BTCUSDT means 1 contract = 1 BTC)
+            # Contract size is the amount of base currency per contract.
+            risk_per_contract_if_sl_hit = sl_distance_price * float(specs['contract_size'])
+
+            if risk_per_contract_if_sl_hit <= 0:
+                self.logger.error(f"Risk per contract is zero or negative for {symbol}: {risk_per_contract_if_sl_hit}. Check contract specs and prices.")
+                return None, None
+
+            initial_position_size = fixed_dollar_risk / risk_per_contract_if_sl_hit
+            self.logger.debug(f"Initial calculated position size for {symbol}: {initial_position_size}")
+
+            # Adjust to meet exchange's quantity step (lot size for quantity)
+            # E.g., if quantity_step is 0.001, position size must be a multiple of 0.001
+            quantity_step = float(specs['quantity_step'])
+            adjusted_position_size = math.floor(initial_position_size / quantity_step) * quantity_step
+            
+            # Ensure it's not rounded down to zero if initial size was very small but > 0
+            if adjusted_position_size == 0 and initial_position_size > 0:
+                 # Try rounding to the smallest possible step if fixed risk allows
+                adjusted_position_size = quantity_step 
+                if (risk_per_contract_if_sl_hit * adjusted_position_size) > (fixed_dollar_risk * 1.5): # Allow some margin for very small risk
+                     self.logger.warning(f"Calculated position size {initial_position_size} for {symbol} is too small, rounding to {quantity_step} leads to risk {(risk_per_contract_if_sl_hit * adjusted_position_size):.2f} which exceeds target ${fixed_dollar_risk} significantly. Min order qty might not be met.")
+                     adjusted_position_size = 0 # Reset if it would cause too much risk
+
+            self.logger.debug(f"Position size for {symbol} after adjusting for quantity_step ({quantity_step}): {adjusted_position_size}")
+
+            min_order_qty = float(specs['min_order_qty'])
+            if adjusted_position_size < min_order_qty:
+                self.logger.warning(f"Adjusted position size {adjusted_position_size} for {symbol} is below min_order_qty {min_order_qty}. Attempting to use min_order_qty.")
+                # Check if using min_order_qty is within acceptable risk (e.g., not more than 1.5x fixed_dollar_risk)
+                risk_at_min_qty = risk_per_contract_if_sl_hit * min_order_qty
+                if risk_at_min_qty > (fixed_dollar_risk * 1.5): # Arbitrary 50% over risk budget
+                    self.logger.error(f"Using min_order_qty {min_order_qty} for {symbol} would result in risk ${risk_at_min_qty:.2f}, exceeding target ${fixed_dollar_risk} by too much. Cannot place trade.")
+                    return None, None
+                adjusted_position_size = min_order_qty
+                self.logger.info(f"Using min_order_qty {min_order_qty} for {symbol}. Actual risk will be ${risk_at_min_qty:.2f}.")
 
 
-        if specs.get('max_order_qty') is not None:
-            max_order_qty = float(specs['max_order_qty'])
-            if adjusted_position_size > max_order_qty:
-                self.logger.warning(f"Adjusted position size {adjusted_position_size} for {symbol} exceeds max_order_qty {max_order_qty}. Clamping to max_order_qty.")
-                adjusted_position_size = max_order_qty
-        
-        if adjusted_position_size <= 0:
-            self.logger.error(f"Final adjusted position size for {symbol} is {adjusted_position_size}. Cannot place trade.")
+            if specs.get('max_order_qty') is not None:
+                max_order_qty = float(specs['max_order_qty'])
+                if adjusted_position_size > max_order_qty:
+                    self.logger.warning(f"Adjusted position size {adjusted_position_size} for {symbol} exceeds max_order_qty {max_order_qty}. Clamping to max_order_qty.")
+                    adjusted_position_size = max_order_qty
+            
+            if adjusted_position_size <= 0:
+                self.logger.error(f"Final adjusted position size for {symbol} is {adjusted_position_size}. Cannot place trade.")
+                return None, None
+
+            actual_risk_usd = risk_per_contract_if_sl_hit * adjusted_position_size
+            self.logger.info(f"Final calculated position size for {symbol}: {adjusted_position_size}, Actual $ risk: {actual_risk_usd:.2f}")
+
+            return adjusted_position_size, actual_risk_usd
+            
+        except KeyError as ke:
+            # Catch KeyError specifically during calculations using specs
+            self.logger.error(f"Caught KeyError during position size calculation logic for {symbol}: {ke}. Problem accessing specs field.", exc_info=True)
+            self.logger.error(f"Specs being used when error occurred: {specs}")
             return None, None
-
-        actual_risk_usd = risk_per_contract_if_sl_hit * adjusted_position_size
-        self.logger.info(f"Final calculated position size for {symbol}: {adjusted_position_size}, Actual $ risk: {actual_risk_usd:.2f}")
-
-        return adjusted_position_size, actual_risk_usd
+        except Exception as e:
+            # Catch any other unexpected errors during calculation
+            self.logger.error(f"Unexpected error during position size calculation logic for {symbol}: {e}", exc_info=True)
+            self.logger.error(f"Specs being used when error occurred: {specs}")
+            return None, None
 
 # Example Usage (for testing - to be moved to a test script or main.py)
 if __name__ == '__main__':

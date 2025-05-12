@@ -47,19 +47,45 @@ class StateManager:
                     symbol TEXT NOT NULL,
                     direction TEXT NOT NULL,
                     poi_key TEXT,  -- e.g., timestamp or hash of POI details
-                    status TEXT NOT NULL, -- PENDING_ENTRY, ENTRY_FILLED, POSITION_OPEN, SL_FILLED, TP_FILLED, CANCELLED, ERROR
+                    status TEXT NOT NULL, -- PENDING_ENTRY, ENTRY_FILLED, POSITION_OPEN, SL_FILLED, TP_FILLED, CANCELLED, ERROR, etc.
                     entry_order_id TEXT,
                     sl_order_id TEXT,
                     tp_order_id TEXT, 
                     entry_signal_price REAL,
                     entry_fill_price REAL,
+                    closed_price REAL, -- Added field for closed price
+                    closed_by TEXT, -- Added field for closure reason (SL/TP)
                     sl_price REAL,
                     tp_price REAL, -- Could store primary TP price or JSON of multiple TPs
                     position_size REAL,
+                    filled_qty REAL, -- Added field for actual filled quantity
+                    signal_data TEXT, -- Stores the original signal data as JSON
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
                 """)
+                
+                # --- Add new columns if they don't exist (for existing databases) ---
+                # Function to check if a column exists
+                def column_exists(cursor, table_name, column_name):
+                    cursor.execute(f"PRAGMA table_info({table_name});")
+                    columns = [info[1] for info in cursor.fetchall()]
+                    return column_name in columns
+
+                if not column_exists(cursor, 'tracked_signals', 'signal_data'):
+                    cursor.execute("ALTER TABLE tracked_signals ADD COLUMN signal_data TEXT;")
+                    self.logger.info("Added missing column 'signal_data' to tracked_signals table.")
+                if not column_exists(cursor, 'tracked_signals', 'filled_qty'):
+                    cursor.execute("ALTER TABLE tracked_signals ADD COLUMN filled_qty REAL;")
+                    self.logger.info("Added missing column 'filled_qty' to tracked_signals table.")
+                if not column_exists(cursor, 'tracked_signals', 'closed_price'):
+                    cursor.execute("ALTER TABLE tracked_signals ADD COLUMN closed_price REAL;")
+                    self.logger.info("Added missing column 'closed_price' to tracked_signals table.")
+                if not column_exists(cursor, 'tracked_signals', 'closed_by'):
+                    cursor.execute("ALTER TABLE tracked_signals ADD COLUMN closed_by TEXT;")
+                    self.logger.info("Added missing column 'closed_by' to tracked_signals table.")
+                # --- End Add new columns ---
+
                 # Add indexes for faster lookups
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_status ON tracked_signals (status);")
                 cursor.execute("CREATE INDEX IF NOT EXISTS idx_symbol_status ON tracked_signals (symbol, status);")
@@ -105,12 +131,19 @@ class StateManager:
         """Adds a new signal to track with its pending entry order."""
         now = datetime.datetime.now(datetime.timezone.utc)
         try:
+            signal_data_json = json.dumps(signal_data) # Serialize the full signal data
+        except TypeError as e:
+            self.logger.error(f"Failed to serialize signal_data to JSON for signal {signal_id}: {e}")
+            return False
+            
+        try:
             with self._get_db_connection() as conn:
                 cursor = conn.cursor()
+                # Update INSERT statement to include signal_data column
                 cursor.execute("""
                 INSERT INTO tracked_signals 
-                (signal_id, symbol, direction, poi_key, status, entry_order_id, entry_signal_price, sl_price, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (signal_id, symbol, direction, poi_key, status, entry_order_id, entry_signal_price, sl_price, signal_data, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     signal_id,
                     signal_data.get('symbol'),
@@ -120,6 +153,7 @@ class StateManager:
                     entry_order_id,
                     signal_data.get('entry_price'),
                     signal_data.get('stop_loss_price'),
+                    signal_data_json, # Store the serialized dictionary
                     now,
                     now
                 ))

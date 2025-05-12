@@ -641,6 +641,19 @@ class AnalysisEngine:
                     signal['bos_level_15m'] = signal.pop('bos_level_15m_bullish', None) or signal.pop('bos_level_15m_bearish', None)
                     if signal['bos_level_15m'] is None: signal['bos_level_15m'] = 'N/A'
 
+                # --- Map direction string to Buy/Sell ---
+                for signal_to_map in signals_found:
+                    direction_raw = signal_to_map.get('direction') # Should be 'bullish' or 'bearish'
+                    if direction_raw == 'bullish':
+                        signal_to_map['direction'] = "Buy"
+                    elif direction_raw == 'bearish':
+                        signal_to_map['direction'] = "Sell"
+                    else:
+                        self.logger.warning(f"Unknown raw direction '{direction_raw}' in signal: {signal_to_map}. Cannot map to Buy/Sell.")
+                        # Consider how to handle this - e.g. remove the signal or flag it
+                        # For now, if it's not bullish/bearish, it might cause issues downstream if not caught.
+                # --- End map ---
+
             else:
                  self.logger.debug(f"No 5m entry signals met criteria for {symbol}.")
 

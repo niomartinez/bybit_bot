@@ -98,12 +98,17 @@ class OrderExecutor:
             
         order_type = 'Limit'
         ccxt_side = side.lower()
-        self.logger.info(f"Placing {ccxt_side} {order_type} entry order: {symbol}, Qty: {formatted_qty}, Price: {formatted_price}")
+        self.logger.info(f"[OrderExecutor] Placing {ccxt_side} {order_type} entry order: {symbol}, Qty: {formatted_qty}, Price: {formatted_price}")
         
-        default_params = { 'timeInForce': 'GTC' }
+        default_params = {
+            'timeInForce': 'GTC',
+            'category': 'linear' # Explicitly for Bybit V5 USDT Perps
+        } 
         if params: default_params.update(params)
 
+        order_response = None # Initialize before try
         try:
+            self.logger.debug(f"[OrderExecutor] Calling exchange.create_order for limit entry: {symbol}...")
             order_response = await self.exchange.create_order(
                 symbol=symbol,
                 type=order_type,
@@ -112,53 +117,60 @@ class OrderExecutor:
                 price=float(formatted_price),
                 params=default_params
             )
-            
-            # --- MORE ROBUST CHECKING ---
+            # This log is reached if create_order returns without raising an exception itself.
+            self.logger.info(f"[OrderExecutor] Successfully called self.exchange.create_order for {symbol}. Raw response: {order_response}")
+
+            # Proceed with robust checking of the response we got if create_order itself didn't fail.
             if not isinstance(order_response, dict):
-                self.logger.error(f"Unexpected response type from create_order: {type(order_response)}. Response: {order_response}")
+                self.logger.error(f"[OrderExecutor] Unexpected response type after create_order for {symbol}: {type(order_response)}. Response: {order_response}")
                 return None
 
+            # Check for Bybit's error structure (retCode != 0)
             bybit_ret_code_raw = order_response.get('retCode')
-            if bybit_ret_code_raw is not None:
+            if bybit_ret_code_raw is not None: 
                 try:
                     bybit_ret_code = int(bybit_ret_code_raw)
-                    if bybit_ret_code != 0:
+                    if bybit_ret_code != 0: 
                         ret_msg = order_response.get('retMsg', 'Unknown Bybit Error')
-                        self.logger.error(f"Bybit API Error placing limit entry order: Code={bybit_ret_code}, Msg='{ret_msg}'. Symbol={symbol}")
-                        return None # Explicitly return None on Bybit error
+                        self.logger.error(f"[OrderExecutor] Bybit API Error (top-level retCode) after successful create_order call for {symbol}: Code={bybit_ret_code}, Msg='{ret_msg}'. Raw Response: {order_response}")
+                        return None 
                 except (ValueError, TypeError):
-                    self.logger.error(f"Could not interpret retCode '{bybit_ret_code_raw}' as integer for {symbol}. Raw: {order_response}")
-                    return None # Treat as failure
-
+                    self.logger.error(f"[OrderExecutor] Could not interpret top-level retCode '{bybit_ret_code_raw}' as integer (after create_order call) for {symbol}. Raw: {order_response}")
+                    return None 
+            
             ccxt_order_id = order_response.get('id')
             if ccxt_order_id:
-                info_error_code_raw = order_response.get('info', {}).get('retCode')
-                if info_error_code_raw is not None:
-                     try:
-                         info_error_code = int(info_error_code_raw)
-                         if info_error_code != 0:
-                              ret_msg = order_response.get('info', {}).get('retMsg', 'Unknown Bybit Error in Info')
-                              self.logger.error(f"Bybit API Error (in info dict) placing limit entry order: Code={info_error_code}, Msg='{ret_msg}'. Symbol={symbol}")
-                              return None # Treat as failure
-                     except (ValueError, TypeError):
-                          self.logger.error(f"Could not interpret info.retCode '{info_error_code_raw}' as integer for {symbol}. Treating as potential issue.")
-                          return None # Treat as failure
+                info_dict = order_response.get('info', {})
+                if isinstance(info_dict, dict):
+                    info_ret_code_raw = info_dict.get('retCode')
+                    if info_ret_code_raw is not None:
+                        try:
+                            info_ret_code = int(info_ret_code_raw)
+                            if info_ret_code != 0:
+                                info_ret_msg = info_dict.get('retMsg', 'Unknown Bybit Error in info')
+                                self.logger.error(f"[OrderExecutor] Bybit API Error (info.retCode) after successful create_order call for {symbol}: Code={info_ret_code}, Msg='{info_ret_msg}'. Raw Response: {order_response}")
+                                return None 
+                        except (ValueError, TypeError):
+                            self.logger.error(f"[OrderExecutor] Could not interpret info.retCode '{info_ret_code_raw}' as integer (after create_order call) for {symbol}. Raw: {order_response}")
+                            return None 
                 
-                # If we have an ID and no error codes indicated failure, assume success
-                self.logger.info(f"Limit entry order placed successfully via CCXT for {symbol}. Order ID: {ccxt_order_id}")
-                self.logger.debug(f"Order details: {order_response}")
+                self.logger.info(f"[OrderExecutor] Limit entry order placed successfully via CCXT for {symbol}. Order ID: {ccxt_order_id}")
                 return order_response
             else:
-                # No 'id' and top-level 'retCode' was 0 or missing - ambiguous response
-                self.logger.error(f"Order placement response for limit entry {symbol} lacks CCXT ID and did not have a non-zero top-level retCode. Raw: {order_response}")
+                self.logger.error(f"[OrderExecutor] Order placement response (after create_order call) for {symbol} lacks CCXT ID. Top-level retCode was {bybit_ret_code_raw}. Raw: {order_response}")
                 return None
-                 
-        except ccxt.ExchangeError as e:
-            self.logger.error(f"ExchangeError placing limit entry order for {symbol}: {e}", exc_info=True)
-        except Exception as e:
-            self.logger.error(f"Unexpected error placing limit entry order for {symbol}: {e}", exc_info=True)
-        
-        return None
+
+        except Exception as e_create_order_direct:
+            self.logger.error(f"[OrderExecutor] Exception directly from or during self.exchange.create_order() for {symbol}. Type: {type(e_create_order_direct).__name__}, Msg: {str(e_create_order_direct)}, Args: {e_create_order_direct.args}", exc_info=True)
+            if isinstance(e_create_order_direct, KeyError):
+                 self.logger.error(f"[OrderExecutor] The direct exception from create_order was a KeyError. Key: {e_create_order_direct.args}")
+            return None
+        finally:
+            self.logger.debug(f"[OrderExecutor] Exiting place_limit_entry_order for {symbol}. Final order_response value before return: {order_response}")
+
+        # Fallback return, though all paths should be covered.
+        # self.logger.error(f"[OrderExecutor] Fell through all checks in place_limit_entry_order for {symbol}. Order_response: {order_response}. Returning None.")
+        # return None 
 
     async def place_stop_loss_order(self, symbol: str, side: str, qty: float, stop_price: float, params: Optional[Dict] = None) -> Optional[Dict]:
         """Places a stop-loss order (typically STOP_MARKET)."""
@@ -182,18 +194,26 @@ class OrderExecutor:
         sl_side = 'sell' if side.lower() == 'buy' else 'buy'
         order_type = 'Stop' # This implies StopMarket on many exchanges
         
-        self.logger.info(f"Placing {sl_side} {order_type} stop loss order: {symbol}, Qty: {formatted_qty}, Stop Price: {formatted_stop_price}")
+        self.logger.info(f"[OrderExecutor] Placing {sl_side} {order_type} stop loss order: {symbol}, Qty: {formatted_qty}, Stop Price: {formatted_stop_price}")
 
-        default_params = { 'reduceOnly': True, 'timeInForce': 'GTC', 'triggerBy': 'LastPrice'}
+        default_params = {
+            'reduceOnly': True, 
+            'timeInForce': 'GTC', 
+            'triggerBy': 'LastPrice',
+            'category': 'linear' # Explicitly for Bybit V5 USDT Perps
+        } 
         if params: default_params.update(params)
 
+        order_response = None # Initialize before try
         try:
+            self.logger.debug(f"Calling exchange.create_order for SL: {symbol}...")
             order_response = await self.exchange.create_order(
                 symbol=symbol, type=order_type, side=sl_side, amount=float(formatted_qty),
                 stopPrice=float(formatted_stop_price), params=default_params
             )
+            self.logger.debug(f"Received response from exchange.create_order (SL): {order_response}")
 
-            # --- MORE ROBUST CHECKING ---
+            # --- MORE ROBUST CHECKING --- Moved inside
             if not isinstance(order_response, dict):
                 self.logger.error(f"Unexpected response type from create_order (SL): {type(order_response)}. Response: {order_response}")
                 return None
@@ -204,7 +224,7 @@ class OrderExecutor:
                     bybit_ret_code = int(bybit_ret_code_raw)
                     if bybit_ret_code != 0:
                         ret_msg = order_response.get('retMsg', 'Unknown Bybit Error')
-                        self.logger.error(f"Bybit API Error placing SL order: Code={bybit_ret_code}, Msg='{ret_msg}'. Symbol={symbol}")
+                        self.logger.error(f"Bybit API Error placing SL order: Code={bybit_ret_code}, Msg='{ret_msg}'. Symbol={symbol}. Raw Response: {order_response}")
                         return None 
                 except (ValueError, TypeError):
                     self.logger.error(f"Could not interpret retCode '{bybit_ret_code_raw}' as integer for SL {symbol}. Raw: {order_response}")
@@ -218,7 +238,7 @@ class OrderExecutor:
                          info_error_code = int(info_error_code_raw)
                          if info_error_code != 0:
                               ret_msg = order_response.get('info', {}).get('retMsg', 'Unknown Bybit Error in Info')
-                              self.logger.error(f"Bybit API Error (in info dict) placing SL order: Code={info_error_code}, Msg='{ret_msg}'. Symbol={symbol}")
+                              self.logger.error(f"Bybit API Error (in info dict) placing SL order: Code={info_error_code}, Msg='{ret_msg}'. Symbol={symbol}. Raw Response: {order_response}")
                               return None 
                      except (ValueError, TypeError):
                           self.logger.error(f"Could not interpret info.retCode '{info_error_code_raw}' as integer for SL {symbol}. Treating as potential issue.")
@@ -230,10 +250,19 @@ class OrderExecutor:
                 self.logger.error(f"Order placement response for SL {symbol} lacks CCXT ID and did not have a non-zero top-level retCode. Raw: {order_response}")
                 return None
 
+        except KeyError as ke:
+            # Specifically catch the weird KeyError
+            self.logger.error(f"Caught KeyError during or immediately after exchange.create_order call for SL {symbol}: {ke}", exc_info=True)
+            self.logger.error(f"Value of order_response before KeyError: {order_response}")
+            return None
         except ccxt.ExchangeError as e:
             self.logger.error(f"ExchangeError placing stop loss order for {symbol}: {e}", exc_info=True)
+            return None # Explicitly return None
         except Exception as e:
             self.logger.error(f"Unexpected error placing stop loss order for {symbol}: {e}", exc_info=True)
+            return None # Explicitly return None
+            
+        self.logger.error(f"Reached end of place_stop_loss_order for {symbol} without returning a value. Returning None.")
         return None
 
     async def place_take_profit_order(self, symbol: str, side: str, qty: float, price: float, params: Optional[Dict] = None) -> Optional[Dict]:
@@ -258,18 +287,25 @@ class OrderExecutor:
         tp_side = 'sell' if side.lower() == 'buy' else 'buy'
         order_type = 'Limit' 
         
-        self.logger.info(f"Placing {tp_side} {order_type} take profit order: {symbol}, Qty: {formatted_qty}, Price: {formatted_price}")
+        self.logger.info(f"[OrderExecutor] Placing {tp_side} {order_type} take profit order: {symbol}, Qty: {formatted_qty}, Price: {formatted_price}")
 
-        default_params = { 'reduceOnly': True, 'timeInForce': 'GTC' }
+        default_params = {
+            'reduceOnly': True, 
+            'timeInForce': 'GTC',
+            'category': 'linear' # Explicitly for Bybit V5 USDT Perps
+        } 
         if params: default_params.update(params)
 
+        order_response = None # Initialize before try
         try:
+            self.logger.debug(f"Calling exchange.create_order for TP: {symbol}...")
             order_response = await self.exchange.create_order(
                 symbol=symbol, type=order_type, side=tp_side, amount=float(formatted_qty),
                 price=float(formatted_price), params=default_params
             )
+            self.logger.debug(f"Received response from exchange.create_order (TP): {order_response}")
 
-            # --- MORE ROBUST CHECKING ---
+            # --- MORE ROBUST CHECKING --- Moved inside
             if not isinstance(order_response, dict):
                 self.logger.error(f"Unexpected response type from create_order (TP): {type(order_response)}. Response: {order_response}")
                 return None
@@ -280,7 +316,7 @@ class OrderExecutor:
                     bybit_ret_code = int(bybit_ret_code_raw)
                     if bybit_ret_code != 0:
                         ret_msg = order_response.get('retMsg', 'Unknown Bybit Error')
-                        self.logger.error(f"Bybit API Error placing TP order: Code={bybit_ret_code}, Msg='{ret_msg}'. Symbol={symbol}")
+                        self.logger.error(f"Bybit API Error placing TP order: Code={bybit_ret_code}, Msg='{ret_msg}'. Symbol={symbol}. Raw Response: {order_response}")
                         return None
                 except (ValueError, TypeError):
                     self.logger.error(f"Could not interpret retCode '{bybit_ret_code_raw}' as integer for TP {symbol}. Raw: {order_response}")
@@ -294,7 +330,7 @@ class OrderExecutor:
                          info_error_code = int(info_error_code_raw)
                          if info_error_code != 0:
                               ret_msg = order_response.get('info', {}).get('retMsg', 'Unknown Bybit Error in Info')
-                              self.logger.error(f"Bybit API Error (in info dict) placing TP order: Code={info_error_code}, Msg='{ret_msg}'. Symbol={symbol}")
+                              self.logger.error(f"Bybit API Error (in info dict) placing TP order: Code={info_error_code}, Msg='{ret_msg}'. Symbol={symbol}. Raw Response: {order_response}")
                               return None
                      except (ValueError, TypeError):
                           self.logger.error(f"Could not interpret info.retCode '{info_error_code_raw}' as integer for TP {symbol}. Treating as potential issue.")
@@ -306,43 +342,92 @@ class OrderExecutor:
                 self.logger.error(f"Order placement response for TP {symbol} lacks CCXT ID and did not have a non-zero top-level retCode. Raw: {order_response}")
                 return None
 
+        except KeyError as ke:
+            # Specifically catch the weird KeyError
+            self.logger.error(f"Caught KeyError during or immediately after exchange.create_order call for TP {symbol}: {ke}", exc_info=True)
+            self.logger.error(f"Value of order_response before KeyError: {order_response}")
+            return None
         except ccxt.ExchangeError as e:
             self.logger.error(f"ExchangeError placing take profit order for {symbol}: {e}", exc_info=True)
+            return None # Explicitly return None
         except Exception as e:
             self.logger.error(f"Unexpected error placing take profit order for {symbol}: {e}", exc_info=True)
+            return None # Explicitly return None
+            
+        self.logger.error(f"Reached end of place_take_profit_order for {symbol} without returning a value. Returning None.")
         return None
 
     async def check_order_status(self, order_id: str, symbol: str, params: Optional[Dict] = None) -> Optional[Dict]:
-        """Fetches the status of a specific order by ID."""
+        """Fetches the status of a specific order by ID using more robust methods for Bybit V5."""
         if not self.exchange:
-            self.logger.error("Exchange not available.")
+            self.logger.error("[OrderExecutor] Exchange not available for check_order_status.")
             return None
             
         if not order_id:
-            self.logger.error("Order ID not provided for status check.")
+            self.logger.error("[OrderExecutor] Order ID not provided for status check.")
             return None
             
-        self.logger.debug(f"Checking status for order ID: {order_id} on {symbol}")
+        self.logger.debug(f"[OrderExecutor] Checking status for order ID: {order_id} on {symbol}")
+        
+        order_to_return = None
+
         try:
-            # Ensure exchange supports fetchOrder
-            if not self.exchange.has.get('fetchOrder'):
-                self.logger.error(f"Exchange {self.exchange.id} does not support fetchOrder.")
-                return None
+            # 1. Check open orders first
+            if self.exchange.has.get('fetchOpenOrders'):
+                self.logger.debug(f"[OrderExecutor] Attempting to find order {order_id} in open orders for {symbol}...")
+                open_orders = await self.exchange.fetch_open_orders(symbol, params=params if params else {})
+                for order in open_orders:
+                    if order.get('id') == order_id:
+                        self.logger.info(f"[OrderExecutor] Order {order_id} found in OPEN orders. Status: {order.get('status')}")
+                        order_to_return = order
+                        break
+            else:
+                self.logger.warning("[OrderExecutor] fetchOpenOrders not supported by exchange. Skipping this check.")
+
+            # 2. If not found in open, check closed/filled orders
+            if order_to_return is None and self.exchange.has.get('fetchClosedOrders'):
+                self.logger.debug(f"[OrderExecutor] Order {order_id} not in open orders. Attempting to find in closed orders for {symbol}...")
+                # Fetch recent closed orders. Bybit might return a lot, so limit if possible or filter by time if order had a timestamp.
+                # For now, a reasonable limit like 20-50 might be okay.
+                closed_orders_params = params.copy() if params else {}
+                if 'limit' not in closed_orders_params: # Add a default limit if not provided
+                    closed_orders_params['limit'] = 50 # Fetch last 50 closed orders
                 
-            order_status = await self.exchange.fetch_order(order_id, symbol, params=params if params else {})
-            self.logger.debug(f"Status for order {order_id}: {order_status.get('status')}")
-            return order_status
-        except ccxt.OrderNotFound as e:
-            self.logger.warning(f"OrderNotFound when checking status for order ID {order_id} on {symbol}: {e}")
-            # This might mean it was filled and removed, or cancelled, or never existed.
-            # Consider fetching trade history if needed to confirm fill.
-            return {'status': 'notFound'} # Return a specific status
+                closed_orders = await self.exchange.fetch_closed_orders(symbol, params=closed_orders_params)
+                for order in closed_orders:
+                    if order.get('id') == order_id:
+                        self.logger.info(f"[OrderExecutor] Order {order_id} found in CLOSED orders. Status: {order.get('status')}")
+                        order_to_return = order
+                        break
+            elif order_to_return is None: # If fetchClosedOrders not supported
+                 self.logger.warning("[OrderExecutor] fetchClosedOrders not supported by exchange. Cannot check closed orders.")
+
+            if order_to_return:
+                return order_to_return
+            else:
+                self.logger.warning(f"[OrderExecutor] Order {order_id} for {symbol} not found in open or recent closed orders.")
+                # Fallback to fetchOrder if absolutely necessary, though it gives warnings for Bybit
+                # Or, more simply, return a 'notFound' status if other methods fail.
+                # For now, let's be explicit it wasn't found via preferred methods.
+                return {'id': order_id, 'symbol': symbol, 'status': 'notFoundByPreferredMethods'}
+
+        except ccxt.NetworkError as ne:
+            self.logger.error(f"[OrderExecutor] CCXT NetworkError checking order status for {order_id}: {ne}", exc_info=True)
         except ccxt.ExchangeError as e:
-            self.logger.error(f"ExchangeError checking order status for {order_id}: {e}")
+            # The original warning was an ExchangeError, but not specific to OrderNotFound for fetchOrder
+            self.logger.error(f"[OrderExecutor] CCXT ExchangeError checking order status for {order_id}: {type(e).__name__} - {e}", exc_info=True)
+            if "fetchOrder() can only access an order if it is in last 500 orders" in str(e):
+                 self.logger.warning(f"[OrderExecutor] Encountered known fetchOrder limitation for {order_id}. The new method should avoid this.")
+                 return {'id': order_id, 'symbol': symbol, 'status': 'fetchOrderLimitationHit'}
         except Exception as e:
-            self.logger.error(f"Unexpected error checking order status for {order_id}: {e}", exc_info=True)
+            self.logger.error(f"[OrderExecutor] Unexpected error checking order status for {order_id}: {e}", exc_info=True)
             
-        return None
+        # If any exception occurred or order_to_return is still None after all checks
+        if order_to_return is None:
+            self.logger.warning(f"[OrderExecutor] Final fallback: Could not reliably determine status for order {order_id} on {symbol}.")
+            return {'id': order_id, 'symbol': symbol, 'status': 'unknown'} # Generic unknown or error status
+        
+        return order_to_return # Should be redundant if logic above is correct
 
     async def cancel_order(self, order_id: str, symbol: str, params: Optional[Dict] = None) -> bool:
         """Cancels a specific order by ID."""

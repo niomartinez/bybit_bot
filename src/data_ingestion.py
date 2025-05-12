@@ -42,7 +42,8 @@ class DataIngestionModule:
                 }, 
                 'options': {
                     'defaultType': 'future' # Keep this to hint other methods
-                }
+                },
+                'verbose': False  # <--- ADD THIS FOR CCXT HTTP LOGGING
             }
 
             self.logger.info(f"Initializing {exchange_id} exchange. Target URL: {active_url}")
@@ -130,7 +131,26 @@ class DataIngestionModule:
             }
             # Try the implicit method name corresponding to the API endpoint
             # instrument_info_list = await self.exchange.fetch_instruments_info(params=params)
-            response = await self.exchange.public_get_v5_market_instruments_info(params=params)
+            response = None # Initialize before try
+            try:
+                self.logger.debug(f"Calling public_get_v5_market_instruments_info for {symbol}...")
+                response = await self.exchange.public_get_v5_market_instruments_info(params=params)
+                self.logger.debug(f"Received response from public_get_v5_market_instruments_info for {symbol}: {response}")
+            except KeyError as ke:
+                self.logger.error(f"Caught KeyError during public_get_v5_market_instruments_info call for {symbol}: {ke}", exc_info=True)
+                return None
+            except ccxt.ExchangeError as e:
+                self.logger.error(f"ExchangeError fetching instrument info for {symbol}: {e}")
+                return None
+            except Exception as e:
+                self.logger.exception(f"Unexpected error during API call for instrument info for {symbol}: {e}")
+                return None
+            
+            # If API call succeeded, now validate the response structure and retCode
+            if response is None:
+                 self.logger.error(f"API call for instrument info for {symbol} returned None unexpectedly.")
+                 return None
+
             # The response structure for this endpoint contains a 'result' object, and inside it, a 'list'
             # {'retCode': 0, 'retMsg': 'OK', 'result': {'category': 'linear', 'list': [...]}, ...}
             instrument_info_list = response.get('result', {}).get('list', [])
@@ -230,11 +250,11 @@ class DataIngestionModule:
             self.logger.info(f"Fetched and cached contract specs for {symbol} via instruments-info.")
             return specs
 
-        except ccxt.ExchangeError as e:
+        except ccxt.ExchangeError as e: # This might be redundant now but kept as fallback
             self.logger.error(f"Exchange error fetching instrument info for {symbol}: {e}")
             return None
-        except Exception as e:
-            self.logger.exception(f"Unexpected error fetching instrument info for {symbol}: {e}")
+        except Exception as e: # General fallback for parsing errors etc.
+            self.logger.exception(f"Unexpected error processing instrument info for {symbol}: {e}")
             return None
 
     async def close(self):
