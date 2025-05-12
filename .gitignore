@@ -150,3 +150,5 @@ dmypy.json
 
 # Cython debug symbols
 cython_debug/ 
+logs/trade_journal.db-shm
+logs/trade_journal.db-wal

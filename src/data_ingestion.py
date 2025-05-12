@@ -43,7 +43,7 @@ class DataIngestionModule:
                 'options': {
                     'defaultType': 'future' # Keep this to hint other methods
                 },
-                'verbose': False  # <--- ADD THIS FOR CCXT HTTP LOGGING
+                'verbose': False  # <--- SET THIS TO TRUE FOR CCXT HTTP LOGGING
             }
 
             self.logger.info(f"Initializing {exchange_id} exchange. Target URL: {active_url}")

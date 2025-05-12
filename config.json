@@ -29,7 +29,9 @@
         "coins_to_scan": [
             "BTCUSDT",
             "ETHUSDT",
-            "SOLUSDT"
+            "SOLUSDT",
+            "XRPUSDT",
+            "DOGEUSDT"
         ],
         "max_concurrent_trades": 1
     },
@@ -39,12 +41,12 @@
             "execution": "5m"
         },
         "swing_points": {
-            "lookback_left": 5,
-            "lookback_right": 5
+            "lookback_left": 1,
+            "lookback_right": 1
         },
         "swing_points_5m": {
-            "lookback_left": 3,
-            "lookback_right": 3
+            "lookback_left": 1,
+            "lookback_right": 1
         },
         "bos": {
             "confirmation_candles": 1
@@ -53,7 +55,7 @@
             "confirmation_candles": 1
         },
         "fvg": {
-            "sensitivity_factor": 0.1 
+            "sensitivity_factor": 0.2
         },
         "fibonacci": {
             "levels_to_watch": [0.50, 0.618, 0.786],
