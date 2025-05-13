@@ -1,50 +1,50 @@
 import sys
-from pathlib import Path
 from loguru import logger
+from pathlib import Path
+
+from .config_manager import config_manager # Use absolute import if running as module, relative if script
 
 class LoggingService:
-    _instance = None
+    def __init__(self):
+        self.log_config = config_manager.get_logging_config()
+        self._setup_logger()
 
-    def __new__(cls, config_manager=None):
-        if cls._instance is None:
-            cls._instance = super(LoggingService, cls).__new__(cls)
-            # Initialize logger only once
-            cls._instance.initialize_logger(config_manager)
-        return cls._instance
-
-    def initialize_logger(self, config_manager=None):
+    def _setup_logger(self):
         logger.remove() # Remove default handler
 
-        log_level = "INFO" # Default level
-        # File logging parameters removed
+        log_level = self.log_config.get("log_level", "INFO").upper()
+        log_file_path_str = self.log_config.get("log_file", "logs/bot.log")
+        
+        log_file_path = Path(log_file_path_str)
+        log_file_path.parent.mkdir(parents=True, exist_ok=True) # Ensure log directory exists
 
-        if config_manager:
-            log_cfg = config_manager.get_logging_config()
-            log_level = log_cfg.get("log_level", "INFO").upper()
-            # File logging parameters are ignored here now
-
-        # --- Configure Console Sink --- 
+        # Console logger
         logger.add(
-            sys.stderr,
+            sys.stderr, 
             level=log_level,
-            format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
-            colorize=True
+            format="<green>{time:YYYY-MM-DD HH:mm:ss.SSS}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>"
         )
+        
+        # File logger
+        logger.add(
+            log_file_path_str,
+            level=log_level,
+            rotation=f"{self.log_config.get('log_rotation_size_mb', 10)} MB",
+            retention=self.log_config.get('log_backup_count', 5),
+            compression="zip", # Optional: compress rotated logs
+            format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} - {message}"
+        )
+        
+        logger.info(f"Logging service initialized. Level: {log_level}. File: {log_file_path_str}")
 
-        # --- File Sink Removed --- 
-        # No longer adding a file sink based on config
+    def get_logger(self, name: str = None):
+        if name:
+            return logger.bind(name=name)
+        return logger
 
-        self.logger = logger
-        self.logger.info(f"Logging initialized. Console Level: {log_level}")
-
-    def get_logger(self, name="Default"):
-        """Returns a logger instance bound with the given name."""
-        return self.logger.bind(name=name)
-
-# --- Global Instance ---
-# Attempt to initialize with None initially, requires calling initialize_logger later if needed
-# Or assume config_manager is passed during initial import somewhere (like in main)
-logger_instance = LoggingService().logger # Provide the configured logger instance
+# Global instance (optional, but can be convenient)
+logging_service = LoggingService()
+logger_instance = logging_service.get_logger()
 
 if __name__ == '__main__':
     # Example Usage:
@@ -52,7 +52,7 @@ if __name__ == '__main__':
     # One way is to ensure your PYTHONPATH includes the project root when running from src/
     # Or temporarily modify the import: from config_manager import config_manager
 
-    test_logger = logger_instance.bind(name="TestLogger")
+    test_logger = logging_service.get_logger("TestLogger")
 
     logger_instance.debug("This is a debug message.") # Won't show if level is INFO
     logger_instance.info("This is an info message.")
