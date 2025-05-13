@@ -203,9 +203,9 @@ async def run_scanner():
     order_executor = None
     state_manager = None
     try:
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        # LOG_DIR creation removed as file logging is disabled
         config_manager = ConfigManager(CONFIG_FILE)
-        main_logger.info("ConfigManager initialized.")
+        main_logger.debug("ConfigManager initialized.")
 
         data_ingestion_module = DataIngestionModule(
             config_manager=config_manager,
@@ -214,47 +214,47 @@ async def run_scanner():
         if not await data_ingestion_module.initialize():
             main_logger.critical("Failed to initialize Data Ingestion Module. Exiting.")
             return
-        main_logger.info("DataIngestionModule initialized.")
+        main_logger.debug("DataIngestionModule initialized.")
 
         risk_management_module = RiskManagementModule(
             data_ingestion_module=data_ingestion_module,
             config_manager=config_manager,
             logger=logger_instance 
         )
-        main_logger.info("RiskManagementModule initialized.")
+        main_logger.debug("RiskManagementModule initialized.")
         
         order_executor = OrderExecutor(
              data_ingestion_module=data_ingestion_module,
              config_manager=config_manager,
              main_logger=logger_instance
         )
-        main_logger.info("OrderExecutor initialized.")
+        main_logger.debug("OrderExecutor initialized.")
         
         state_manager = StateManager(
             config_manager=config_manager,
             main_logger=logger_instance
         )
-        main_logger.info("StateManager initialized.")
+        main_logger.debug("StateManager initialized.")
 
         analysis_engine = AnalysisEngine(
             data_ingestion_module=data_ingestion_module,
             config_manager=config_manager,
             logger_object=logger_instance 
         )
-        main_logger.info("AnalysisEngine initialized.")
+        main_logger.debug("AnalysisEngine initialized.")
 
         journaling_module = JournalingModule(
             config_manager=config_manager,
             main_logger=logger_instance 
         )
-        main_logger.info("JournalingModule initialized.")
+        main_logger.debug("JournalingModule initialized.")
 
         signal_alerter = SignalAlerter(
             config_manager=config_manager,
             main_logger=logger_instance, 
             risk_management_module=risk_management_module
         )
-        main_logger.info("SignalAlerter initialized.")
+        main_logger.debug("SignalAlerter initialized.")
 
         main_logger.info("--- All modules initialized successfully ---")
 
@@ -272,7 +272,7 @@ async def run_scanner():
     try:
         while True:
             loop_start_time = time.time()
-            main_logger.info("Starting new scan cycle...")
+            main_logger.debug("Starting new scan cycle...")
 
             coins_to_scan = config_manager.get("portfolio.coins_to_scan", [])
             if not coins_to_scan:
@@ -280,32 +280,32 @@ async def run_scanner():
                 await asyncio.sleep(scan_interval_seconds)
                 continue
 
-            main_logger.info(f"Scanning symbols: {coins_to_scan}")
+            main_logger.debug(f"Scanning symbols: {coins_to_scan}")
 
             all_potential_signals = []
             # --- Run Analysis --- 
             for symbol in coins_to_scan:
                 try:
-                    main_logger.info(f"Analyzing {symbol}...")
+                    main_logger.debug(f"Analyzing {symbol}...")
                     potential_signals = await analysis_engine.run_analysis(symbol) 
                     if potential_signals:
-                        main_logger.info(f"Found {len(potential_signals)} potential raw signal(s) for {symbol}.")
+                        main_logger.debug(f"Found {len(potential_signals)} potential raw signal(s) for {symbol}.")
                         all_potential_signals.extend(potential_signals)
-                    else:
-                         main_logger.debug(f"No potential raw signals found for {symbol}.")
+                    # else: # No need to log absence of signals unless debugging
+                    #      main_logger.debug(f"No potential raw signals found for {symbol}.")
                 except Exception as e:
                     main_logger.error(f"Error analyzing {symbol}: {e}", exc_info=True)
                 await asyncio.sleep(config_manager.get("scanner.delay_between_symbols_seconds", 0.5))
 
             # --- Process Potential Signals --- 
             if all_potential_signals:
-                main_logger.info(f"Processing {len(all_potential_signals)} total potential signals found in this cycle.")
+                main_logger.debug(f"Processing {len(all_potential_signals)} total potential signals found in this cycle.")
                 for signal_data in all_potential_signals:
                     # --- VERY EARLY CHECK AND LOG (Before Try Block) --- 
                     if not isinstance(signal_data, dict):
                         main_logger.error(f"Received signal_data is not a dictionary! Type: {type(signal_data)}, Value: {signal_data}. Skipping this item.")
                         continue
-                    main_logger.debug(f"Processing raw signal_data dict: {signal_data}")
+                    # main_logger.debug(f"Processing raw signal_data dict: {signal_data}") # Can be very verbose
                     # --- END EARLY CHECK --- 
                     
                     signal_id = None # Ensure signal_id is defined for logging in exception block
@@ -324,23 +324,24 @@ async def run_scanner():
                         existing_signal = state_manager.get_signal(signal_id)
                         if existing_signal:
                             # Skip if signal is already in a final state or a non-retryable error state
-                            non_actionable_statuses = ['ENTRY_FILLED', 'POSITION_OPEN', 'SL_FILLED', 'TP_FILLED', 'CANCELLED', 'REJECTED', 'CLOSED_SL', 'CLOSED_TP', 'CANCELLED_STALE', 'CANCELLED_TP_HIT_PENDING', 'CANCELLED_STALE_NOT_FOUND', 'CLOSED_OR_CANCELLED_HISTORICAL', 'SL_PLACEMENT_FAILED', 'TP_PLACEMENT_FAILED', 'TP_CALCULATION_FAILED']
-                            # Also skip UNKNOWN_API_STATUS to prevent reprocessing until manually checked or status changes
-                            if existing_signal['status'] in non_actionable_statuses or existing_signal['status'] == 'UNKNOWN_API_STATUS':
-                                main_logger.debug(f"Signal ID {signal_id} ({symbol}) already tracked with status {existing_signal['status']}. Skipping.")
+                            non_actionable_statuses = ['ENTRY_FILLED', 'POSITION_OPEN', 'SL_FILLED', 'TP_FILLED', 'CANCELLED', 'REJECTED', 'CLOSED_SL', 'CLOSED_TP', 'CANCELLED_STALE', 'CANCELLED_TP_HIT_PENDING', 'CANCELLED_STALE_NOT_FOUND', 'CLOSED_OR_CANCELLED_HISTORICAL', 'SL_PLACEMENT_FAILED', 'TP_PLACEMENT_FAILED', 'TP_CALCULATION_FAILED', 'CANCELLED_STALE_TP_HIT_MARKET', 'CANCELLED_STALE_SL_HIT_MARKET', 'CANCELLED_STALE_MARKET_MOVED_AWAY', 'CANCELLATION_FAILED_STALE'] 
+                            # Also skip UNKNOWN_API_STATUS, CHECK_STATUS_FAILED to prevent reprocessing until manually checked or status changes
+                            if existing_signal['status'] in non_actionable_statuses or existing_signal['status'] in ['UNKNOWN_API_STATUS', 'CHECK_STATUS_FAILED']:
+                                # main_logger.debug(f"Signal ID {signal_id} ({symbol}) already tracked with status {existing_signal['status']}. Skipping.") # DEBUG - can be noisy
                                 continue 
                             # If PENDING_ENTRY, it will be handled by the order status monitoring section later
                             elif existing_signal['status'] == 'PENDING_ENTRY':
-                                main_logger.debug(f"Signal ID {signal_id} ({symbol}) is PENDING_ENTRY. Will be checked by monitor. Skipping new order placement.")
+                                # main_logger.debug(f"Signal ID {signal_id} ({symbol}) is PENDING_ENTRY. Will be checked by monitor. Skipping new order placement.") # DEBUG - can be noisy
                                 continue
+                        else: # <<< Only process if it's a genuinely new signal >>>
                             # Check for other active trades for the *same symbol*
                             active_symbol_signals = state_manager.get_active_signals_by_symbol(symbol)
                             if len(active_symbol_signals) >= max_concurrent_trades:
-                                main_logger.info(f"Skipping new signal for {symbol} as {len(active_symbol_signals)} active trade(s) already exist (max: {max_concurrent_trades}).")
+                                main_logger.info(f"Skipping new signal for {symbol} as {len(active_symbol_signals)} active trade(s) already exist (max: {max_concurrent_trades}).") # Keep INFO
                                 continue
                             
                             # --- New Signal Processing --- 
-                            main_logger.info(f"New unique signal identified for {symbol} (ID: {signal_id}). Processing entry...") 
+                            main_logger.info(f"New unique signal identified for {symbol} (ID: {signal_id}). Processing entry...") # Keep INFO
 
                             entry = signal_data.get('entry_price')
                             sl = signal_data.get('stop_loss_price')
@@ -367,12 +368,11 @@ async def run_scanner():
                                     stop_loss_price=sl_f, 
                                     fixed_dollar_risk=fixed_dollar_risk
                                 )
+                            # Keep specific KeyErrror handling for debugging if needed
                             except KeyError as ke:
-                                # Check if this is the specific KeyError we are hunting
-                                problematic_key = '"retCode"' # The key causing the error, with literal quotes
-                                # Check if the problematic key string is present in the exception arguments
+                                problematic_key = '\"retCode\"'
                                 if any(problematic_key in str(arg) for arg in ke.args):
-                                    main_logger.error(f"Caught specific KeyError involving '\\\"retCode\\\"' during calculate_position_size for {signal_id}. Origin likely within RiskManagement or DataIngestion specs fetch.", exc_info=True)
+                                    main_logger.error(f"Caught specific KeyError involving '\\\"retCode\\\"' during calculate_position_size for {signal_id}.", exc_info=True)
                                 else:
                                     main_logger.error(f"Caught unexpected KeyError during calculate_position_size for {signal_id}: {ke}", exc_info=True)
                                 continue # Skip this signal if position size calculation fails
@@ -389,27 +389,19 @@ async def run_scanner():
                             try:
                                 ticker = await order_executor.exchange.fetch_ticker(symbol)
                                 current_market_price = float(ticker['last'])
-                                main_logger.info(f"[{signal_id}] PRE-ORDER CHECK for {symbol}: Entry={entry_f}, SL={sl_f}, Current Market={current_market_price}")
+                                main_logger.debug(f"[{signal_id}] PRE-ORDER CHECK for {symbol}: Entry={entry_f}, SL={sl_f}, Current Market={current_market_price}") # DEBUG
 
                                 if direction.upper() == "BUY":
                                     if sl_f >= current_market_price:
                                         main_logger.warning(f"[{signal_id}] STALE/INVALID BUY (SL validation): SL ({sl_f}) is at or above current market ({current_market_price}). Invalidating pre-order.")
                                         proceed_to_place_order = False
-                                    # Optional: Check if entry_f is too far from current_market_price (e.g., > 5% away, making it a chase)
-                                    # elif entry_f > current_market_price * 1.05: 
-                                    #     main_logger.warning(f"[{signal_id}] STALE BUY (Entry validation): Entry ({entry_f}) is >5% above current market ({current_market_price}). Invalidating pre-order.")
-                                    #     proceed_to_place_order = False
                                 elif direction.upper() == "SELL":
                                     if sl_f <= current_market_price:
                                         main_logger.warning(f"[{signal_id}] STALE/INVALID SELL (SL validation): SL ({sl_f}) is at or below current market ({current_market_price}). Invalidating pre-order.")
                                         proceed_to_place_order = False
-                                    # Optional: Check if entry_f is too far from current_market_price
-                                    # elif entry_f < current_market_price * 0.95:
-                                    #     main_logger.warning(f"[{signal_id}] STALE SELL (Entry validation): Entry ({entry_f}) is <5% below current market ({current_market_price}). Invalidating pre-order.")
-                                    #     proceed_to_place_order = False
                                 
                                 if not proceed_to_place_order:
-                                    main_logger.info(f"[{signal_id}] Skipping order placement due to pre-order validation failure.")
+                                    main_logger.info(f"[{signal_id}] Skipping order placement due to pre-order validation failure.") # Keep INFO
                                     continue # Skip to the next signal_data
 
                             except Exception as e_ticker_val:
@@ -418,29 +410,17 @@ async def run_scanner():
                                 continue # Skip to next signal if ticker fetch fails
                             # --- >>> END PRE-ORDER VALIDATION <<< ---
                             
-                            # This check is now redundant if continue is used above, but as a safeguard:
-                            # if not proceed_to_place_order:
-                            #    main_logger.debug(f"[{signal_id}] Double check: Not proceeding to order placement.")
-                            #    continue
-
-                            main_logger.info(f"[{signal_id}] Pre-order validation passed. Proceeding to place order for {symbol}.")
-                            # --- Granular Logging Before Final Steps --- 
-                            main_logger.debug(f"[{signal_id}] Calculated pos_size: {pos_size} (Type: {type(pos_size)}), actual_risk: {actual_risk} (Type: {type(actual_risk)}) ")
-                            main_logger.debug(f"[{signal_id}] signal_data before assignment: {signal_data}")
+                            main_logger.info(f"[{signal_id}] Pre-order validation passed. Attempting order for {symbol}.") # INFO
                             
                             signal_data['position_size'] = pos_size 
                             signal_data['actual_risk_usd'] = actual_risk
                             
-                            main_logger.debug(f"[{signal_id}] signal_data after assignment: {signal_data}")
-                            main_logger.debug(f"[{signal_id}] Values for warning log - symbol: {symbol}, direction: {direction}, entry_f: {entry_f}")
-                            # --- End Granular Logging ---
-                            
-                            main_logger.warning(f"ATTEMPTING TO PLACE LIVE ORDER for signal {signal_id} ({symbol} {direction} @ {entry_f})")
+                            main_logger.warning(f"PLACING LIVE ORDER attempt for signal {signal_id} ({symbol} {direction} @ {entry_f})") # WARNING - High visibility
                             
                             # --- Add specific try-except around the order placement call ---
                             entry_order = None # Initialize to None before the try block
                             try:
-                                main_logger.info(f"[{signal_id}] About to call order_executor.place_limit_entry_order")
+                                main_logger.debug(f"[{signal_id}] About to call order_executor.place_limit_entry_order") # DEBUG
                                 
                                 # Calculate TP price for this order based on R:R
                                 tp_price_f = None
@@ -450,15 +430,16 @@ async def run_scanner():
                                     fixed_rr_ratios = tp_params.get('fixed_rr_ratios', [2.0])  # Default to 2R
                                     primary_rr_target = fixed_rr_ratios[0] if fixed_rr_ratios else 2.0
                                     
+                                    if sl_distance > 0: # Avoid division by zero or meaningless TP if SL=Entry
                                     if direction.upper() == "BUY":
                                         tp_price_f = entry_f + (sl_distance * primary_rr_target)
                                     elif direction.upper() == "SELL":
                                         tp_price_f = entry_f - (sl_distance * primary_rr_target)
                                     else:
-                                        # This warning should now be less likely
-                                        tp_price_f = None
+                                        main_logger.warning(f"[{signal_id}] SL distance is zero or negative ({sl_distance}). Cannot calculate R:R based TP.")
+
                                 except Exception as tp_calc_e:
-                                    main_logger.error(f"Error calculating TP price for entry order: {tp_calc_e}", exc_info=True)
+                                    main_logger.error(f"[{signal_id}] Error calculating TP price for entry order: {tp_calc_e}", exc_info=True)
                                     tp_price_f = None
                                 
                                 # Place order with SL/TP included
@@ -470,30 +451,27 @@ async def run_scanner():
                                     sl_price=sl_f,  # Include SL price directly in order
                                     tp_price=tp_price_f  # Include TP price if calculated
                                 )
-                                main_logger.info(f"[{signal_id}] Returned from order_executor.place_limit_entry_order. Response: {entry_order}")
+                                main_logger.debug(f"[{signal_id}] Returned from order_executor.place_limit_entry_order. Response: {entry_order}") # DEBUG
                             except KeyError as ke_order_call:
                                 main_logger.error(f"KeyError specifically during place_limit_entry_order call for {signal_id}: {ke_order_call}", exc_info=True)
-                                # entry_order remains None, will be caught by subsequent checks or main exception handler
                             except Exception as e_order_call:
                                 main_logger.error(f"Exception specifically during place_limit_entry_order call for {signal_id}: {e_order_call}", exc_info=True)
-                                # entry_order remains None
                             # --- End specific try-except ---
 
                             # --- Explicitly check if order placement failed --- 
                             if entry_order is None:
-                                main_logger.error(f"Order placement failed for signal {signal_id} (returned None). Skipping further processing for this signal. Check OrderExecutor logs for details.")
+                                main_logger.error(f"Order placement FAILED for signal {signal_id} (executor returned None). Skipping further processing.")
                                 continue # Skip to the next potential signal
-                            # --- End explicit check ---
                             
                             # Check if the response *still* looks like a Bybit error (shouldn't happen with new executor logic, but safeguard)
                             if isinstance(entry_order, dict) and entry_order.get('retCode') != 0 and not entry_order.get('id'):
-                                main_logger.error(f"Order placement seems to have failed for signal {signal_id} despite not returning None. Raw response: {entry_order}. Skipping.")
+                                main_logger.error(f"Order placement FAILED for signal {signal_id} (API Error). Raw response: {entry_order}. Skipping.")
                                 continue
                             
                             # Proceed only if entry_order looks valid (has an 'id')
                             entry_order_id = entry_order.get('id')
                             if entry_order_id:
-                                main_logger.info(f"Successfully placed entry order {entry_order_id} for signal {signal_id} ({symbol}).")
+                                main_logger.info(f"Successfully PLACED entry order {entry_order_id} for signal {signal_id} ({symbol}). Status: PENDING_ENTRY.") # INFO
                                 
                                 # Store SL/TP details if they were included with the order
                                 signal_data['entry_order_data'] = {
@@ -504,7 +482,7 @@ async def run_scanner():
                                 }
                                 
                                 if signal_data['entry_order_data']['has_sltp']:
-                                    main_logger.info(f"Entry order {entry_order_id} for {signal_id} includes SL ({signal_data['entry_order_data']['sl_price']}) & TP ({signal_data['entry_order_data']['tp_price']}) directly.")
+                                    main_logger.info(f"Entry order {entry_order_id} for {signal_id} includes SL ({signal_data['entry_order_data']['sl_price']}) & TP ({signal_data['entry_order_data']['tp_price']}) directly.") # INFO
                                 
                                 # 4. Add to State Manager, now including the actual_tp_ordered if available
                                 actual_tp_ordered_for_db = signal_data['entry_order_data'].get('tp_price') if signal_data['entry_order_data'].get('has_sltp') else None
@@ -544,13 +522,13 @@ async def run_scanner():
                                 signal_data['status'] = 'PENDING_ENTRY' # Add status for logging
                                 
                                 # 6. Log NEW PENDING signal to Journal & Alert
-                                main_logger.info(f"Logging and Alerting NEW PENDING signal: {signal_id}")
+                                main_logger.info(f"Logging and Alerting NEW PENDING signal: {signal_id}") # Keep INFO
                                 journaling_module.log_trade_signal(signal_data) 
                                 signal_alerter.alert(signal_data) 
 
                             else:
                                 # OrderExecutor now logs the specific Bybit error if retCode != 0
-                                main_logger.error(f"Failed to place entry order for signal {signal_id} ({symbol}). See OrderExecutor logs for details.")
+                                main_logger.error(f"Order placement FAILED for signal {signal_id} ({symbol}). See OrderExecutor logs.")
                                 # No need to update state here as it wasn't added
 
                     except Exception as e:
@@ -560,17 +538,17 @@ async def run_scanner():
                          # Add detailed logging for entry_order if it exists in this scope
                          # Use repr() for potentially complex objects
                          entry_order_val = repr(entry_order) if 'entry_order' in locals() else "Not Defined"
-                         main_logger.error(f"Value of 'entry_order' at time of exception: {entry_order_val}, Type: {type(entry_order) if 'entry_order' in locals() else 'N/A'}")
-            else:
-                 main_logger.info("No new signals generated in this cycle to process.")
+                         main_logger.debug(f"Value of 'entry_order' at time of exception: {entry_order_val}, Type: {type(entry_order) if 'entry_order' in locals() else 'N/A'}") # DEBUG
+            # else: # No need to log absence of signals unless debugging
+                 # main_logger.debug("No new signals generated in this cycle to process.")
                  
             # --- Order Status Monitoring ---
-            main_logger.info("Checking status of PENDING_ENTRY orders...")
+            main_logger.info("Checking status of PENDING_ENTRY orders...") # Keep INFO
             pending_entry_signals = state_manager.get_signals_by_status('PENDING_ENTRY')
             if not pending_entry_signals:
-                main_logger.info("No PENDING_ENTRY orders to monitor in this cycle.")
+                main_logger.debug("No PENDING_ENTRY orders to monitor in this cycle.") # DEBUG
             else:
-                main_logger.info(f"Found {len(pending_entry_signals)} PENDING_ENTRY order(s) to check.")
+                main_logger.info(f"Found {len(pending_entry_signals)} PENDING_ENTRY order(s) to check.") # Keep INFO
                 for signal_in_db in pending_entry_signals:
                     signal_id = signal_in_db['signal_id']
                     order_id = signal_in_db['entry_order_id']
@@ -589,7 +567,7 @@ async def run_scanner():
                         continue
 
                     try:
-                        main_logger.debug(f"Checking status for order {order_id} (Signal ID: {signal_id}, Symbol: {symbol})")
+                        main_logger.debug(f"Checking status for order {order_id} (Signal ID: {signal_id}, Symbol: {symbol})") # DEBUG
                         # Ensure order_executor is not None
                         if order_executor is None:
                             main_logger.error("OrderExecutor is not initialized. Cannot check order status.")
@@ -599,19 +577,19 @@ async def run_scanner():
 
                         if order_status_details:
                             status = order_status_details.get('status')
-                            main_logger.info(f"Order {order_id} (Signal ID: {signal_id}) status: {status}")
+                            main_logger.debug(f"Order {order_id} (Signal ID: {signal_id}) API status: {status}") # DEBUG
 
                             if status == 'filled' or status == 'closed': 
-                                main_logger.info(f"Entry order {order_id} for signal {signal_id} ({symbol}) is FILLED/CLOSED.")
+                                main_logger.info(f"Entry order {order_id} for signal {signal_id} ({symbol}) is FILLED/CLOSED.") # Keep INFO
                                 filled_price = order_status_details.get('averagePrice', signal_data.get('entry_price')) 
                                 filled_qty = order_status_details.get('filled', signal_data.get('position_size'))
                                 
                                 # Ensure status update happens *before* triggering next step
                                 state_manager.update_signal_status(signal_id, 'ENTRY_FILLED', {'filled_price': filled_price, 'filled_qty': filled_qty})
-                                main_logger.info(f"Updated signal {signal_id} status to ENTRY_FILLED in StateManager.")
+                                main_logger.info(f"Updated signal {signal_id} status to ENTRY_FILLED.") # Keep INFO
                                 
                                 # --- Trigger SL/TP Placement ---
-                                main_logger.info(f"Attempting to place SL/TP orders for filled signal {signal_id}...")
+                                main_logger.info(f"Attempting to place SL/TP orders for filled signal {signal_id}...") # Keep INFO
                                 # Fetch the *updated* signal details from DB which now include filled_price/qty
                                 updated_db_signal_details = state_manager.get_signal(signal_id)
                                 if updated_db_signal_details and updated_db_signal_details['status'] == 'ENTRY_FILLED':
@@ -621,15 +599,15 @@ async def run_scanner():
                                         updated_signal_data_for_sltp['filled_price'] = updated_db_signal_details.get('filled_price')
                                         updated_signal_data_for_sltp['filled_qty'] = updated_db_signal_details.get('filled_qty')
                                         
-                                        await place_sl_tp_orders_for_signal(
-                                            signal_id=signal_id, 
+                                await place_sl_tp_orders_for_signal(
+                                    signal_id=signal_id, 
                                             signal_data=updated_signal_data_for_sltp, # Pass data possibly enriched with filled details
-                                            order_executor=order_executor, 
-                                            state_manager=state_manager, 
-                                            risk_management_module=risk_management_module, 
-                                            config_manager=config_manager,
-                                            main_logger=main_logger
-                                        )
+                                    order_executor=order_executor, 
+                                    state_manager=state_manager, 
+                                    risk_management_module=risk_management_module, 
+                                    config_manager=config_manager,
+                                    main_logger=main_logger
+                                )
                                     except json.JSONDecodeError as jde_sltp:
                                         main_logger.error(f"Error decoding updated signal_data for SL/TP placement (Signal ID: {signal_id}): {jde_sltp}. SL/TP placement aborted.")
                                         state_manager.update_signal_status(signal_id, 'SLTP_PLACEMENT_FAILED_JSON_ERROR', {'error_message': f"JSON decode error before SL/TP placement: {jde_sltp}"})
@@ -639,9 +617,9 @@ async def run_scanner():
                                 else:
                                      main_logger.error(f"Could not retrieve updated ENTRY_FILLED signal {signal_id} from DB before placing SL/TP. Aborting SL/TP.")
                                      # Status remains ENTRY_FILLED, but needs manual check for SL/TP
-                            
+
                             elif status == 'open':
-                                main_logger.info(f"Entry order {order_id} for signal {signal_id} ({symbol}) is still OPEN.")
+                                main_logger.debug(f"Entry order {order_id} for signal {signal_id} ({symbol}) is still OPEN.") # DEBUG
                                 # --- >>> Stale Order Cancellation Logic <<< ---
                                 try:
                                     # Retrieve necessary details from signal_data (already loaded from JSON)
@@ -657,15 +635,15 @@ async def run_scanner():
                                         try:
                                             hypothetical_tp_price_f = float(hypothetical_tp_price_str)
                                         except ValueError:
-                                            main_logger.error(f"[{signal_id}] Invalid format for hypothetical_tp_price ('{hypothetical_tp_price_str}'). Skipping market-based staleness check for TP.")
-                                    else:
-                                         main_logger.warning(f"[{signal_id}] Missing hypothetical_tp_price for stale check. Skipping market-based staleness check for TP.")
+                                            main_logger.error(f"[{signal_id}] Invalid format for hypothetical_tp_price (\'{hypothetical_tp_price_str}\'). Skipping market-based staleness check for TP.")
+                                    # else: # No need to log if missing unless debugging
+                                         # main_logger.debug(f"[{signal_id}] Missing hypothetical_tp_price for stale check. Skipping market-based staleness check for TP.")
 
-                                    main_logger.debug(f"[{signal_id}] Performing market-based staleness check for OPEN PENDING_ENTRY order {order_id}.")
+                                    main_logger.debug(f"[{signal_id}] Performing market-based staleness check for OPEN PENDING_ENTRY order {order_id}.") # DEBUG
                                     
                                     ticker = await order_executor.exchange.fetch_ticker(symbol)
                                     current_market_price = float(ticker['last'])
-                                    main_logger.info(f"[{signal_id}] Stale Check: Current Market Price for {symbol} is {current_market_price}. Entry: {entry_price_f}, SL: {sl_price_f}, Hypo TP: {hypothetical_tp_price_f if hypothetical_tp_price_f is not None else 'N/A'}")
+                                    main_logger.debug(f"[{signal_id}] Stale Check: Current Market Price for {symbol} is {current_market_price}. Entry: {entry_price_f}, SL: {sl_price_f}, Hypo TP: {hypothetical_tp_price_f if hypothetical_tp_price_f is not None else 'N/A'}") # DEBUG
 
                                     cancel_reason = None
                                     cancellation_details_for_db = {}
@@ -691,14 +669,15 @@ async def run_scanner():
                                     # 3. Check if entry is too far from current market (market moved away)
                                     if not cancel_reason:
                                         staleness_deviation_percent = config_manager.get("scanner.staleness_entry_deviation_percent", 2.0) / 100.0
-                                        if direction.upper() == "BUY" and entry_price_f < current_market_price * (1 - staleness_deviation_percent):
-                                            # For a buy, if entry is significantly *below* current market (market ran up)
-                                            cancel_reason = "CANCELLED_STALE_MARKET_MOVED_AWAY"
-                                            main_logger.warning(f"[{signal_id}] STALE (Market Moved Away): Buy order {order_id}, Entry ({entry_price_f}) < Current Price ({current_market_price}) by > {staleness_deviation_percent*100:.2f}%")
-                                        elif direction.upper() == "SELL" and entry_price_f > current_market_price * (1 + staleness_deviation_percent):
-                                            # For a sell, if entry is significantly *above* current market (market ran down)
-                                            cancel_reason = "CANCELLED_STALE_MARKET_MOVED_AWAY"
-                                            main_logger.warning(f"[{signal_id}] STALE (Market Moved Away): Sell order {order_id}, Entry ({entry_price_f}) > Current Price ({current_market_price}) by > {staleness_deviation_percent*100:.2f}%")
+                                        if staleness_deviation_percent > 0: # Only check if deviation is configured > 0
+                                            if direction.upper() == "BUY" and entry_price_f < current_market_price * (1 - staleness_deviation_percent):
+                                                # For a buy, if entry is significantly *below* current market (market ran up)
+                                                cancel_reason = "CANCELLED_STALE_MARKET_MOVED_AWAY"
+                                                main_logger.warning(f"[{signal_id}] STALE (Market Moved Away): Buy order {order_id}, Entry ({entry_price_f}) < Current Price ({current_market_price}) by > {staleness_deviation_percent*100:.2f}%")
+                                            elif direction.upper() == "SELL" and entry_price_f > current_market_price * (1 + staleness_deviation_percent):
+                                                # For a sell, if entry is significantly *above* current market (market ran down)
+                                                cancel_reason = "CANCELLED_STALE_MARKET_MOVED_AWAY"
+                                                main_logger.warning(f"[{signal_id}] STALE (Market Moved Away): Sell order {order_id}, Entry ({entry_price_f}) > Current Price ({current_market_price}) by > {staleness_deviation_percent*100:.2f}%")
 
                                     # --- Attempt Cancellation If Stale ---
                                     if cancel_reason:
@@ -720,7 +699,7 @@ async def run_scanner():
                                             cancel_api_response.get('status', '').lower() in ['canceled', 'cancelled'] or
                                             cancel_api_response.get('orderStatus', '').lower() in ['canceled', 'cancelled'] # Common Bybit V5 field
                                             ):
-                                            main_logger.info(f"[{signal_id}] Successfully cancelled stale order {order_id}. API Response: {cancel_api_response}")
+                                            main_logger.info(f"[{signal_id}] Successfully CANCELLED stale order {order_id}. API Response: {cancel_api_response}")
                                             cancellation_details_for_db['cancel_api_response_status'] = cancel_api_response.get('status', cancel_api_response.get('orderStatus', 'Success'))
                                             state_manager.update_signal_status(signal_id, cancel_reason, cancellation_details_for_db)
                                         else:
@@ -732,26 +711,26 @@ async def run_scanner():
                                             # Specific Bybit error codes for "already filled/cancelled" etc. should be checked here if known.
                                             # Example: 110007 often means order not found or already processed
                                             if ret_code == 110007 or "order not exists" in ret_msg.lower() or "order has been filled" in ret_msg.lower() or "order has been cancelled" in ret_msg.lower():
-                                                 main_logger.warning(f"[{signal_id}] Attempted to cancel stale order {order_id}, but it was likely already filled/cancelled. API Response: {cancel_api_response}. Will re-check status normally.")
-                                                 # Don't update status to CANCELLATION_FAILED here, let the normal status check proceed
+                                                 main_logger.warning(f"[{signal_id}] Attempted to cancel stale order {order_id}, but it was likely already filled/cancelled. API Response: {cancel_api_response}. Normal status check will proceed.")
+                                                 # Don't update status or continue; let the main logic handle fill/cancel next cycle
                                             else:
-                                                 main_logger.error(f"[{signal_id}] Failed to cancel stale order {order_id} or cancellation not confirmed by API. API Response: {cancel_api_response}")
+                                                 main_logger.error(f"[{signal_id}] FAILED to cancel stale order {order_id} or cancellation not confirmed by API. API Response: {cancel_api_response}")
                                                  cancellation_details_for_db['cancel_api_response_status'] = 'FAILURE_OR_UNKNOWN'
                                                  cancellation_details_for_db['cancel_api_raw_response'] = str(cancel_api_response) # Store raw response for debugging
                                                  state_manager.update_signal_status(signal_id, "CANCELLATION_FAILED_STALE", cancellation_details_for_db)
+                                                 continue # Skip further checks this cycle after failed cancellation
                                         
-                                        # IMPORTANT: After cancellation attempt (success or fail), skip further API status checks for this order *in this cycle*.
-                                        # The state is updated, or normal check will happen next cycle if cancellation failed non-terminally.
-                                        continue # Skip to the next signal_in_db in pending_entry_signals
+                                        # If cancellation was successful, skip further checks this cycle.
+                                        if cancel_reason in state_manager.get_signal(signal_id).get('status', ''): # Check if status was updated to the cancel reason
+                                             continue # Skip to the next signal_in_db
                                         
                                 except Exception as stale_check_e:
                                     main_logger.error(f"[{signal_id}] Error during market-based stale check for order {order_id}: {stale_check_e}", exc_info=True)
-                                    # Log error but allow loop to continue to check other orders or potentially re-check this one next cycle
                                 # --- <<< End Stale Order Cancellation Logic >>> ---
 
-                            # Handle other API statuses ('canceled', 'rejected', etc.) - This part remains unchanged
+                            # Handle other API statuses ('canceled', 'rejected', etc.)
                             elif status in ['canceled', 'cancelled']:
-                                main_logger.info(f"Order {order_id} (Signal ID: {signal_id}) has status '{status}'. Updating DB status.")
+                                main_logger.info(f"Order {order_id} (Signal ID: {signal_id}) has status '{status}'. Updating DB status.") # Keep INFO
                                 state_manager.update_signal_status(signal_id, 'CANCELLED', {'cancellation_reason': 'API reported Canceled'})
                             elif status in ['rejected', 'expired']:
                                 main_logger.warning(f"Order {order_id} (Signal ID: {signal_id}) has status '{status}'. Updating DB status.")
@@ -765,26 +744,20 @@ async def run_scanner():
                                 main_logger.error(f"Order {order_id} for signal {signal_id} ({symbol}) encountered error: '{status}'. Marking as CHECK_STATUS_FAILED in DB.")
                                 state_manager.update_signal_status(signal_id, 'CHECK_STATUS_FAILED', {'error_message': f'Order status check returned {status}.'})
                             else: 
-                                main_logger.info(f"Order {order_id} (Signal ID: {signal_id}) has status '{status}'. No status update action taken in DB yet.")
+                                main_logger.info(f"Order {order_id} (Signal ID: {signal_id}) has status '{status}'. No status update action needed yet.")
                         else:
-                            main_logger.warning(f"Could not retrieve status details for order {order_id} (Signal ID: {signal_id}) from OrderExecutor (returned None/empty). This should ideally not happen.")
-                            # Consider updating status to ERROR or UNKNOWN if consistently not found.
-                            # current_db_signal = state_manager.get_signal(signal_id)
-                            # if current_db_signal and current_db_signal['status'] == 'PENDING_ENTRY':
-                            #     main_logger.error(f"Order {order_id} for signal {signal_id} status check failed, but still PENDING_ENTRY in DB. Marking as CHECK_STATUS_FAILED.")
-                            #     state_manager.update_signal_status(signal_id, 'CHECK_STATUS_FAILED')
-
+                            main_logger.warning(f"Could not retrieve status details for order {order_id} (Signal ID: {signal_id}) from OrderExecutor (returned None/empty).")
                     except Exception as e:
                         main_logger.error(f"Error checking status for order {order_id} (Signal ID: {signal_id}): {e}", exc_info=True)
             
             # --- Position/SL/TP Monitoring ---
-            main_logger.info("Checking status of POSITION_OPEN orders (SL/TP monitoring)...")
+            main_logger.info("Checking status of POSITION_OPEN orders (SL/TP monitoring)...") # Keep INFO
             position_open_signals = state_manager.get_signals_by_status('POSITION_OPEN')
 
             if not position_open_signals:
-                main_logger.info("No POSITION_OPEN orders to monitor for SL/TP.")
+                main_logger.debug("No POSITION_OPEN orders to monitor for SL/TP.") # DEBUG
             else:
-                main_logger.info(f"Found {len(position_open_signals)} POSITION_OPEN order(s) to monitor for SL/TP.")
+                main_logger.info(f"Found {len(position_open_signals)} POSITION_OPEN order(s) to monitor for SL/TP.") # Keep INFO
                 for db_signal in position_open_signals:
                     signal_id = db_signal['signal_id']
                     symbol = db_signal['symbol']
@@ -804,15 +777,15 @@ async def run_scanner():
                         break
 
                     # --- Check SL Order --- 
-                    if sl_order_id:
+                    if sl_order_id and sl_order_id != 'included_in_entry': # Don't check if bundled
                         try:
-                            main_logger.debug(f"Checking SL order {sl_order_id} for signal {signal_id} ({symbol})")
+                            main_logger.debug(f"Checking SL order {sl_order_id} for signal {signal_id} ({symbol})") # DEBUG
                             sl_status_details = await order_executor.check_order_status(symbol=symbol, order_id=sl_order_id)
                             if sl_status_details:
                                 sl_status = sl_status_details.get('status')
-                                main_logger.info(f"SL order {sl_order_id} (Signal {signal_id}) status: {sl_status}")
+                                main_logger.debug(f"SL order {sl_order_id} (Signal {signal_id}) status: {sl_status}") # DEBUG
                                 
-                                if sl_status == 'filled' or sl_status == 'closed': # 'closed' often means fully filled
+                                if sl_status == 'filled' or sl_status == 'closed':
                                     filled_price = sl_status_details.get('averagePrice', original_signal_data.get('stop_loss_price'))
                                     main_logger.warning(f"!!! STOP LOSS HIT for signal {signal_id} ({symbol}) at price {filled_price} (Order ID: {sl_order_id}) !!!")
                                     state_manager.update_signal_status(signal_id, 'CLOSED_SL', {'closed_price': filled_price, 'closed_by': 'SL'})
@@ -821,43 +794,41 @@ async def run_scanner():
                                     journaling_module.log_trade_signal(original_signal_data) # Log final state
                                     signal_alerter.alert(original_signal_data, is_closure=True)
                                     
-                                    if tp_order_id:
+                                    if tp_order_id and tp_order_id != 'included_in_entry':
                                         main_logger.info(f"Attempting to cancel TP order {tp_order_id} for signal {signal_id} as SL was hit.")
                                         await order_executor.cancel_order(tp_order_id, symbol)
                                     continue # Move to next signal, this one is resolved
-                                elif sl_status in ['canceled', 'rejected', 'expired']:
+                                elif sl_status in ['canceled', 'cancelled', 'rejected', 'expired']:
                                     main_logger.error(f"SL order {sl_order_id} for signal {signal_id} ({symbol}) is {sl_status}! Position might be unprotected.")
-                                    # This is a critical situation. The position is open, but SL is no longer active.
                                     state_manager.update_signal_status(signal_id, f'SL_INACTIVE_{sl_status.upper()}', {'sl_order_id': sl_order_id, 'tp_order_id': tp_order_id})
-                                    # TODO: Implement emergency handling? E.g., market close position.
                                     continue # Or break and handle manually
                             else:
                                 main_logger.warning(f"Could not retrieve SL order {sl_order_id} status for signal {signal_id}. It might have been cancelled or does not exist.")
-                                # If it's not found, it could be an issue. Check if it was already processed
                                 current_status_in_db = state_manager.get_signal(signal_id).get('status')
-                                if current_status_in_db == 'POSITION_OPEN': # Still expect it to be open
+                                if current_status_in_db == 'POSITION_OPEN': 
                                      state_manager.update_signal_status(signal_id, 'SL_ORDER_NOT_FOUND')
                                      main_logger.error(f"SL order {sl_order_id} for signal {signal_id} not found by API, but signal is POSITION_OPEN in DB. Critical!")
                                 continue
 
                         except Exception as e:
                             main_logger.error(f"Error checking SL order {sl_order_id} for signal {signal_id}: {e}", exc_info=True)
-                    else:
+                    elif sl_order_id is None:
                         main_logger.error(f"Signal {signal_id} ({symbol}) is POSITION_OPEN but has no sl_order_id. Critical error in state.")
                         state_manager.update_signal_status(signal_id, 'MISSING_SL_ORDER_ID')
                         continue # Skip to next signal
+                    # else: sl_order_id == 'included_in_entry', no separate check needed.
 
-                    # --- Check TP Order (only if SL not hit in this cycle) ---
-                    if tp_order_id:
+                    # --- Check TP Order (only if SL not hit in this cycle AND not bundled) ---
+                    if tp_order_id and tp_order_id != 'included_in_entry':
                         try:
-                            main_logger.debug(f"Checking TP order {tp_order_id} for signal {signal_id} ({symbol})")
+                            main_logger.debug(f"Checking TP order {tp_order_id} for signal {signal_id} ({symbol})") # DEBUG
                             tp_status_details = await order_executor.check_order_status(symbol=symbol, order_id=tp_order_id)
                             if tp_status_details:
                                 tp_status = tp_status_details.get('status')
-                                main_logger.info(f"TP order {tp_order_id} (Signal {signal_id}) status: {tp_status}")
+                                main_logger.debug(f"TP order {tp_order_id} (Signal {signal_id}) status: {tp_status}") # DEBUG
                                 
                                 if tp_status == 'filled' or tp_status == 'closed':
-                                    filled_price = tp_status_details.get('averagePrice', original_signal_data.get('take_profit_targets_str')) # Fallback is not ideal here, but best guess
+                                    filled_price = tp_status_details.get('averagePrice', db_signal.get('tp_price')) # Use TP price stored in DB if available
                                     main_logger.info(f"$$$ TAKE PROFIT HIT for signal {signal_id} ({symbol}) at price {filled_price} (Order ID: {tp_order_id}) $$$ ")
                                     state_manager.update_signal_status(signal_id, 'CLOSED_TP', {'closed_price': filled_price, 'closed_by': 'TP'})
                                     original_signal_data['status'] = 'CLOSED_TP'
@@ -865,31 +836,29 @@ async def run_scanner():
                                     journaling_module.log_trade_signal(original_signal_data) # Log final state
                                     signal_alerter.alert(original_signal_data, is_closure=True)
 
-                                    if sl_order_id:
+                                    if sl_order_id and sl_order_id != 'included_in_entry':
                                         main_logger.info(f"Attempting to cancel SL order {sl_order_id} for signal {signal_id} as TP was hit.")
                                         await order_executor.cancel_order(sl_order_id, symbol)
                                     continue # Move to next signal
-                                elif tp_status in ['canceled', 'rejected', 'expired']:
+                                elif tp_status in ['canceled', 'cancelled', 'rejected', 'expired']:
                                     main_logger.warning(f"TP order {tp_order_id} for signal {signal_id} ({symbol}) is {tp_status}. Position remains open with SL only (if SL is active).")
                                     state_manager.update_signal_status(signal_id, f'TP_INACTIVE_{tp_status.upper()}', {'sl_order_id': sl_order_id, 'tp_order_id': tp_order_id})
-                                    # Position continues, but without this specific TP. Might need manual management or other TPs if multiple.
                             else:
                                 main_logger.warning(f"Could not retrieve TP order {tp_order_id} status for signal {signal_id}. It might have been cancelled or does not exist.")
                                 current_status_in_db = state_manager.get_signal(signal_id).get('status')
-                                if current_status_in_db == 'POSITION_OPEN': # Still expect it to be open
+                                    if current_status_in_db == 'POSITION_OPEN':
                                      state_manager.update_signal_status(signal_id, 'TP_ORDER_NOT_FOUND')
                                      main_logger.warning(f"TP order {tp_order_id} for signal {signal_id} not found by API, but signal is POSITION_OPEN in DB.")
                                 # No continue here, SL might still be active or other TPs.
                         except Exception as e:
                             main_logger.error(f"Error checking TP order {tp_order_id} for signal {signal_id}: {e}", exc_info=True)
-                    # If no tp_order_id but position is open, it means TP placement might have failed earlier.
-                    # The status should reflect that (e.g., TP_PLACEMENT_FAILED). No specific action here unless new TPs are to be attempted.
+                    # else: tp_order_id is None or 'included_in_entry'
 
             # --- Wait for next cycle --- 
             loop_end_time = time.time()
             loop_duration = loop_end_time - loop_start_time
             wait_time = max(0, scan_interval_seconds - loop_duration)
-            main_logger.info(f"Scan cycle finished in {loop_duration:.2f}s. Waiting {wait_time:.2f}s for next cycle.")
+            main_logger.info(f"Scan cycle finished in {loop_duration:.2f}s. Waiting {wait_time:.2f}s for next cycle.") # Keep INFO
             await asyncio.sleep(wait_time)
 
     except asyncio.CancelledError:
@@ -897,29 +866,28 @@ async def run_scanner():
     except Exception as e:
         main_logger.critical(f"Critical error in main scanner loop: {e}", exc_info=True)
     finally:
-        main_logger.info("--- Shutting down Crypto Scanner Bot ---")
+        main_logger.info("--- Shutting down Crypto Scanner Bot ---") # Keep INFO
         if data_ingestion_module and hasattr(data_ingestion_module, 'exchange') and data_ingestion_module.exchange:
             await data_ingestion_module.close()
-        main_logger.info("--- Shutdown complete ---")
+        main_logger.info("--- Shutdown complete ---") # Keep INFO
 
 
 if __name__ == "__main__":
     try:
-        # Ensure logs directory exists before initializing logger via LoggingService
+        # Ensure logger is initialized before use, potentially passing config
         try: from .config_manager import ConfigManager 
         except ImportError: from config_manager import ConfigManager # Fallback for direct run?
+        try: from .logging_service import LoggingService # Use LoggingService class
+        except ImportError: from logging_service import LoggingService
 
         config_mgr_for_logs = ConfigManager(CONFIG_FILE)
-        log_cfg = config_mgr_for_logs.get_logging_config()
-        log_file = Path(log_cfg.get("log_file", "logs/bot.log"))
-        log_file.parent.mkdir(parents=True, exist_ok=True)
-        
-        # Now LoggingService can be safely imported relatively if run with -m
-        from .logging_service import logger_instance 
+        # Initialize logger through the LoggingService singleton
+        logger_service = LoggingService(config_manager=config_mgr_for_logs)
+        logger_instance = logger_service.logger # Get the configured logger instance
         
         asyncio.run(run_scanner())
     except KeyboardInterrupt:
-        # Ensure logger_instance is available here
+        # Attempt to get logger instance again for shutdown message
         try: from .logging_service import logger_instance 
         except ImportError: logger_instance = None
         

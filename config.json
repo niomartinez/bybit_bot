@@ -17,7 +17,7 @@
     "secrets_env_file": ".env",
     "logging": {
         "log_file": "logs/bot.log",
-        "log_level": "INFO",
+        "log_level": "WARNING",
         "log_rotation_size_mb": 10,
         "log_backup_count": 5
     },
