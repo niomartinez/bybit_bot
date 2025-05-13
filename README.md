@@ -104,19 +104,3 @@ Make sure your virtual environment is active when running these commands.
 Refer to [PROGRESS_SUMMARY.md](PROGRESS_SUMMARY.md) for the latest development status and immediate next steps.
 
 --
-
-Prompt:
-We are currently building
-@Implementation_Plan_Crypto_Scanner_Bot.md from @Trading_Strategy_5m_15m_BOS_FVG_Fib_Confluence.md 
-You are a master python crypto trading bot developer for Bybit, and also a seasoned profitable crypto trader with extensive knowledge in ICT. 
-
-Your task now is to address the below.
---
-
---
-run terminal commands to execute the main using python then keep refixing untill there are no errors. 
-
-use the below for reference:
-@Bybit Exchange @.env @config.json  @PROGRESS_SUMMARY.md @README.md @main.py  
-
-

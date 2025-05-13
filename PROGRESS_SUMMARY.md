@@ -12,6 +12,7 @@ Order placement for entry orders with bundled Stop Loss (SL) and Take Profit (TP
     *   Implemented **Local 5m Validation**: When a 5m entry signal is found, it now checks if its hypothetical TP was breached by subsequent 5m candles within its initial fetched data window. Debug logs added for this step.
     *   Implemented **Stage 2 Validation (15m Close)**: Signals passing local validation are checked against the latest 15m closing price for the symbol.
     *   Implemented **Final Validation (Fresh 5m Data)**: Before a signal is finalized, fresh 5m data (from the signal's 5m timestamp up to a recent window or current time) is fetched to perform a more definitive check if the hypothetical TP was breached. This helps invalidate older signals more accurately.
+    *   Improved the robustness of the SL/TP monitoring loop for `POSITION_OPEN` signals by adding more detailed handling for various order statuses (e.g., `notfound`, `canceled`, `rejected`, errors) returned by the exchange, mirroring the logic in the `PENDING_ENTRY` loop.
 *   **Pre-Order Placement Validation (`src/main.py`):**
     *   Before attempting to place any limit entry order, `main.py` now fetches the current ticker price.
     *   It validates if the signal's SL price is valid relative to the current market price (e.g., SL for a buy must be below current market).
@@ -43,8 +44,12 @@ Order placement for entry orders with bundled Stop Loss (SL) and Take Profit (TP
     *   Resolved "no such column: error_message" by ensuring the `error_message` column is added to `tracked_signals` via `add_column_if_not_exists` in `_init_db`. DB updates including error messages now succeed.
 *   **Pandas Datetime Handling (`src/analysis_engine.py`):**
     *   Resolved persistent Pandas `TypeError`s (previously `FutureWarning`s) related to timezone-naive vs. timezone-aware datetime conversions by ensuring datetime columns are consistently initialized and typed as timezone-aware UTC (`datetime64[ns, UTC]`) using `pd.Series(pd.NaT, index=df.index, dtype='datetime64[ns, UTC]')`.
-*   **SL/TP Monitoring Loop Enhancement (`src/main.py`):**
-    *   Improved the robustness of the SL/TP monitoring loop for `POSITION_OPEN` signals by adding more detailed handling for various order statuses (e.g., `notfound`, `canceled`, `rejected`, errors) returned by the exchange, mirroring the logic in the `PENDING_ENTRY` loop.
+*   **Logging System Overhaul (`src/logging_service.py`, `src/main.py`, `config.json`):**
+    *   Removed file-based logging (`bot.log`) to simplify output.
+    *   Introduced a custom "USER" log level for concise, user-friendly terminal messages.
+    *   Refactored `INFO` level to provide more detailed operational logs, and `DEBUG` for verbose internal steps.
+    *   Updated `config.json` to support new log levels and removed file logging configurations.
+    *   Modified `main.py` to use the new log levels, significantly decluttering terminal output when `log_level` is set to "USER" while providing more insight into the scanning process per symbol.
 
 ### Debugging Journey Summary:
 
