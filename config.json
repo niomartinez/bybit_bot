@@ -59,7 +59,7 @@
             "SEIUSDT",
             "ARKMUSDT",
             "GRASSUSDT",
-            "PLUMUSDT",
+            "PLUMEUSDT",
             "GUNUSDT"
         ],
         "max_concurrent_trades": 1

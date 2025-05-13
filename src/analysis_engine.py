@@ -75,8 +75,8 @@ class AnalysisEngine:
         df = df_with_swings.copy()
         df['bullish_bos_level'] = np.nan
         df['bearish_bos_level'] = np.nan
-        df['bullish_bos_src_time'] = pd.Series(index=df.index, dtype='datetime64[ns]')
-        df['bearish_bos_src_time'] = pd.Series(index=df.index, dtype='datetime64[ns]')
+        df['bullish_bos_src_time'] = pd.Series(pd.NaT, index=df.index, dtype='datetime64[ns, UTC]')
+        df['bearish_bos_src_time'] = pd.Series(pd.NaT, index=df.index, dtype='datetime64[ns, UTC]')
 
         bos_params = self._get_timeframe_specific_params('bos', timeframe_key)
         confirmation_candles = bos_params.get('confirmation_candles', 1)
@@ -114,8 +114,8 @@ class AnalysisEngine:
                             bos_confirm_time = df.index[i + confirmation_candles - 1]
                             # First set the numeric value
                             df.loc[bos_confirm_time, 'bullish_bos_level'] = active_sh_price
-                            # Then set the datetime value using proper conversion to avoid FutureWarning
-                            df.at[bos_confirm_time, 'bullish_bos_src_time'] = pd.to_datetime(active_sh_time)
+                            # Then set the datetime value
+                            df.at[bos_confirm_time, 'bullish_bos_src_time'] = active_sh_time # Assign directly
                             active_sh_price = np.nan 
                             active_sh_time = pd.NaT
             
@@ -132,8 +132,8 @@ class AnalysisEngine:
                             bos_confirm_time = df.index[i + confirmation_candles - 1]
                             # First set the numeric value
                             df.loc[bos_confirm_time, 'bearish_bos_level'] = active_sl_price
-                            # Then set the datetime value using proper conversion to avoid FutureWarning
-                            df.at[bos_confirm_time, 'bearish_bos_src_time'] = pd.to_datetime(active_sl_time)
+                            # Then set the datetime value
+                            df.at[bos_confirm_time, 'bearish_bos_src_time'] = active_sl_time # Assign directly
                             active_sl_price = np.nan 
                             active_sl_time = pd.NaT
         return df
@@ -146,9 +146,9 @@ class AnalysisEngine:
         Assumes df_with_bos contains swing_high/low columns detected for the relevant timeframe.
         """
         df = df_with_bos.copy()
-        df['impulse_leg_start_time'] = pd.Series(index=df.index, dtype='datetime64[ns]')
+        df['impulse_leg_start_time'] = pd.Series(pd.NaT, index=df.index, dtype='datetime64[ns, UTC]')
         df['impulse_leg_start_price'] = np.nan
-        df['impulse_leg_end_time'] = pd.Series(index=df.index, dtype='datetime64[ns]')
+        df['impulse_leg_end_time'] = pd.Series(pd.NaT, index=df.index, dtype='datetime64[ns, UTC]')
         df['impulse_leg_end_price'] = np.nan
         df['impulse_direction'] = None
         df['fib_levels'] = pd.Series(index=df.index, dtype=object) 
@@ -174,10 +174,10 @@ class AnalysisEngine:
                         impulse_end_price = subsequent_swing_highs.iloc[0]
                         
                         if impulse_end_price > impulse_start_price:
-                            # Use pd.to_datetime to convert timestamps properly
-                            df.at[current_event_time, 'impulse_leg_start_time'] = pd.to_datetime(impulse_start_time)
+                            # Assign timestamps directly
+                            df.at[current_event_time, 'impulse_leg_start_time'] = impulse_start_time
                             df.at[current_event_time, 'impulse_leg_start_price'] = impulse_start_price
-                            df.at[current_event_time, 'impulse_leg_end_time'] = pd.to_datetime(impulse_end_time)
+                            df.at[current_event_time, 'impulse_leg_end_time'] = impulse_end_time
                             df.at[current_event_time, 'impulse_leg_end_price'] = impulse_end_price
                             df.at[current_event_time, 'impulse_direction'] = 'bullish'
                             
@@ -202,10 +202,10 @@ class AnalysisEngine:
                         impulse_end_price = subsequent_swing_lows.iloc[0]
 
                         if impulse_end_price < impulse_start_price:
-                            # Use pd.to_datetime to convert timestamps properly
-                            df.at[current_event_time, 'impulse_leg_start_time'] = pd.to_datetime(impulse_start_time)
+                            # Assign timestamps directly
+                            df.at[current_event_time, 'impulse_leg_start_time'] = impulse_start_time
                             df.at[current_event_time, 'impulse_leg_start_price'] = impulse_start_price
-                            df.at[current_event_time, 'impulse_leg_end_time'] = pd.to_datetime(impulse_end_time)
+                            df.at[current_event_time, 'impulse_leg_end_time'] = impulse_end_time
                             df.at[current_event_time, 'impulse_leg_end_price'] = impulse_end_price
                             df.at[current_event_time, 'impulse_direction'] = 'bearish'
 
@@ -379,14 +379,14 @@ class AnalysisEngine:
             return df_15m_processed
 
         df_15m_with_entries = df_15m_processed.copy()
-        df_15m_with_entries['entry_5m_time'] = pd.Series(index=df_15m_with_entries.index, dtype='datetime64[ns]')
+        df_15m_with_entries['entry_5m_time'] = pd.Series(pd.NaT, index=df_15m_with_entries.index, dtype='datetime64[ns, UTC]')
         df_15m_with_entries['entry_5m_price'] = np.nan
         df_15m_with_entries['entry_5m_type'] = None # 'FVG_MITIGATION', 'MSS_RETEST'
         df_15m_with_entries['entry_5m_sl_price'] = np.nan
         # Add column for hypothetical TP
         df_15m_with_entries['hypothetical_tp_price'] = np.nan 
-        df_15m_with_entries['entry_5m_raw_data_range_start'] = pd.Series(index=df_15m_with_entries.index, dtype='datetime64[ns]')
-        df_15m_with_entries['entry_5m_raw_data_range_end'] = pd.Series(index=df_15m_with_entries.index, dtype='datetime64[ns]')
+        df_15m_with_entries['entry_5m_raw_data_range_start'] = pd.Series(pd.NaT, index=df_15m_with_entries.index, dtype='datetime64[ns, UTC]')
+        df_15m_with_entries['entry_5m_raw_data_range_end'] = pd.Series(pd.NaT, index=df_15m_with_entries.index, dtype='datetime64[ns, UTC]')
 
         # Config for 5m entries
         entry_logic_5m_params = self.strategy_params.get('entry_logic_5m', {})
@@ -412,9 +412,9 @@ class AnalysisEngine:
             fetch_5m_start_time = poi_15m_time - pd.Timedelta(minutes=num_15m_candles_back_for_5m * context_timeframe_duration_minutes)
             fetch_5m_end_time = poi_15m_time + pd.Timedelta(minutes=num_15m_candles_forward_for_5m * context_timeframe_duration_minutes)
             
-            # Use pd.to_datetime to properly convert timestamps
-            df_15m_with_entries.at[poi_15m_time, 'entry_5m_raw_data_range_start'] = pd.to_datetime(fetch_5m_start_time)
-            df_15m_with_entries.at[poi_15m_time, 'entry_5m_raw_data_range_end'] = pd.to_datetime(fetch_5m_end_time)
+            # Assign timestamps directly
+            df_15m_with_entries.at[poi_15m_time, 'entry_5m_raw_data_range_start'] = fetch_5m_start_time
+            df_15m_with_entries.at[poi_15m_time, 'entry_5m_raw_data_range_end'] = fetch_5m_end_time
 
             df_5m = await self.data_ingestion_module.fetch_ohlcv(
                 symbol=symbol, 
@@ -554,8 +554,8 @@ class AnalysisEngine:
                          except Exception as e:
                              self.logger.warning(f"Could not calculate hypothetical TP for {symbol} at {idx_5m}: {e}")
 
-                         # Use pd.to_datetime to properly convert timestamps
-                         df_15m_with_entries.at[poi_15m_time, 'entry_5m_time'] = pd.to_datetime(idx_5m)
+                         # Assign timestamps directly
+                         df_15m_with_entries.at[poi_15m_time, 'entry_5m_time'] = idx_5m
                          df_15m_with_entries.at[poi_15m_time, 'entry_5m_price'] = entry_price
                          df_15m_with_entries.at[poi_15m_time, 'entry_5m_type'] = entry_type
                          df_15m_with_entries.at[poi_15m_time, 'entry_5m_sl_price'] = sl_price

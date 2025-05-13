@@ -746,7 +746,6 @@ async def run_scanner():
                                         
                                 except Exception as stale_check_e:
                                     main_logger.error(f"[{signal_id}] Error during market-based stale check for order {order_id}: {stale_check_e}", exc_info=True)
-                                    # Log error but allow loop to continue to check other orders or potentially re-check this one next cycle
                                 # --- <<< End Stale Order Cancellation Logic >>> ---
 
                             # Handle other API statuses ('canceled', 'rejected', etc.) - This part remains unchanged
@@ -818,6 +817,7 @@ async def run_scanner():
                         try:
                             main_logger.debug(f"Checking SL order {sl_order_id} for signal {signal_id} ({symbol})")
                             sl_status_details = await order_executor.check_order_status(symbol=symbol, order_id=sl_order_id)
+                            
                             if sl_status_details:
                                 sl_status = sl_status_details.get('status')
                                 main_logger.info(f"SL order {sl_order_id} (Signal {signal_id}) status: {sl_status}")
@@ -833,22 +833,43 @@ async def run_scanner():
                                     
                                     if tp_order_id:
                                         main_logger.info(f"Attempting to cancel TP order {tp_order_id} for signal {signal_id} as SL was hit.")
-                                        await order_executor.cancel_order(tp_order_id, symbol)
+                                        # Store cancellation attempt info if needed, or just log
+                                        cancel_tp_response = await order_executor.cancel_order(tp_order_id, symbol)
+                                        main_logger.info(f"Cancel TP order {tp_order_id} response: {cancel_tp_response}")
                                     continue # Move to next signal, this one is resolved
-                                elif sl_status in ['canceled', 'rejected', 'expired']:
-                                    main_logger.error(f"SL order {sl_order_id} for signal {signal_id} ({symbol}) is {sl_status}! Position might be unprotected.")
-                                    # This is a critical situation. The position is open, but SL is no longer active.
-                                    state_manager.update_signal_status(signal_id, f'SL_INACTIVE_{sl_status.upper()}', {'sl_order_id': sl_order_id, 'tp_order_id': tp_order_id})
+
+                                elif sl_status in ['canceled', 'cancelled', 'rejected', 'expired']:
+                                    main_logger.error(f"SL order {sl_order_id} for signal {signal_id} ({symbol}) is {sl_status}! Position might be unprotected. Critical!")
+                                    state_manager.update_signal_status(signal_id, f'SL_INACTIVE_{sl_status.upper()}', {'sl_order_id': sl_order_id, 'tp_order_id': tp_order_id, 'error_message': f'SL order reported as {sl_status}'})
                                     # TODO: Implement emergency handling? E.g., market close position.
-                                    continue # Or break and handle manually
-                            else:
-                                main_logger.warning(f"Could not retrieve SL order {sl_order_id} status for signal {signal_id}. It might have been cancelled or does not exist.")
-                                # If it's not found, it could be an issue. Check if it was already processed
+                                    continue # Position is now in an error state, process next signal
+
+                                elif sl_status in ['notfound', 'historical_notfound', 'unknown_after_retries']:
+                                    new_db_status = 'SL_ORDER_NOT_FOUND_API'
+                                    error_message_detail = f"SL order {sl_order_id} for signal {signal_id} ({symbol}) reported as '{sl_status}' by OrderExecutor."
+                                    main_logger.error(f"{error_message_detail} Position might be unprotected. Critical! Marking as {new_db_status} in DB.")
+                                    state_manager.update_signal_status(signal_id, new_db_status, {'sl_order_id': sl_order_id, 'error_message': error_message_detail})
+                                    continue # Position is in an error state
+
+                                elif sl_status in ['network_error', 'exchange_error', 'unexpected_error_check_status', 'unknown_loop_exit']:
+                                    main_logger.error(f"SL order {sl_order_id} for signal {signal_id} ({symbol}) encountered API/network error: '{sl_status}'. Status check will retry next cycle.")
+                                    # No state change, allow retry in next cycle
+                                
+                                # If sl_status is 'open' or any other unhandled status, it implies the SL is still active or in an indeterminate state.
+                                # No specific action needed here, loop will check again.
+                                else:
+                                    main_logger.debug(f"SL order {sl_order_id} for signal {signal_id} status '{sl_status}'. No immediate closure action.")
+
+                            else: # sl_status_details is None
+                                main_logger.warning(f"Could not retrieve SL order {sl_order_id} status details (None returned) for signal {signal_id}. It might have been cancelled or does not exist. Check next cycle.")
+                                # To avoid rapidly flipping state if it's a temporary API glitch, we might not change state immediately
+                                # unless this persists over multiple cycles (more advanced handling).
+                                # For now, if check_order_status returns None, we assume a temporary issue and retry.
                                 current_status_in_db = state_manager.get_signal(signal_id).get('status')
                                 if current_status_in_db == 'POSITION_OPEN': # Still expect it to be open
-                                     state_manager.update_signal_status(signal_id, 'SL_ORDER_NOT_FOUND')
-                                     main_logger.error(f"SL order {sl_order_id} for signal {signal_id} not found by API, but signal is POSITION_OPEN in DB. Critical!")
-                                continue
+                                     main_logger.warning(f"SL order {sl_order_id} status check returned None for signal {signal_id}, but signal is POSITION_OPEN in DB. Potential issue with check_order_status or order disappeared.")
+                                     # Consider a specific state like 'SL_CHECK_FAILED_NO_DETAILS' if this becomes common.
+                                # continue # Removed continue, SL check failed, proceed to TP check or next signal normally.
 
                         except Exception as e:
                             main_logger.error(f"Error checking SL order {sl_order_id} for signal {signal_id}: {e}", exc_info=True)
@@ -859,42 +880,77 @@ async def run_scanner():
 
                     # --- Check TP Order (only if SL not hit in this cycle) ---
                     if tp_order_id:
+                        # First, ensure the signal hasn't already been closed by SL in this same cycle run
+                        current_signal_status_for_tp_check = state_manager.get_signal(signal_id).get('status')
+                        if current_signal_status_for_tp_check != 'POSITION_OPEN':
+                            main_logger.info(f"Signal {signal_id} is no longer POSITION_OPEN (current: {current_signal_status_for_tp_check}). Skipping TP check for this cycle.")
+                            continue
+
                         try:
                             main_logger.debug(f"Checking TP order {tp_order_id} for signal {signal_id} ({symbol})")
                             tp_status_details = await order_executor.check_order_status(symbol=symbol, order_id=tp_order_id)
+
                             if tp_status_details:
                                 tp_status = tp_status_details.get('status')
                                 main_logger.info(f"TP order {tp_order_id} (Signal {signal_id}) status: {tp_status}")
                                 
                                 if tp_status == 'filled' or tp_status == 'closed':
-                                    filled_price = tp_status_details.get('averagePrice', original_signal_data.get('take_profit_targets_str')) # Fallback is not ideal here, but best guess
-                                    main_logger.info(f"$$$ TAKE PROFIT HIT for signal {signal_id} ({symbol}) at price {filled_price} (Order ID: {tp_order_id}) $$$ ")
-                                    state_manager.update_signal_status(signal_id, 'CLOSED_TP', {'closed_price': filled_price, 'closed_by': 'TP'})
-                                    original_signal_data['status'] = 'CLOSED_TP'
-                                    original_signal_data['closed_price'] = filled_price
-                                    journaling_module.log_trade_signal(original_signal_data) # Log final state
-                                    signal_alerter.alert(original_signal_data, is_closure=True)
+                                    # Ensure signal wasn't already closed by SL (double check, though prior check should catch it)
+                                    if state_manager.get_signal(signal_id).get('status') == 'POSITION_OPEN':
+                                        filled_price = tp_status_details.get('averagePrice', original_signal_data.get('take_profit_targets_str')) # Fallback is not ideal here
+                                        actual_tp_price_from_db = db_signal.get('tp_price', 'N/A') # Get ordered TP price
+                                        main_logger.info(f"$$$ TAKE PROFIT HIT for signal {signal_id} ({symbol}) at price {filled_price} (Order ID: {tp_order_id}, Ordered TP: {actual_tp_price_from_db}) $$$ ")
+                                        state_manager.update_signal_status(signal_id, 'CLOSED_TP', {'closed_price': filled_price, 'closed_by': 'TP'})
+                                        original_signal_data['status'] = 'CLOSED_TP'
+                                        original_signal_data['closed_price'] = filled_price
+                                        journaling_module.log_trade_signal(original_signal_data) # Log final state
+                                        signal_alerter.alert(original_signal_data, is_closure=True)
 
-                                    if sl_order_id:
-                                        main_logger.info(f"Attempting to cancel SL order {sl_order_id} for signal {signal_id} as TP was hit.")
-                                        await order_executor.cancel_order(sl_order_id, symbol)
-                                    continue # Move to next signal
-                                elif tp_status in ['canceled', 'rejected', 'expired']:
+                                        if sl_order_id:
+                                            main_logger.info(f"Attempting to cancel SL order {sl_order_id} for signal {signal_id} as TP was hit.")
+                                            cancel_sl_response = await order_executor.cancel_order(sl_order_id, symbol)
+                                            main_logger.info(f"Cancel SL order {sl_order_id} response: {cancel_sl_response}")
+                                        continue # Move to next signal, this one is resolved
+                                    else:
+                                        main_logger.info(f"TP order {tp_order_id} for signal {signal_id} found filled, but signal already closed (e.g. by SL). No action.")
+                                        continue
+
+                                elif tp_status in ['canceled', 'cancelled', 'rejected', 'expired']:
                                     main_logger.warning(f"TP order {tp_order_id} for signal {signal_id} ({symbol}) is {tp_status}. Position remains open with SL only (if SL is active).")
-                                    state_manager.update_signal_status(signal_id, f'TP_INACTIVE_{tp_status.upper()}', {'sl_order_id': sl_order_id, 'tp_order_id': tp_order_id})
-                                    # Position continues, but without this specific TP. Might need manual management or other TPs if multiple.
-                            else:
-                                main_logger.warning(f"Could not retrieve TP order {tp_order_id} status for signal {signal_id}. It might have been cancelled or does not exist.")
+                                    # Update status to reflect TP inactive, but SL might still be active.
+                                    # Do not mark as fully error if SL is still there.
+                                    current_db_status = state_manager.get_signal(signal_id).get('status')
+                                    if current_db_status == 'POSITION_OPEN': # Only update if not already closed by SL
+                                        state_manager.update_signal_status(signal_id, f'TP_INACTIVE_{tp_status.upper()}', {'sl_order_id': sl_order_id, 'tp_order_id': tp_order_id, 'error_message': f'TP order reported as {tp_status}'})
+                                    # Position continues, but without this specific TP.
+
+                                elif tp_status in ['notfound', 'historical_notfound', 'unknown_after_retries']:
+                                    new_db_status = 'TP_ORDER_NOT_FOUND_API'
+                                    error_message_detail = f"TP order {tp_order_id} for signal {signal_id} ({symbol}) reported as '{tp_status}' by OrderExecutor."
+                                    main_logger.warning(f"{error_message_detail} Signal was POSITION_OPEN. Marking as {new_db_status} in DB.")
+                                    current_db_status = state_manager.get_signal(signal_id).get('status')
+                                    if current_db_status == 'POSITION_OPEN': # Only update if not already closed by SL
+                                        state_manager.update_signal_status(signal_id, new_db_status, {'tp_order_id': tp_order_id, 'error_message': error_message_detail})
+                                
+                                elif tp_status in ['network_error', 'exchange_error', 'unexpected_error_check_status', 'unknown_loop_exit']:
+                                    main_logger.error(f"TP order {tp_order_id} for signal {signal_id} ({symbol}) encountered API/network error: '{tp_status}'. Status check will retry next cycle.")
+                                    # No state change, allow retry in next cycle
+                                else:
+                                    main_logger.debug(f"TP order {tp_order_id} for signal {signal_id} status '{tp_status}'. No immediate closure action.")
+
+                            else: # tp_status_details is None
+                                main_logger.warning(f"Could not retrieve TP order {tp_order_id} status details (None returned) for signal {signal_id}. It might have been cancelled or does not exist. Check next cycle.")
+                                # Similar to SL, avoid rapid state change on temporary glitch.
                                 current_status_in_db = state_manager.get_signal(signal_id).get('status')
                                 if current_status_in_db == 'POSITION_OPEN': # Still expect it to be open
-                                     state_manager.update_signal_status(signal_id, 'TP_ORDER_NOT_FOUND')
-                                     main_logger.warning(f"TP order {tp_order_id} for signal {signal_id} not found by API, but signal is POSITION_OPEN in DB.")
-                                # No continue here, SL might still be active or other TPs.
+                                     main_logger.warning(f"TP order {tp_order_id} status check returned None for signal {signal_id}, but signal is POSITION_OPEN in DB. Potential issue with check_order_status or order disappeared.")
+                                     # Consider a specific state like 'TP_CHECK_FAILED_NO_DETAILS'.
                         except Exception as e:
                             main_logger.error(f"Error checking TP order {tp_order_id} for signal {signal_id}: {e}", exc_info=True)
                     # If no tp_order_id but position is open, it means TP placement might have failed earlier.
                     # The status should reflect that (e.g., TP_PLACEMENT_FAILED). No specific action here unless new TPs are to be attempted.
-
+                    # or if the SL was hit in this same cycle, this TP check part would be skipped.
+                
             # --- Wait for next cycle --- 
             loop_end_time = time.time()
             loop_duration = loop_end_time - loop_start_time

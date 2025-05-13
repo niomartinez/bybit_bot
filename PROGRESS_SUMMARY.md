@@ -41,6 +41,10 @@ Order placement for entry orders with bundled Stop Loss (SL) and Take Profit (TP
     *   Changed log level for `historical_notfound` status (when checking `PENDING_ENTRY` orders) from `ERROR` to `WARNING` to reduce noise for expected scenarios with very old orders.
 *   **Database Schema Fix for `error_message` (`src/state_manager.py`):**
     *   Resolved "no such column: error_message" by ensuring the `error_message` column is added to `tracked_signals` via `add_column_if_not_exists` in `_init_db`. DB updates including error messages now succeed.
+*   **Pandas Datetime Handling (`src/analysis_engine.py`):**
+    *   Resolved persistent Pandas `TypeError`s (previously `FutureWarning`s) related to timezone-naive vs. timezone-aware datetime conversions by ensuring datetime columns are consistently initialized and typed as timezone-aware UTC (`datetime64[ns, UTC]`) using `pd.Series(pd.NaT, index=df.index, dtype='datetime64[ns, UTC]')`.
+*   **SL/TP Monitoring Loop Enhancement (`src/main.py`):**
+    *   Improved the robustness of the SL/TP monitoring loop for `POSITION_OPEN` signals by adding more detailed handling for various order statuses (e.g., `notfound`, `canceled`, `rejected`, errors) returned by the exchange, mirroring the logic in the `PENDING_ENTRY` loop.
 
 ### Debugging Journey Summary:
 
@@ -49,6 +53,7 @@ Order placement for entry orders with bundled Stop Loss (SL) and Take Profit (TP
 *   Corrected `AttributeError` in `AnalysisEngine`.
 *   Fixed "no such column: error_message" database error.
 *   Adjusted logging for `historical_notfound` scenarios.
+*   Iteratively diagnosed and resolved Pandas `TypeError` (manifesting after initial `FutureWarning` fixes) concerning timezone-naive vs. timezone-aware datetime operations in `src/analysis_engine.py`. The solution involved consistently initializing relevant datetime columns as `datetime64[ns, UTC]`.
 
 ## Immediate Next Steps & Focus Areas:
 
@@ -64,8 +69,9 @@ Order placement for entry orders with bundled Stop Loss (SL) and Take Profit (TP
     *   If one is hit (e.g., TP), attempt to cancel the other (e.g., SL).
 3.  **Configuration Cleanup:**
     *   Review and remove invalid/placeholder symbols from `portfolio.coins_to_scan` in `config.json` (e.g., `PLUMUSDT`, `FARTCOINUSDT`) to prevent API errors during data fetching.
-4.  **Address Pandas `FutureWarning`s:**
-    *   Investigate and refactor code in `src/analysis_engine.py` (and potentially other places) causing `FutureWarning: Setting an item of incompatible dtype is deprecated...` to ensure future compatibility with Pandas. This typically involves explicit type casting (e.g., `pd.to_datetime()`) before assigning to DataFrame columns of a specific `dtype`.
+4.  **Review SL/TP Order Cancellation Logic (Post Fill):**
+    *   Ensure the logic for cancelling the remaining SL or TP order (after one of them has been filled) is robust and handles various exchange responses correctly (e.g., order already filled, order not found because it was auto-cancelled by exchange).
+    *   Verify that the state in `StateManager` is updated accurately post-cancellation attempt.
 
 ## Future Modules/Refinements (Post Critical Next Steps):
 
