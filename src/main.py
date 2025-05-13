@@ -758,8 +758,18 @@ async def run_scanner():
                                 state_manager.update_signal_status(signal_id, status.upper(), {'rejection_reason': f'API reported {status}'})
                             # Handle new statuses from check_order_status
                             elif status in ['notfound', 'unknown_after_retries', 'historical_notfound']:
-                                new_db_status = 'CANCELLED_STALE_NOT_FOUND' if status == 'historical_notfound' else 'UNKNOWN_API_STATUS'
-                                main_logger.error(f"Order {order_id} for signal {signal_id} ({symbol}) reported as '{status}' by OrderExecutor. Marking as {new_db_status} in DB.")
+                                if status == 'historical_notfound':
+                                    new_db_status = 'CANCELLED_STALE_NOT_FOUND'
+                                    main_logger.warning(f"Order {order_id} for signal {signal_id} ({symbol}) reported as '{status}' by OrderExecutor. Marking as {new_db_status} in DB.")
+                                else: # 'notfound' or 'unknown_after_retries'
+                                    new_db_status = 'UNKNOWN_API_STATUS' # Default for other not founds
+                                    if status == 'notfound': # Explicitly not found by first checks
+                                        main_logger.error(f"Order {order_id} for signal {signal_id} ({symbol}) reported as '{status}' (not found by open/closed checks, nor specific fetch_order). Marking as {new_db_status} in DB.")
+                                    elif status == 'unknown_after_retries':
+                                        main_logger.error(f"Order {order_id} for signal {signal_id} ({symbol}) reported as '{status}' after multiple retries. Marking as {new_db_status} in DB.")
+                                    else: # Should not happen given the input list, but as a fallback
+                                        main_logger.error(f"Order {order_id} for signal {signal_id} ({symbol}) reported as unhandled status '{status}' in notfound block. Marking as {new_db_status} in DB.")
+
                                 state_manager.update_signal_status(signal_id, new_db_status, {'error_message': f'Order status check returned {status}'})
                             elif status in ['network_error', 'exchange_error', 'unexpected_error_check_status', 'unknown_loop_exit']:
                                 main_logger.error(f"Order {order_id} for signal {signal_id} ({symbol}) encountered error: '{status}'. Marking as CHECK_STATUS_FAILED in DB.")

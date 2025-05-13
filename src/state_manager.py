@@ -56,7 +56,8 @@ class StateManager:
                     signal_data TEXT, 
                     filled_qty REAL, 
                     closed_price REAL, 
-                    closed_by TEXT
+                    closed_by TEXT,
+                    error_message TEXT
                 )
             """)
             
@@ -75,6 +76,7 @@ class StateManager:
             add_column_if_not_exists('closed_price', 'REAL')
             add_column_if_not_exists('closed_by', 'TEXT')
             add_column_if_not_exists('poi_key', 'TEXT')
+            add_column_if_not_exists('error_message', 'TEXT')
 
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_symbol_status ON tracked_signals (symbol, status)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_status ON tracked_signals (status)")

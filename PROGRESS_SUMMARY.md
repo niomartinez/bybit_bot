@@ -4,7 +4,7 @@
 
 ## Current Status
 
-Order placement for entry orders with bundled Stop Loss (SL) and Take Profit (TP) is largely functional. Significant effort has been made to refine signal validation logic to prevent placing orders for stale setups where the price has already moved beyond the hypothetical TP or where the SL would be invalid relative to the current market price. `OrderExecutor.check_order_status` has been made more robust. TP price journaling to the database and CSV has been improved. **Logic for cancelling stale `PENDING_ENTRY` orders based on current market price vs. SL/TP/Entry has been implemented.**
+Order placement for entry orders with bundled Stop Loss (SL) and Take Profit (TP) is largely functional. Significant effort has been made to refine signal validation logic to prevent placing orders for stale setups. Logic for cancelling stale `PENDING_ENTRY` orders based on current market price vs. SL/TP/Entry has been implemented. The handling of very old, untraceable pending orders (`historical_notfound`) has been refined.
 
 ### Key Accomplishments (Since Last Update):
 
@@ -32,34 +32,44 @@ Order placement for entry orders with bundled Stop Loss (SL) and Take Profit (TP
         *   Corrected logic to pass the actual TP price (from order response when bundled, or calculated `tp_price_f` when separate) to `StateManager` for storage in relevant TP price columns.
 *   **Order Status Handling (`src/order_executor.py` & `src/main.py`):**
     *   `OrderExecutor.check_order_status` refactored to try `fetchOpenOrders`, then `fetchClosedOrders`, then `fetch_order` as a fallback. It now returns more descriptive statuses like `historical_notfound` if Bybit's "last 500 orders" limit is hit by `fetch_order`.
-    *   `StateManager.update_signal_status` now whitelists `error_message` for storage.
-    *   `main.py` updated to handle `closed` status from `check_order_status` as a fill, and to appropriately update DB status for new error/not-found states like `historical_notfound` (to `CANCELLED_STALE_NOT_FOUND`) and other errors (to `CHECK_STATUS_FAILED`).
-    *   `main.py` signal processing loop now more robustly skips reprocessing signals that are already `PENDING_ENTRY` or in other non-actionable states (including `UNKNOWN_API_STATUS`).
+    *   `main.py` updated to handle `closed` status from `check_order_status` as a fill, and to appropriately update DB status for new error/not-found states.
+    *   `main.py` signal processing loop now more robustly skips reprocessing signals that are already `PENDING_ENTRY` or in other non-actionable states.
     *   Refined `place_sl_tp_orders_for_signal` in `main.py` to fetch updated signal details (with filled price/qty) from DB after setting status to `ENTRY_FILLED`, before proceeding to place SL/TP orders. Added error handling for this step.
 *   **API Parameter Correction (`src/order_executor.py`):**
     *   Removed potentially problematic `orderFilter: 'tpslOrder'` from `default_params` in `place_limit_entry_order` for derivative orders with bundled SL/TP.
+*   **Log Level Adjustment for `historical_notfound` (`src/main.py`):**
+    *   Changed log level for `historical_notfound` status (when checking `PENDING_ENTRY` orders) from `ERROR` to `WARNING` to reduce noise for expected scenarios with very old orders.
+*   **Database Schema Fix for `error_message` (`src/state_manager.py`):**
+    *   Resolved "no such column: error_message" by ensuring the `error_message` column is added to `tracked_signals` via `add_column_if_not_exists` in `_init_db`. DB updates including error messages now succeed.
 
 ### Debugging Journey Summary:
 
-*   Addressed `KeyError: '"retCode"'` during order placement by:
-    *   Ensuring `verbose: True` in `DataIngestionModule` to get raw Bybit API responses.
-    *   Identifying that Bybit rejected orders due to SL prices being invalid relative to the *current market price* at the time of submission (because signals were stale).
-    *   Removing the `orderFilter` parameter for derivative limit orders with SL/TP.
-    *   Implementing the pre-order validation in `main.py` to catch these stale SL conditions proactively.
-*   Refined multi-stage signal invalidation in `AnalysisEngine` to better handle old signals by fetching fresh 5m data up to the current scan time for a final validity check against hypothetical TP.
-*   Corrected `AttributeError` in `AnalysisEngine` due to method indentation.
+*   Addressed `KeyError: '"retCode"'` during order placement.
+*   Refined multi-stage signal invalidation in `AnalysisEngine`.
+*   Corrected `AttributeError` in `AnalysisEngine`.
+*   Fixed "no such column: error_message" database error.
+*   Adjusted logging for `historical_notfound` scenarios.
 
-## Immediate Next Steps:
+## Immediate Next Steps & Focus Areas:
 
-1.  **Testing and Monitoring:**
-    *   Thoroughly test the **stale order cancellation logic** in various scenarios (TP hit market, SL hit market, market moved away).
+1.  **Testing and Monitoring (Ongoing Priority):**
+    *   Continue thorough testing of the **stale order cancellation logic** in various scenarios (TP hit market, SL hit market, market moved away).
     *   Monitor order fill status updates (`PENDING_ENTRY` -> `ENTRY_FILLED` -> `POSITION_OPEN`) to ensure correct transitions.
     *   Verify that the `place_sl_tp_orders_for_signal` function is triggered reliably after `ENTRY_FILLED` and uses the correct filled price/qty.
     *   Test the **duplicate entry prevention** logic by restarting the bot during different signal states.
+2.  **Implement Position/SL/TP Monitoring (Critical):**
+    *   Develop the loop in `main.py` for `POSITION_OPEN` signals to actively monitor if their corresponding SL or TP orders (managed by the exchange) are hit.
+    *   This involves periodically checking the status of the `sl_order_id` and `tp_order_id` stored in `StateManager`.
+    *   Upon SL/TP fill, update the signal status in `StateManager` to `CLOSED_SL` or `CLOSED_TP`, log the closure, and alert.
+    *   If one is hit (e.g., TP), attempt to cancel the other (e.g., SL).
+3.  **Configuration Cleanup:**
+    *   Review and remove invalid/placeholder symbols from `portfolio.coins_to_scan` in `config.json` (e.g., `PLUMUSDT`, `FARTCOINUSDT`) to prevent API errors during data fetching.
+4.  **Address Pandas `FutureWarning`s:**
+    *   Investigate and refactor code in `src/analysis_engine.py` (and potentially other places) causing `FutureWarning: Setting an item of incompatible dtype is deprecated...` to ensure future compatibility with Pandas. This typically involves explicit type casting (e.g., `pd.to_datetime()`) before assigning to DataFrame columns of a specific `dtype`.
 
-## Future Modules/Refinements (Post SL/TP & Stale Order Cancellation Testing):
+## Future Modules/Refinements (Post Critical Next Steps):
 
-*   Implement Position/SL/TP Monitoring (`main.py` loop for `POSITION_OPEN` signals to see if active SL/TP orders are hit).
-*   Add Telegram/Discord notifications (`SignalAlerter`).
-*   Address remaining Pandas `FutureWarning`s (low priority).
-*   Add unit tests.
+*   Add Telegram/Discord notifications (`SignalAlerter` for fills, errors, and closures).
+*   Add comprehensive unit tests for all critical modules.
+*   Further explore and refine error handling and retry mechanisms, especially for API interactions.
+*   Performance review and optimization if scanning a very large number of coins.
