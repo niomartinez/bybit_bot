@@ -1,128 +1,21 @@
 {
-    "cex_api": {
-        "exchange_id": "bybit",
-        "testnet": false,
-        "demo_mode": false,
-        "api_urls": {
-            "testnet": "https://api-testnet.bybit.com",
-            "mainnet": "https://api.bybit.com",
-            "demo_mainnet": "https://api-demo.bybit.com" 
-        },
-        "api_key_env_var": "MAINNET_LIVE_BYBIT_API_KEY",
-        "api_secret_env_var": "MAINNET_LIVE_BYBIT_API_SECRET",
-        "rate_limit_retry_attempts": 5,
-        "rate_limit_retry_delay_seconds": 60,
-        "rate_limit_test_delay_seconds": 1
-    },
-    "secrets_env_file": ".env",
-    "logging": {
-        "log_file": "logs/bot.log",
-        "log_level": "USER",
-        "log_rotation_size_mb": 10,
-        "log_backup_count": 5
-    },
-    "scanner": {
-        "scan_interval_minutes": 5,
-        "delay_between_symbols_seconds": 0.5,
-        "staleness_entry_deviation_percent": 2.0
-    },
-    "portfolio": {
-        "coins_to_scan": [
-            "BTCUSDT",
-            "ETHUSDT",
-            "SOLUSDT",
-            "XRPUSDT",
-            "DOGEUSDT",
-            "SUIUSDT",
-            "RENDERUSDT",
-            "OMUSDT",
-            "ONDOUSDT",
-            "WIFUSDT",
-            "POPCATUSDT",
-            "ADAUSDT",
-            "FARTCOINUSDT",
-            "MOODENGUSDT",
-            "1000PEPEUSDT",
-            "1000BONKUSDT",
-            "TRUMPUSDT",
-            "ENAUSDT",
-            "NEARUSDT",
-            "AVAXUSDT",
-            "AAVEUSDT",
-            "HBARUSDT",
-            "BNBUSDT",
-            "HYPEUSDT",
-            "HYPERUSDT",
-            "KAITOUSDT",
-            "TAOUSDT",
-            "TIAUSDT",
-            "SEIUSDT",
-            "ARKMUSDT",
-            "GRASSUSDT",
-            "PLUMEUSDT",
-            "GUNUSDT"
-        ],
-        "max_concurrent_trades": 1
-    },
-    "strategy_params": {
-        "timeframes": {
-            "contextual": "15m",
-            "execution": "5m"
-        },
-        "swing_points": {
-            "lookback_left": 1,
-            "lookback_right": 1
-        },
-        "swing_points_5m": {
-            "lookback_left": 1,
-            "lookback_right": 1
-        },
-        "bos": {
-            "confirmation_candles": 1
-        },
-        "bos_5m": {
-            "confirmation_candles": 1
-        },
-        "fvg": {
-            "sensitivity_factor": 0.1
-        },
-        "fibonacci": {
-            "levels_to_watch": [0.50, 0.618, 0.786],
-            "golden_pocket_upper": 0.650,
-            "golden_pocket_lower": 0.618
-        },
-        "poi_confluence": {
-            "min_confidence_score": 3,
-            "bos_retest_tolerance_percent": 0.1, 
-            "fib_fvg_overlap_tolerance_percent": 0.05 
-        },
-        "entry_logic_5m": {
-            "use_fvg_entry": true,
-            "use_mss_bos_entry": true
-        },
-        "take_profit": {
-            "use_fixed_rr": true,
-            "fixed_rr_ratios": [2.0, 3.0],
-            "use_structural_targets": false,
-            "fib_extension_levels": [-0.272, -0.618]
-        }
-    },
-    "risk_management": {
-        "fixed_dollar_risk_per_trade": 1.00,
-        "daily_loss_limit_dollars": 3.00,
-        "daily_max_losing_trades": 3,
-        "sl_buffer_ticks": 5 
-    },
-    "notifications": {
-        "enable_telegram": false,
-        "telegram_bot_token_env": "TELEGRAM_BOT_TOKEN",
-        "telegram_chat_id_env": "TELEGRAM_CHAT_ID",
-        "enable_discord": false,
-        "discord_webhook_url_env": "DISCORD_WEBHOOK_URL"
-    },
-    "journaling": {
-        "journal_file_type": "csv",
-        "csv_journal_file": "logs/trade_journal.csv",
-        "db_journal_uri": "sqlite:///logs/trade_journal.db"
-    }
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8001
+  },
+  "bybit_api": {
+    "category": "linear",
+    "default_time_in_force": "GTC",
+    "max_leverage_cap": null
+  },
+  "risk_management": {
+    "var_type": "fixed_amount",
+    "var_value": 1.0,
+    "portfolio_currency": "USDT"
+  },
+  "logging": {
+    "level": "INFO",
+    "file": "logs/trading_bot.log",
+    "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  }
 } 

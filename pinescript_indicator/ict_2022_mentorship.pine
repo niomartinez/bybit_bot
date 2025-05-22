@@ -1,0 +1,1321 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © nioboi
+
+//@version=6
+strategy("ICT 2022 Mentorship Model Strategy", "ICT 2022", overlay=true, max_bars_back=5000, max_lines_count=500, max_labels_count=500, default_qty_type=strategy.percent_of_equity, default_qty_value=10, initial_capital=10000, currency=currency.USD, dynamic_requests=true)
+
+//================ IMPORT LIBRARIES ================ courtesy of @TFlab
+//import Order Block Refiner
+import TFlab/OrderBlockRefiner_TradingFinder/2 as Refiner
+//import Order Block Drawing Library
+import TFlab/OrderBlockDrawing_TradingFinder/4 as Drawing
+//import FVD Detector Library
+import TFlab/FVGDetectorLibrary/3 as FVG
+
+//================ CORE LOGIC PARAMETERS ================
+SwingPeriod = input.int(50, 'Swing Period', minval=1, group='Logical Setting', tooltip='Defines the number of bars to look back for swing high/low points. Higher values capture larger market moves but may be less responsive to recent price action.')
+MaxSwingBack_Method = "All" // defaulted we are not using this
+MaxSwingBack = 100 // Defaulted, we are not using this
+FVG_Length = input.int(120, 'FVG Length', minval=1, group='Logical Setting', tooltip='Determines how long Fair Value Gaps remain active for trading. Lower values make the strategy more selective but might miss opportunities; higher values consider older FVGs but may enter outdated market conditions.')
+MSS_Length = input.int(80, 'MSS Length', minval=1, group='Logical Setting', tooltip='Market Structure Shift length - Sets how long to track structure shifts for potential trades. Controls the window for detecting changes in trend direction.')
+
+//================ FVG FILTERING & MITIGATION ================
+PFVGFilter = input.bool(false, 'Enable FVG Width Filter', group='FVG Logical Setting', inline='FVG Filter', tooltip='If enabled, this filter will filter Fair Value Gaps based on their width. Helps avoid trading in FVGs that are too narrow or too wide, improving trade quality by focusing on meaningful price imbalances.')
+PFVGFilterType = input.string('Defensive', 'Filter Type', ['Very Aggressive', 'Aggressive', 'Defensive', 'Very Defensive'], group='FVG Logical Setting', inline='FVG Filter', tooltip='Controls how selective the FVG filter is. "Very Aggressive" accepts most FVGs regardless of width. "Defensive" and "Very Defensive" become increasingly selective, requiring larger gaps. Use more defensive settings for higher timeframes or volatile markets.')
+MLFVG = input.string('Proximal', 'FVG Internal Entry Level', ['Proximal', '50 % OB', 'Distal'], tooltip='Determines exactly where within the Fair Value Gap to place limit orders. "Proximal" places orders at the edge closest to current price (more conservative, higher fill rate). "50% OB" places orders at the midpoint. "Distal" places orders at the furthest edge (more aggressive, better R:R but fewer fills).', group='FVG Logical Setting')
+
+//================ DISPLAY FVG ================
+// Display settings from original script
+DFVGShow = input.bool(true, 'Demand FVG', inline='DFVG', group='FVG Display Setting')
+DFVGColor = input.color(#03a8036c, '', inline='DFVG', group='FVG Display Setting')
+
+SFVGShow = input.bool(true, 'Supply FVG', inline='SFVG', group='FVG Display Setting')
+SFVGColor = input.color(#c20d0070, '', inline='SFVG', group='FVG Display Setting')
+
+Show_Strategy_Table = input.bool(true, 'Show Statistics Table', group='Display Setting', tooltip='Toggle visibility of the strategy statistics table in the top-right corner. Shows performance metrics like win rate, profit factor and drawdown when enabled.')
+Show_Trade_Bar_Colors = input.bool(false, 'Color Bars On Trades', group='Display Setting', tooltip='When enabled, colors price bars green during long trades and red during short trades to easily visualize trade duration.')
+
+AShow = input.bool(true, 'Show All LvL', group='Display Setting')
+HShow = input.bool(true, 'Show High LvL', group='Display Setting', inline='H')
+LShow = input.bool(true, 'Show Low LvL', group='Display Setting', inline='L')
+
+HNColor = input.color(#870505, 'Name', group='Display Setting', inline='H')
+LNColor = input.color(#014f07, 'Name', group='Display Setting', inline='L')
+HLColor = input.color(#b90000b8, 'Line', group='Display Setting', inline='H')
+LLColor = input.color(#069206a7, 'Line', group='Display Setting', inline='L')
+
+AShow_MSS = input.bool(true, 'Show All MSS', group='Display Setting')
+HShow_MSS = input.bool(true, 'Show High MSS', group='Display Setting', inline='HMSS')
+LShow_MSS = input.bool(true, 'Show Low MSS', group='Display Setting', inline='LMSS')
+
+HNColor_MSS = input.color(#870505, 'Name', group='Display Setting', inline='HMSS')
+LNColor_MSS = input.color(#014f07, 'Name', group='Display Setting', inline='LMSS')
+HLColor_MSS = input.color(#b90000b8, 'Line', group='Display Setting', inline='HMSS')
+LLColor_MSS = input.color(#069206a7, 'Line', group='Display Setting', inline='LMSS')
+
+//================ ENTRY LOGIC CONFIGURATION ================
+Entry_Method = input.string('FVG_Level_Limit_Order', 'Entry Method', ['Proximal_Touch_Market', 'FVG_Level_Limit_Order', 'Candle_Close_Inside_FVG'], group='Entry Configuration', tooltip='Determines how trades are entered: "Proximal_Touch_Market" enters immediately when price touches the FVG boundary; "FVG_Level_Limit_Order" places a limit order at the specified FVG level and waits for price to come to it; "Candle_Close_Inside_FVG" only enters when a candle closes inside the FVG area.')
+Entry_Order_Expiry_Bars = input.int(100, 'Entry Order Expiry Bars', minval=1, tooltip='When using limit order entry methods, this controls how many bars a pending order will remain active before being canceled if not filled. Lower values (3-5) keep orders fresh but may miss delayed fills; higher values (10-15) allow more time for price to reach the order level.', group='Entry Configuration')
+
+//================ STOP-LOSS CONFIGURATION ================
+StopLoss_Placement_Method = input.string('Lowest_After_Sweep', 'Stop-Loss Placement Method', ['FVG_Distal', 'MSS_Swing_Point', 'Liquidity_Sweep_Extreme', 'Lowest_After_Sweep', 'Recent_Swing_Point'], group='Stop-Loss Configuration', tooltip='Controls where to place stop loss: "FVG_Distal" uses far edge of the FVG (conservative); "MSS_Swing_Point" uses market structure swing points (balanced protection); "Liquidity_Sweep_Extreme" uses recent liquidity sweep levels (follows ICT concepts); "Lowest_After_Sweep" finds the lowest post-sweep price (adaptive); "Recent_Swing_Point" uses most recent pivot points (tighter stops).')
+StopLoss_Offset_ATR_Multiplier = input.float(0.2, 'Stop-Loss Buffer %', minval=0.0, step=0.1, tooltip='Adds additional buffer to stop-loss as a percentage of the distance between entry and stop. Higher values place stops further away (safer but larger risk per trade), 0 places stops exactly at the calculated level (tighter but higher chance of premature stop-out).', group='Stop-Loss Configuration')
+
+//================ TAKE-PROFIT CONFIGURATION ================
+// Take Profit Configuration
+Enable_TP1 = true // default to true since we are only using 1 tp for now
+// TakeProfit_Method_TP1 = input.string('Risk_Reward_Ratio', 'Take Profit Method', ['Risk_Reward_Ratio', 'Opposing_Liquidity_Pool', 'Opposing_PD_Array'], group='Take-Profit Configuration')
+TakeProfit_Method_TP1 = 'Risk_Reward_Ratio' // fixed to only use risk to reward due to liq pool and pd array finder bug
+TakeProfit_RR_Ratio_TP1 = input.float(1.5, 'Risk:Reward Ratio', minval=0.1, step=0.1, tooltip='Sets the risk-to-reward ratio for take profit target placement. A value of 1.5 means the profit target will be placed 1.5x the distance from entry as the stop loss is from entry. Higher values place targets further away (larger potential profit but lower win rate).', group='Take-Profit Configuration')
+
+// Hidden variables to maintain compatibility with existing code
+Partial_Profit_Percent_TP1 = 100 // Always 100% since we removed partial TP functionality
+Move_SL_To_BE_On_TP1 = false // Disabled since we simplified exit Entry_Order_Expiry_Bars
+
+//================ ADDITIONAL FILTERS ================
+// Time Filter
+Enable_Time_Filter = input.bool(false, 'Enable Time Filter', tooltip='When enabled, only allows entries during specific forex market sessions known as "Kill Zones" - periods of high liquidity and volatility. Trades outside these times often have lower quality and higher false signals.', group='Time Filter Configuration')
+
+// Asian Session kill zone (default: 20:00-00:00 UTC)
+KZ_Asian_Enabled = input.bool(true, "Asian KillZone", group='Time Filter Configuration', inline="Asian", tooltip="Tokyo/Asian session is typically a period of consolidation and lower volatility, featuring range-bound price action useful for breakout setups.")
+TimeFilter_KillZone_1 = input.session("2000-0000", "Hours (UTC)", group='Time Filter Configuration', inline="Asian", tooltip="Asian/Tokyo session trading hours in UTC time")
+
+// London Session kill zone (default: 02:00-05:00 UTC)
+KZ_London_Enabled = input.bool(true, "London KillZone", group='Time Filter Configuration', inline="London", tooltip="London open is known for increased volatility and directional moves as European traders enter the market, creating many trading opportunities.")
+TimeFilter_KillZone_2 = input.session("0200-0500", "Hours (UTC)", group='Time Filter Configuration', inline="London", tooltip="London session trading hours in UTC time")
+
+// New York Session kill zone (default: 08:30-16:00 UTC)
+KZ_NewYork_Enabled = input.bool(true, "New York KillZone", group='Time Filter Configuration', inline="NewYork", tooltip="New York session often creates high volatility when it overlaps with London, followed by potential trend continuation or reversal after London closes.")
+TimeFilter_KillZone_3 = input.session("0830-1600", "Hours (UTC)", group='Time Filter Configuration', inline="NewYork", tooltip="New York session trading hours in UTC time")
+
+// Higher Timeframe Bias Filter
+Show_Daily_Bias_Background = input.bool(false, 'Color Background based on dailybias', group='HTF Bias Filter', tooltip='When enabled, colors BG green during bullish bias and red during bearis bias to easily visualize trade bias.')
+Enable_HTF_Bias_Filter = input.bool(true, 'Enable HTF Bias Filter', tooltip='When enabled, only allows trades in the direction of the higher timeframe trend. This filter improves trade quality by avoiding counter-trend trades, but may reduce the total number of trading opportunities.', group='HTF Bias Filter')
+HTF_Bias_Timeframe = input.string("Daily", "HTF Bias Timeframe", ["1 Hour", "4 Hours", "Daily"], tooltip='Selects which higher timeframe to use for trend direction. Longer timeframes (Daily) provide more stable trend filtering but may be less responsive to changes; shorter timeframes (1 Hour) are more responsive but may generate more noise.', group='HTF Bias Filter')
+
+// Helper function to convert user-friendly timeframe to actual timeframe value
+convertTimeframe(userTimeframe) =>
+    if userTimeframe == "1 Hour"
+        "60"
+    else if userTimeframe == "4 Hours"
+        "240"
+    else if userTimeframe == "Daily"
+        "D"
+    else
+        "60" // Default to 1 hour
+HTF_Bias_EMA_Period = input.int(20, 'HTF Bias EMA Period', minval=1, tooltip='EMA period used on HTF for bias', group='HTF Bias Filter')
+
+// Volume Filter
+Enable_Volume_Filter = input.bool(false, 'Enable Volume Filter', tooltip='When enabled, requires fair value gap creation to occur on above-average volume. This helps filter out less significant price moves and focuses on FVGs created by strong institutional interest, improving signal quality at the cost of reduced trade frequency.', group='Volume Filter')
+Volume_Filter_Lookback_Period = input.int(20, 'Volume Lookback Period', minval=1, tooltip='Number of bars used to calculate the average volume baseline. Longer periods (30-50) provide more stable volume averages but may be less responsive to current market conditions; shorter periods (10-20) are more adaptive to recent volume patterns.', group='Volume Filter')
+
+// Consecutive Loss Pause
+Enable_Consecutive_Loss_Pause = input.bool(false, 'Enable Consecutive Loss Pause', tooltip='When enabled, automatically pauses trading after a set number of consecutive losing trades. This risk management feature helps avoid over-trading during unfavorable market conditions and gives you time to reassess the strategy performance.', group='Risk Management')
+Consecutive_Loss_Count_Threshold = input.int(3, 'Consecutive Loss Threshold', minval=1, tooltip='Number of consecutive losses required to trigger a trading pause. Lower values (2-3) provide stricter risk control but may pause trading more frequently; higher values (4-5) allow more losses before pausing but may result in larger drawdowns.', group='Risk Management')
+Trading_Pause_Duration_Hours = input.float(4.0, 'Trading Pause Duration (Hours)', minval=0.1, step=0.1, tooltip='How long to pause trading after hitting consecutive loss threshold. Shorter durations (1-2 hours) allow quicker return to trading but may not provide enough time for market conditions to change; longer durations (4-8 hours) provide more separation between trading sessions.', group='Risk Management')
+
+//================ VARIABLE DECLARATIONS ================
+// Variables for tracking trades and status
+var int consecutiveLosses = 0
+var int lastTradeResult = 0  // 1 = win, -1 = loss, 0 = no trade/undetermined
+var float lastTradeTimestamp = 0.0
+var bool inTradingPause = false
+var float lastNetProfit = 0.0
+
+// Variables for tracking kill zone status
+var bool inAsianKZ = false
+var bool inLondonKZ = false
+var bool inNewYorkKZ = false
+
+// Risk management variables
+var float initialEquity = strategy.initial_capital
+var float maxDrawdownPercent = 30.0  // Maximum allowed drawdown before reducing position size
+var float currentRiskMultiplier = 1.0  // Adjusts position size based on drawdown
+
+// Get current pause condition based on consecutive losses and time
+isPauseActive() =>
+    if not Enable_Consecutive_Loss_Pause
+        false
+    else
+        if consecutiveLosses >= Consecutive_Loss_Count_Threshold
+            timeSinceLastTrade = timenow - lastTradeTimestamp
+            pauseMilliseconds = Trading_Pause_Duration_Hours * 60 * 60 * 1000
+            timeSinceLastTrade <= pauseMilliseconds
+        else
+            false
+
+// Consecutive Loss Pause Filter Function - returns true if trading is allowed
+tradingPauseConditionMet() =>
+    if not Enable_Consecutive_Loss_Pause
+        true  // If filter disabled, always return true
+    else
+        not isPauseActive()  // If not in pause, trading is allowed
+
+//================ LVL DETECTOR FUNCTION ================
+// Liquidity Sweep Detection Function
+Lvl_Detector(SwingPeriod, MaxSwingBack_Method, MaxSwingBack) => //Swing Failure 
+    const int Z = 100000000000000000
+
+    var MSH_P = array.new_float()
+    var MSH_I = array.new_int()
+    var MSL_P = array.new_float()
+    var MSL_I = array.new_int()
+
+    var MSH_Permit = array.new_bool()
+    var AOI_MSH = array.new_int()//Another Opportunity Index
+
+    var MSL_Permit = array.new_bool()
+    var AOI_MSL = array.new_int()//Another Opportunity Index
+
+    var float Last_MSH_P = 0.0
+    var int Last_MSH_I   = 0
+    var float Last_MSL_P = 0.0
+    var int Last_MSL_I   = 0
+
+    int HSwingBack = 0
+    int LSwingBack = 0
+    
+    var bool RealLvL         = false
+    var bool ConsiderableLvL = false
+
+    var float H_Price_LvL = 0.0
+    var int   H_Index_LvL = 0
+    var float L_Price_LvL = 0.0
+    var int   L_Index_LvL = 0
+
+    bool HAlert = false
+    bool LAlert = false  
+
+    MSH = ta.pivothigh(SwingPeriod , SwingPeriod)   // Major Swing High
+    MSL = ta.pivotlow(SwingPeriod , SwingPeriod)   // Major Swing Low
+
+    if not na(MSH)
+        MSH_P.push(high[SwingPeriod])
+        MSH_I.push(time[SwingPeriod])
+        MSH_Permit.push(true)
+        AOI_MSH.push(Z)
+
+    if not na(MSL)
+        MSL_P.push(low[SwingPeriod])
+        MSL_I.push(time[SwingPeriod])
+        MSL_Permit.push(true)
+        AOI_MSL.push(Z)
+
+    if  MSH_P.size() > 0 
+        Last_MSH_P := MSH_P.get(MSH_P.size() - 1)
+        Last_MSH_I := MSH_I.get(MSH_I.size() - 1)
+
+    if  MSL_P.size() > 0 
+        Last_MSL_P := MSL_P.get(MSL_P.size() - 1)
+        Last_MSL_I := MSL_I.get(MSL_I.size() - 1)
+
+    switch MaxSwingBack_Method
+        'All'    => HSwingBack := MSH_P.size() , LSwingBack := MSL_P.size()
+        'Custom' => HSwingBack := MaxSwingBack , LSwingBack := MaxSwingBack 
+
+
+    if MSH_P.size() > (MaxSwingBack_Method == 'All' ? 1 : HSwingBack)
+        for i = 1 to HSwingBack   by 1
+            if  MSH_Permit.get(MSH_P.size()  - i)
+                if    (bar_index <= AOI_MSH.get(AOI_MSH.size() - i) ) 
+                    if   (MSH_P.get(MSH_P.size() - i)  < high and MSH_P.get(MSH_P.size() - i)  > close and (AOI_MSH.get(AOI_MSH.size() - i) == Z) ) 
+                        MSH_Permit.set(MSH_P.size() - i  , false)
+                        H_Index_LvL := MSH_I.get(MSH_P.size() - i)
+                        H_Price_LvL := MSH_P.get(MSH_P.size() - i)
+                        HAlert := true
+                if ((MSH_P.get(MSH_P.size() - i)  < close) and (AOI_MSH.get(AOI_MSH.size() - i) == Z))
+                    AOI_MSH.set(AOI_MSH.size() - i, bar_index)
+
+
+
+    if MSL_P.size() > (MaxSwingBack_Method == 'All' ? 1 : LSwingBack)
+        for i = 1 to  LSwingBack  by 1
+            if  MSL_Permit.get(MSL_P.size()  - i)
+                if    (bar_index <= AOI_MSL.get(AOI_MSL.size() - i) ) 
+                    if    (MSL_P.get(MSL_P.size() - i)  > low and MSL_P.get(MSL_P.size() - i)  < close and (AOI_MSL.get(AOI_MSL.size() - i) == Z))
+                        MSL_Permit.set(MSL_P.size() - i  , false)
+                        L_Index_LvL := MSL_I.get(MSL_P.size() - i)
+                        L_Price_LvL := MSL_P.get(MSL_P.size() - i)
+                        LAlert := true
+                if ((MSL_P.get(MSL_P.size() - i)  > close) and (AOI_MSL.get(AOI_MSL.size() - i) == Z))
+                    AOI_MSL.set(AOI_MSL.size() - i, bar_index)
+    [HAlert, H_Index_LvL, H_Price_LvL, LAlert, L_Index_LvL, L_Price_LvL]
+
+// Get liquidity levels from security
+[HAlert_o, H_Index_LvL_o, H_Price_LvL_o, LAlert_o, L_Index_LvL_o, L_Price_LvL_o] = 
+ request.security(syminfo.tickerid, timeframe.period, Lvl_Detector(SwingPeriod, MaxSwingBack_Method, MaxSwingBack), gaps = barmerge.gaps_on)
+
+var bool  HAlert = false 
+var int   H_Index_LvL = na 
+var float H_Price_LvL = na
+var bool  LAlert = false
+var int   L_Index_LvL = na
+var float L_Price_LvL = na 
+
+if HAlert_o
+    HAlert      := true
+    H_Index_LvL := H_Index_LvL_o
+    H_Price_LvL := H_Price_LvL_o
+else 
+    HAlert      := false
+
+if LAlert_o
+    LAlert      := true
+    L_Index_LvL := L_Index_LvL_o
+    L_Price_LvL := L_Price_LvL_o
+else 
+    LAlert      := false
+
+//================ MSS DETECTOR FUNCTION ================
+// Market Structure Shift Detection Function
+MSSLevelDetector(CondHigh, CondLow, DConditionFVG, DDFVG, DPFVG, BarDFVG, SConditionFVG, SDFVG, SPFVG, BarSFVG, Label, H_Cond, H_Index, H_Price, L_Cond, L_Index, L_Price) =>
+    ATR                     = ta.atr(55) 
+    Body                    = close - open
+    var float MSSLvLP_L     = 0.0
+    var float MSSLvLP_H     = 0.0
+    var int MSSLvLI_L       = 0
+    var int MSSLvLI_H       = 0  
+    var bool Permit_HSet    = true
+    var bool Permit_LSet    = true
+    var bool Permit_HReset  = true
+    var bool Permit_LReset  = true   
+
+    var line  MSS_LineL     = na
+    var line  MSS_LineH     = na
+    var label MSS_NameH     = na
+    var label MSS_NameL     = na
+    var label MSS_ShapH     = na
+    var label MSS_ShapL     = na
+
+    var line  MSH_Line      = na 
+    var label MSH_Label     = na
+    var label MSH_Shap      = na
+    var line  MSL_Line      = na
+    var label MSL_Label     = na
+    var label MSL_Shap      = na
+    var bool H_Permit       = true
+    var bool L_Permit       = true
+    var bool Bear_Trigger   = false
+    var bool Bull_Trigger   = false    
+    
+    var int   Bear_FVG      = 0 
+    var float Bear_FVG_D    = 0.0
+    var float Bear_FVG_P    = 0.0
+
+    var int   Bull_FVG      = 0 
+    var float Bull_FVG_D    = 0.0
+    var float Bull_FVG_P    = 0.0
+
+    var bool FVG_Bear_Trigger = false
+    var bool FVG_Bull_Trigger = false  
+
+    var FVG_Bear_D         = array.new_float()
+    var FVG_Bear_P         = array.new_float()
+    var FVG_Bear_I         = array.new_int()
+    
+    var FVG_Bull_D         = array.new_float()
+    var FVG_Bull_P         = array.new_float()
+    var FVG_Bull_I         = array.new_int()
+
+    var float H_P = 0.0
+    var int   H_I = 0
+    var float L_P = 0.0
+    var int   L_I = 0
+
+    // MSS Level
+    if bool(ta.pivothigh(2, 1))
+        H_P := high[1]
+        H_I := bar_index[1]
+
+    if bool(ta.pivotlow(2, 1))
+        L_P := low[1]
+        L_I := bar_index[1]
+    
+    //Liquidity Sweep Drawing
+    if H_Cond and H_Permit
+        H_Permit := false
+        if AShow
+            if HShow
+                MSH_Line  := line.new(H_Index, H_Price, time, H_Price, color = na, style = line.style_dashed, xloc = xloc.bar_time)
+                MSH_Label := label.new(bar_index, (high + 1.15 * ATR), 'Liquidity Sweep', color = #ffffff00, textcolor = na, style = label.style_label_down, size = size.small)
+                
+    if not H_Cond
+        H_Permit := true
+    if L_Cond and L_Permit
+        L_Permit := false
+        if AShow
+            if LShow
+                MSL_Line  := line.new(L_Index, L_Price, time, L_Price, color = na, style = line.style_dashed, xloc = xloc.bar_time)
+                MSL_Label := label.new(bar_index, (low - 1.15 * ATR), 'Liquidity Sweep', color = #ffffff00, textcolor = na, style = label.style_label_up, size = size.small)
+                  
+    if not L_Cond
+        L_Permit := true
+    
+    //MSS
+    if CondHigh
+        Permit_HSet := true 
+        if Permit_HSet and H_Index != H_Index[1]
+            Permit_HReset := true
+            MSSLvLP_H := L_P
+            MSSLvLI_H := L_I
+            if AShow_MSS and HShow_MSS
+                MSS_LineH := line.new(MSSLvLI_H, MSSLvLP_H, bar_index, MSSLvLP_H, color = na, style = line.style_solid)
+                MSS_NameH := label.new(MSSLvLI_H + 1, low[bar_index - MSSLvLI_H] - (ATR * 0.3), Label, color = na, style = label.style_label_upper_left, textcolor = na, size = size.small)
+            Permit_HSet := false
+    
+    if Permit_HReset[0]  
+        if SConditionFVG[0]
+            FVG_Bear_I.push(BarSFVG)
+            FVG_Bear_D.push(SDFVG)
+            FVG_Bear_P.push(SPFVG)
+        if FVG_Bear_I.size() > 0
+            if high > FVG_Bear_D.get(FVG_Bear_I.size() - 1)
+                FVG_Bear_I.remove(FVG_Bear_I.size() - 1)
+                FVG_Bear_D.remove(FVG_Bear_D.size() - 1)
+                FVG_Bear_P.remove(FVG_Bear_P.size() - 1)               
+
+        if close[1] >= MSSLvLP_H and (bar_index[1] - MSSLvLI_H) <= MSS_Length
+            MSS_LineH.set_x2(bar_index + 1)
+            
+        if close[1] <= MSSLvLP_H and (bar_index[1] - MSSLvLI_H) <= MSS_Length
+            MSH_Line.set_color(HLColor)
+            MSH_Label.set_textcolor(HNColor)
+            MSS_LineH.set_color(HLColor_MSS)
+            MSS_NameH.set_textcolor(HNColor_MSS)
+            Permit_HReset := false
+            if AShow_MSS and HShow_MSS
+                MSS_ShapH := label.new(bar_index, high + (ATR * 0.6), "", color = HNColor_MSS, style = label.style_triangledown, size = size.tiny)   
+
+    if CondLow
+        Permit_LSet := true 
+        if Permit_LSet and L_Index != L_Index[1]
+            Permit_LReset := true
+            MSSLvLP_L := H_P
+            MSSLvLI_L := H_I
+            if AShow_MSS and LShow_MSS
+                MSS_LineL := line.new(MSSLvLI_L, MSSLvLP_L, bar_index, MSSLvLP_L, color = na, style = line.style_solid)
+                MSS_NameL := label.new(MSSLvLI_L + 1, high[bar_index - MSSLvLI_L] + (ATR * 0.6), Label, color = na, style = label.style_label_lower_right, textcolor = na, size = size.small)
+            Permit_LSet := false
+    
+    if Permit_LReset[0]
+        if DConditionFVG[0]
+            FVG_Bull_I.push(BarDFVG)
+            FVG_Bull_D.push(DDFVG)
+            FVG_Bull_P.push(DPFVG)
+        if FVG_Bull_I.size() > 0
+            if low < FVG_Bull_D.get(FVG_Bull_I.size() - 1)
+                FVG_Bull_I.remove(FVG_Bull_I.size() - 1)
+                FVG_Bull_D.remove(FVG_Bull_D.size() - 1)
+                FVG_Bull_P.remove(FVG_Bull_P.size() - 1)   
+        
+        if close[0] <= MSSLvLP_L and (bar_index[0] - MSSLvLI_L) <= MSS_Length
+            MSS_LineL.set_x2(bar_index + 1)
+        
+        if close[0] >= MSSLvLP_L and (bar_index[0] - MSSLvLI_L) <= MSS_Length
+            MSL_Line.set_color(LLColor)
+            MSL_Label.set_textcolor(LNColor)
+            MSS_LineL.set_color(LLColor_MSS)
+            MSS_NameL.set_textcolor(LNColor_MSS)
+            Permit_LReset := false
+            if AShow_MSS and LShow_MSS
+                MSS_ShapL := label.new(bar_index, low - (ATR * 0.6), "", color = LNColor_MSS, style = label.style_triangleup, size = size.tiny)
+   
+    //Set FVG
+    if FVG_Bull_I.size() > 0 or (ta.change(FVG_Bull_I.size() > 0) and FVG_Bull_I.size() > 0)
+        Bull_FVG := FVG_Bull_I.get(FVG_Bull_I.size() - 1)
+        Bull_FVG_D := FVG_Bull_D.get(FVG_Bull_D.size() - 1)
+        Bull_FVG_P := FVG_Bull_P.get(FVG_Bull_P.size() - 1)
+    
+    if FVG_Bear_I.size() > 0 or (ta.change(FVG_Bear_I.size() > 0) and FVG_Bear_I.size() > 0)
+        Bear_FVG := FVG_Bear_I.get(FVG_Bear_I.size() - 1)
+        Bear_FVG_D := FVG_Bear_D.get(FVG_Bear_D.size() - 1)
+        Bear_FVG_P := FVG_Bear_P.get(FVG_Bear_P.size() - 1)
+
+    if Permit_HReset[1] and Permit_HReset == false
+        Bear_Trigger := true 
+        if FVG_Bear_I.size() > 0 and Bear_FVG != 0
+            FVG_Bear_Trigger := true
+        else
+            FVG_Bear_Trigger := false
+    else 
+        Bear_Trigger := false
+        FVG_Bear_Trigger := false
+
+    if Permit_LReset[1] and Permit_LReset == false
+        Bull_Trigger := true
+        if FVG_Bull_I.size() > 0 and Bull_FVG != 0
+            FVG_Bull_Trigger := true 
+        else 
+            FVG_Bull_Trigger := false                      
+    else 
+        Bull_Trigger := false
+        FVG_Bull_Trigger := false
+    
+    //Reset FVG
+    if H_Cond
+        Bear_FVG   := 0 
+        Bear_FVG_D := 0.0
+        Bear_FVG_P := 0.0
+        FVG_Bear_D.clear()
+        FVG_Bear_P.clear()
+        FVG_Bear_I.clear()
+    
+    if L_Cond
+        FVG_Bull_D.clear()
+        FVG_Bull_P.clear()
+        FVG_Bull_I.clear()
+        Bull_FVG   := 0 
+        Bull_FVG_D := 0.0
+        Bull_FVG_P := 0.0
+    
+    // Store swing values for stop-loss calculation
+    var float bullish_MSS_swing_low = 0.0
+    var float bearish_MSS_swing_high = 0.0
+    
+    if Bull_Trigger
+        bullish_MSS_swing_low := MSSLvLP_L
+    
+    if Bear_Trigger
+        bearish_MSS_swing_high := MSSLvLP_H
+    
+    [Bull_Trigger, Bear_Trigger, FVG_Bull_Trigger, FVG_Bear_Trigger, Bull_FVG, Bear_FVG, Bull_FVG_D, Bear_FVG_D, Bull_FVG_P, Bear_FVG_P, bullish_MSS_swing_low, bearish_MSS_swing_high]
+
+// FVG Call Function
+[DConditionFVG, DDFVG, DPFVG, BarDFVG, SConditionFVG, SDFVG, SPFVG, BarSFVG] = FVG.FVGDetector(PFVGFilter ? 'On' : 'Off', PFVGFilterType, false, false)
+
+// Call MSS Function with all parameters
+[Bull_Trigger, Bear_Trigger, FVG_Bull_Trigger, FVG_Bear_Trigger, Bull_FVG, Bear_FVG, Bull_FVG_D, Bear_FVG_D, Bull_FVG_P, Bear_FVG_P, bullish_MSS_swing_low, bearish_MSS_swing_high] = 
+ MSSLevelDetector(HAlert, LAlert, DConditionFVG, DDFVG, DPFVG, BarDFVG, SConditionFVG, SDFVG, SPFVG, BarSFVG, 'MSS', HAlert, H_Index_LvL, H_Price_LvL, LAlert, L_Index_LvL, L_Price_LvL)
+
+if bar_index - Bull_FVG < 500
+    Drawing.OBDrawing('Demand', FVG_Bull_Trigger, Bull_FVG_D, Bull_FVG_P, Bull_FVG, true, FVG_Length, MLFVG, MLFVG, true, false, DFVGShow, false, DFVGColor, #ffffff00) //Bull_FVG 
+if bar_index - Bear_FVG < 500
+    Drawing.OBDrawing('Supply', FVG_Bear_Trigger, Bear_FVG_D, Bear_FVG_P, Bear_FVG, true, FVG_Length, MLFVG, MLFVG, true, false, SFVGShow, false, SFVGColor, #ffffff00) // Bear_FVG
+
+//================ FILTER FUNCTIONS ================
+// Time Filter Function - returns both overall status and individual session statuses
+isWithinKillZone() =>
+    if not Enable_Time_Filter
+        [true, false, false, false]  // If filter disabled, always return true but sessions inactive
+    else
+        // Check if current time is within each session
+        isInAsian = KZ_Asian_Enabled and not na(time(timeframe.period, TimeFilter_KillZone_1))
+        isInLondon = KZ_London_Enabled and not na(time(timeframe.period, TimeFilter_KillZone_2))
+        isInNewYork = KZ_NewYork_Enabled and not na(time(timeframe.period, TimeFilter_KillZone_3))
+        
+        // Return all statuses: [overall, Asian, London, NY]
+        [isInAsian or isInLondon or isInNewYork, isInAsian, isInLondon, isInNewYork]
+
+// Higher Timeframe Bias Filter Function
+htfBiasAligned(direction) =>
+    if not Enable_HTF_Bias_Filter
+        true  // If filter disabled, always return true
+    else
+        // Get higher timeframe EMA
+        htfEma = request.security(syminfo.tickerid, convertTimeframe(HTF_Bias_Timeframe), ta.ema(close, HTF_Bias_EMA_Period))
+        
+        // Check if HTF bias aligns with trade direction
+        if direction == 1  // Long/Bullish
+            close > htfEma
+        else if direction == -1  // Short/Bearish
+            close < htfEma
+        else
+            false
+
+// Volume Filter Function
+volumeConditionMet(timestamp) =>
+    if not Enable_Volume_Filter
+        true  // If filter disabled, always return true
+    else
+        // Calculate average volume
+        avgVolume = ta.sma(volume, Volume_Filter_Lookback_Period)
+        
+        // Get the volume of the candle at the provided timestamp
+        // Note: We're using the current volume as a simplification
+        currentVolume = volume
+        
+        // Check if current volume exceeds threshold
+        currentVolume >= avgVolume
+
+
+// Combined Filter Function
+allFiltersPass(direction, fvgHigh, fvgLow) =>
+    [timeFilterPass, inAsianKZ, inLondonKZ, inNewYorkKZ] = isWithinKillZone()
+    biasFilterPass = htfBiasAligned(direction)
+    volumeFilterPass = volumeConditionMet(time)
+    pauseFilterPass = tradingPauseConditionMet()
+    
+    // Return combined filter result
+    timeFilterPass and biasFilterPass and volumeFilterPass and pauseFilterPass
+
+//================ TRADE EXECUTION LOGIC ================
+// Calculate entry price based on entry method and FVG levels
+getEntryPrice(fvgHigh, fvgLow, direction) =>
+    entryPrice = 0.0
+    if direction == 1  // Long
+        if Entry_Method == 'Proximal_Touch_Market'
+            entryPrice := fvgLow  // Proximal line for bullish FVG
+        else if Entry_Method == 'FVG_Level_Limit_Order'
+            if MLFVG == 'Proximal'
+                entryPrice := fvgLow
+            else if MLFVG == '50 % OB'
+                entryPrice := (fvgHigh + fvgLow) / 2  // Midpoint (CE 50%)
+            else if MLFVG == 'Distal'
+                entryPrice := fvgHigh
+    else if direction == -1  // Short
+        if Entry_Method == 'Proximal_Touch_Market'
+            entryPrice := fvgHigh  // Proximal line for bearish FVG
+        else if Entry_Method == 'FVG_Level_Limit_Order'
+            if MLFVG == 'Proximal'
+                entryPrice := fvgHigh  // Top of bearish FVG is proximal (closer to price when trading from above)
+            else if MLFVG == '50 % OB'
+                entryPrice := (fvgHigh + fvgLow) / 2  // Midpoint (CE 50%)
+            else if MLFVG == 'Distal'
+                entryPrice := fvgLow  // Bottom of bearish FVG is distal (further from price when trading from above)
+    entryPrice
+
+// Function to find the lowest low between the liquidity sweep and current bar (for longs)
+// or highest high between the liquidity sweep and current bar (for shorts)
+getLowestAfterSweep(direction, sweepBarTime) =>
+    float result = na
+    if direction == 1  // Long - find lowest low after sweep
+        lowestLow = high  // Start with a high value
+        for i = 0 to 100  // Look back up to 100 bars
+            if time[i] <= sweepBarTime  // Stop when we reach the sweep bar
+                break
+            if low[i] < lowestLow  // Check if this bar's low is lower
+                lowestLow := low[i]
+        result := lowestLow
+    else if direction == -1  // Short - find highest high after sweep
+        highestHigh = low  // Start with a low value
+        for i = 0 to 100  // Look back up to 100 bars
+            if time[i] <= sweepBarTime  // Stop when we reach the sweep bar
+                break
+            if high[i] > highestHigh  // Check if this bar's high is higher
+                highestHigh := high[i]
+        result := highestHigh
+    result
+
+// Function to find the most recent swing point (with 2-bar lookback on each side)
+getRecentSwingPoint(direction) =>
+    float result = na
+    if direction == 1  // Long - find most recent swing low
+        swingLow = ta.pivotlow(2, 2)  // 2 bars lookback/lookahead for a swing low
+        if not na(swingLow)
+            result := low[2]  // Pivot function returns index, so use actual low from 2 bars ago
+        else
+            // If no swing low found, use the lowest low of the last 5 bars
+            result := ta.lowest(low, 5)
+    else if direction == -1  // Short - find most recent swing high
+        swingHigh = ta.pivothigh(2, 2)  // 2 bars lookback/lookahead for a swing high
+        if not na(swingHigh)
+            result := high[2]  // Pivot function returns index, so use actual high from 2 bars ago
+        else
+            // If no swing high found, use the highest high of the last 5 bars
+            result := ta.highest(high, 5)
+    result
+
+// Calculate stop loss price based on placement method
+getStopLossPrice(direction, entryPrice, fvgHigh, fvgLow, msSwingPoint, liquidityLevel, liquiditySweepTime) =>
+    // First get the base stop loss level without any buffer
+    float baseStopLevel = 0.0
+    float finalStopLevel = 0.0
+    
+    if direction == 1  // Long
+        if StopLoss_Placement_Method == 'FVG_Distal'
+            baseStopLevel := fvgLow
+        else if StopLoss_Placement_Method == 'MSS_Swing_Point'
+            baseStopLevel := msSwingPoint
+        else if StopLoss_Placement_Method == 'Liquidity_Sweep_Extreme'
+            baseStopLevel := liquidityLevel
+        else if StopLoss_Placement_Method == 'Lowest_After_Sweep'
+            baseStopLevel := getLowestAfterSweep(direction, liquiditySweepTime)
+        else if StopLoss_Placement_Method == 'Recent_Swing_Point'
+            baseStopLevel := getRecentSwingPoint(direction)
+    else  // Short
+        if StopLoss_Placement_Method == 'FVG_Distal'
+            baseStopLevel := fvgHigh
+        else if StopLoss_Placement_Method == 'MSS_Swing_Point'
+            baseStopLevel := msSwingPoint
+        else if StopLoss_Placement_Method == 'Liquidity_Sweep_Extreme'
+            baseStopLevel := liquidityLevel
+        else if StopLoss_Placement_Method == 'Lowest_After_Sweep'
+            baseStopLevel := getLowestAfterSweep(direction, liquiditySweepTime)
+        else if StopLoss_Placement_Method == 'Recent_Swing_Point'
+            baseStopLevel := getRecentSwingPoint(direction)
+
+    // Check if baseStopLevel is valid
+    bool isValid = not na(baseStopLevel)
+    
+    // Check that base level is valid relative to entry price
+    isValid := isValid and ((direction == 1 and baseStopLevel < entryPrice) or (direction == -1 and baseStopLevel > entryPrice))
+    
+    if isValid
+        // Simple percentage buffer calculation
+        if StopLoss_Offset_ATR_Multiplier > 0
+            // Calculate buffer as percentage of distance between entry and stop
+            float distance = math.abs(entryPrice - baseStopLevel)
+            float buffer = distance * (StopLoss_Offset_ATR_Multiplier / 100)
+            
+            if direction == 1  // Long position
+                // For long positions, move stop lower by subtracting the buffer
+                finalStopLevel := baseStopLevel - buffer
+            else  // Short position
+                // For short positions, move stop higher by adding the buffer
+                finalStopLevel := baseStopLevel + buffer
+        else
+            // No buffer
+            finalStopLevel := baseStopLevel
+    else
+        // If not valid, return na
+        finalStopLevel := na
+        
+    // Return the final stop level
+    finalStopLevel
+
+// Function to find the nearest opposing liquidity level (swing high for longs, swing low for shorts)
+findOpposingLiquidityLevel(direction) =>
+    float result = na
+    
+    // Use a smaller lookback for pivot high/low to find more recent levels
+    pivotLookback = 3
+    searchBars = 50
+    
+    if direction == 1  // Long - find nearest swing high above current price
+        // Start with a very high value
+        lowestHigh = high * 3  
+        foundValidLevel = false
+        
+        // First try: Look for pivot highs above current price
+        for i = 0 to searchBars
+            // Check if this is a pivot high
+            if i >= pivotLookback and high[i] > high[i-1] and high[i] > high[i+1] and high[i] > high[i-2] and high[i] > high[i+2]
+                if high[i] > close and high[i] < lowestHigh
+                    lowestHigh := high[i]
+                    foundValidLevel := true
+        
+        // If we found a valid level, return it
+        if foundValidLevel
+            result := lowestHigh
+        else
+            // Second try: Just find the highest high of next 20 bars if it's above current price
+            altHighLevel = ta.highest(high, 20)
+            if altHighLevel > close
+                result := altHighLevel
+    
+    else  // Short - find nearest swing low below current price
+        // Start with a very low value
+        highestLow = low * 0.3
+        foundValidLevel = false
+        
+        // First try: Look for pivot lows below current price
+        for i = 0 to searchBars
+            // Check if this is a pivot low
+            if i >= pivotLookback and low[i] < low[i-1] and low[i] < low[i+1] and low[i] < low[i-2] and low[i] < low[i+2]
+                if low[i] < close and low[i] > highestLow
+                    highestLow := low[i]
+                    foundValidLevel := true
+        
+        // If we found a valid level, return it
+        if foundValidLevel
+            result := highestLow
+        else
+            // Second try: Just find the lowest low of next 20 bars if it's below current price
+            altLowLevel = ta.lowest(low, 20)
+            if altLowLevel < close
+                result := altLowLevel
+    
+    result
+
+// Function to find the nearest opposing FVG (Fair Value Gap)
+findOpposingPDArray(direction) =>
+    float result = na
+    buffer = ta.atr(14) * 0.5
+    
+    if direction == 1  // Long - find nearest bearish FVG above current price
+        // Check if we have a valid bearish FVG
+        if Bear_FVG != 0
+            // For long positions, we want to target the distal level of the bearish FVG
+            // This ensures we're targeting the highest part of the gap
+            if Bear_FVG_P > close  // Only if the FVG is above current price
+                result := Bear_FVG_P  // Use proximal level as target
+            
+            // Fallback - check if distal level is available and above price
+            if na(result) and Bear_FVG_D > close
+                result := Bear_FVG_D
+            
+    else  // Short - find nearest bullish FVG below current price
+        // Check if we have a valid bullish FVG
+        if Bull_FVG != 0
+            // For short positions, we want to target the distal level of the bullish FVG
+            // This ensures we're targeting the lowest part of the gap
+            if Bull_FVG_P < close  // Only if the FVG is below current price
+                result := Bull_FVG_P  // Use proximal level as target
+            
+            // Fallback - check if distal level is available and below price
+            if na(result) and Bull_FVG_D < close
+                result := Bull_FVG_D
+    
+    // Fallback if no FVG found: use the last swing high/low as appropriate
+    if na(result)
+        if direction == 1
+            swingHigh = ta.highest(high, 20)
+            if swingHigh > close
+                result := swingHigh
+        else
+            swingLow = ta.lowest(low, 20)
+            if swingLow < close
+                result := swingLow
+    
+    result
+
+// Calculate take profit prices
+getTakeProfitPrices(direction, entryPrice, stopPrice) =>
+    // Calculate stop distance (risk)
+    stopDistance = math.abs(entryPrice - stopPrice)
+    
+    // Calculate TP1 based on method
+    tp1 = 0.0
+    if TakeProfit_Method_TP1 == 'Risk_Reward_Ratio'
+        tp1 := direction == 1 ? entryPrice + (stopDistance * TakeProfit_RR_Ratio_TP1) : entryPrice - (stopDistance * TakeProfit_RR_Ratio_TP1)
+    else if TakeProfit_Method_TP1 == 'Opposing_Liquidity_Pool'
+        // Find nearest opposing liquidity level
+        opposingLevel = findOpposingLiquidityLevel(direction)
+        
+        // If we found a valid level, use it; otherwise, fall back to RR ratio
+        if not na(opposingLevel) and math.abs(opposingLevel - entryPrice) > stopDistance * 0.5
+            // For longs: use slightly below the opposing swing high (avoid exact level)
+            // For shorts: use slightly above the opposing swing low
+            buffer = ta.atr(14) * 0.1
+            tp1 := direction == 1 ? opposingLevel - buffer : opposingLevel + buffer
+            
+            // Add diagnostic comment about using opposing liquidity
+            strategy.close_all(comment="Using Opposing Liquidity for TP: " + str.tostring(tp1, "#.##"))
+        else
+            // Fallback to 2:1 R:R
+            tp1 := direction == 1 ? entryPrice + (stopDistance * 2.0) : entryPrice - (stopDistance * 2.0)
+            strategy.close_all(comment="Fallback to 2:1 RR - No valid liquidity found. Entry: " + str.tostring(entryPrice, "#.##") + " Stop: " + str.tostring(stopPrice, "#.##"))
+    else if TakeProfit_Method_TP1 == 'Opposing_PD_Array'
+        // Find nearest opposing FVG/Order Block
+        opposingLevel = findOpposingPDArray(direction)
+        
+        // If we found a valid level, use it; otherwise, fall back to RR ratio
+        if not na(opposingLevel) and math.abs(opposingLevel - entryPrice) > stopDistance * 0.5
+            tp1 := opposingLevel
+            // Add diagnostic comment about using opposing PD array
+            strategy.close_all(comment="Using Opposing PD Array for TP: " + str.tostring(tp1, "#.##") + " Bear_FVG: " + str.tostring(Bear_FVG, "#") + " Bear_FVG_P: " + str.tostring(Bear_FVG_P, "#.##") + " Bull_FVG: " + str.tostring(Bull_FVG, "#") + " Bull_FVG_P: " + str.tostring(Bull_FVG_P, "#.##"))
+        else
+            // Fallback to 2:1 R:R
+            tp1 := direction == 1 ? entryPrice + (stopDistance * 2.0) : entryPrice - (stopDistance * 2.0)
+            strategy.close_all(comment="Fallback to 2:1 RR - No valid PD array found. Entry: " + str.tostring(entryPrice, "#.##") + " Stop: " + str.tostring(stopPrice, "#.##") + " Bear_FVG: " + str.tostring(Bear_FVG, "#") + " Bear_FVG_P: " + str.tostring(Bear_FVG_P, "#.##") + " Bull_FVG: " + str.tostring(Bull_FVG, "#") + " Bull_FVG_P: " + str.tostring(Bull_FVG_P, "#.##"))
+    
+    
+    tp1
+
+//================ STRATEGY EXECUTION ================
+// Entry and Trade Management Variables
+var float longEntryPrice = na     // Long entry price
+var float shortEntryPrice = na    // Short entry price
+var float longStopPrice = na      // Stop-loss level for long trades
+var float shortStopPrice = na     // Stop-loss level for short trades
+var float longTp1Price = na       // Take-profit 1 level for long trades
+var float shortTp1Price = na      // Take-profit 1 level for short trades
+var bool longEntrySignal = false  // Signal to trigger long entry
+var bool shortEntrySignal = false // Signal to trigger short entry
+var int longEntryBar = 0          // Bar index when long signal was generated
+var int shortEntryBar = 0         // Bar index when short signal was generated
+
+// Debug info tracking
+var float lastLongEntry = na      // Last executed long entry price
+var float lastShortEntry = na     // Last executed short entry price
+
+// Update entry price when positions are entered
+if strategy.position_size > 0 and strategy.position_size[1] <= 0
+    lastLongEntry := strategy.position_avg_price
+    
+if strategy.position_size < 0 and strategy.position_size[1] >= 0
+    lastShortEntry := strategy.position_avg_price
+
+// Process bullish (long) setup
+if FVG_Bull_Trigger
+    // Check if all filters pass
+    if allFiltersPass(1, Bull_FVG_D, Bull_FVG_P)
+        // Calculate entry price
+        longEntryPrice := getEntryPrice(Bull_FVG_D, Bull_FVG_P, 1)
+        
+        // Get the liquidity sweep time for the lowest_after_sweep method
+        float liquiditySweepTime = L_Index_LvL
+        
+        // Set base SL level based on selected method
+        float baseSLLevel = 0.0
+        if StopLoss_Placement_Method == 'FVG_Distal'
+            baseSLLevel := Bull_FVG_D
+        else if StopLoss_Placement_Method == 'MSS_Swing_Point'
+            baseSLLevel := bullish_MSS_swing_low
+        else if StopLoss_Placement_Method == 'Liquidity_Sweep_Extreme'
+            baseSLLevel := L_Price_LvL
+        else if StopLoss_Placement_Method == 'Lowest_After_Sweep'
+            baseSLLevel := getLowestAfterSweep(1, liquiditySweepTime)
+        else if StopLoss_Placement_Method == 'Recent_Swing_Point'
+            baseSLLevel := getRecentSwingPoint(1)
+            
+        // Enable this code for debugging ATR calculations
+        // float debugAtr = ta.atr(14)
+        // float debugBuffer = StopLoss_Offset_ATR_Multiplier * debugAtr
+        // strategy.close_all(comment="DEBUG LONG SL: Base=" + str.tostring(baseSLLevel, "#.##") + 
+        //                            " ATR=" + str.tostring(debugAtr, "#.##") + 
+        //                            " Buffer=" + str.tostring(debugBuffer, "#.##") + 
+        //                            " Final would be=" + str.tostring(baseSLLevel - debugBuffer, "#.##"))
+            
+        // Calculate stop-loss price using our function (handles all placement methods including the new ones)
+        longStopPrice := getStopLossPrice(1, longEntryPrice, Bull_FVG_D, Bull_FVG_P, bullish_MSS_swing_low, L_Price_LvL, liquiditySweepTime)
+        
+        // Ensure we have a valid SL price
+        if na(longStopPrice) or longStopPrice >= longEntryPrice
+            // Invalid SL - use 2% below entry as fallback
+            longStopPrice := longEntryPrice * 0.98
+            // Uncomment for debugging
+            // strategy.close_all(comment="SL FALLBACK: Original SL calculation invalid. Using 2% fallback.")
+            
+        // Calculate TP prices based on entry and SL
+        riskAmount = math.abs(longEntryPrice - longStopPrice)
+        if riskAmount > 0
+            longTp1Price := longEntryPrice + (riskAmount * TakeProfit_RR_Ratio_TP1)
+        else
+            // Fallback if risk calculation fails
+            longTp1Price := longEntryPrice * 1.02  // 2% above entry
+            
+        // Log calculations with comment
+        if strategy.position_size == 0
+            strategy.close_all(comment="Long-E:" + str.tostring(longEntryPrice, "#.##") + " SL:" + str.tostring(longStopPrice, "#.##") + " TP1:" + str.tostring(longTp1Price, "#.##"))
+        
+        // Set entry signal flag
+        if not (strategy.position_size > 0)  // Only generate entry signal if not already long
+            if Entry_Method == 'Proximal_Touch_Market'
+                if low <= Bull_FVG_P
+                    longEntrySignal := true
+            else if Entry_Method == 'FVG_Level_Limit_Order'
+                longEntrySignal := true
+                longEntryBar := bar_index
+            else if Entry_Method == 'Candle_Close_Inside_FVG'
+                if close > Bull_FVG_D and low < Bull_FVG_P
+                    longEntrySignal := true
+
+// Process bearish (short) setup
+if FVG_Bear_Trigger
+    // Check if all filters pass
+    if allFiltersPass(-1, Bear_FVG_D, Bear_FVG_P)
+        // Calculate entry price
+        // For shorts, reverse the parameters because Bear_FVG_D may be the lower value and Bear_FVG_P the higher value
+        // This swap ensures a proximal entry will be at the higher end of the FVG (traditional entry point)
+        shortEntryPrice := getEntryPrice(Bear_FVG_P, Bear_FVG_D, -1)
+        
+        // Get the liquidity sweep time for the lowest_after_sweep method
+        float liquiditySweepTime = H_Index_LvL
+        
+        // Set base SL level based on selected method
+        float baseSLLevel = 0.0
+        if StopLoss_Placement_Method == 'FVG_Distal'
+            baseSLLevel := Bear_FVG_D
+        else if StopLoss_Placement_Method == 'MSS_Swing_Point'
+            baseSLLevel := bearish_MSS_swing_high
+        else if StopLoss_Placement_Method == 'Liquidity_Sweep_Extreme'
+            baseSLLevel := H_Price_LvL
+        else if StopLoss_Placement_Method == 'Lowest_After_Sweep'
+            baseSLLevel := getLowestAfterSweep(-1, liquiditySweepTime)
+        else if StopLoss_Placement_Method == 'Recent_Swing_Point'
+            baseSLLevel := getRecentSwingPoint(-1)
+            
+        // Enable this code for debugging ATR calculations
+        // float debugAtr = ta.atr(14)
+        // float debugBuffer = StopLoss_Offset_ATR_Multiplier * debugAtr
+        // strategy.close_all(comment="DEBUG SHORT SL: Base=" + str.tostring(baseSLLevel, "#.##") + 
+        //                            " ATR=" + str.tostring(debugAtr, "#.##") + 
+        //                            " Buffer=" + str.tostring(debugBuffer, "#.##") + 
+        //                            " Final would be=" + str.tostring(baseSLLevel + debugBuffer, "#.##"))
+            
+        // Calculate stop-loss price using our function (handles all placement methods including the new ones)
+        shortStopPrice := getStopLossPrice(-1, shortEntryPrice, Bear_FVG_P, Bear_FVG_D, bearish_MSS_swing_high, H_Price_LvL, liquiditySweepTime)
+        
+        // Ensure we have a valid SL price
+        if na(shortStopPrice) or shortStopPrice <= shortEntryPrice
+            // Invalid SL - use 2% above entry as fallback
+            shortStopPrice := shortEntryPrice * 1.02
+            // Uncomment for debugging
+            // strategy.close_all(comment="SL FALLBACK: Original SL calculation invalid. Using 2% fallback.")
+            
+        // Calculate TP prices based on entry and SL
+        riskAmount = math.abs(shortEntryPrice - shortStopPrice)
+        if riskAmount > 0
+            shortTp1Price := shortEntryPrice - (riskAmount * TakeProfit_RR_Ratio_TP1)
+        else
+            // Fallback if risk calculation fails
+            shortTp1Price := shortEntryPrice * 0.98  // 2% below entry
+            
+        // Log calculations with comment
+        if strategy.position_size == 0
+            strategy.close_all(comment="Short-E:" + str.tostring(shortEntryPrice, "#.##") + " SL:" + str.tostring(shortStopPrice, "#.##") + " TP1:" + str.tostring(shortTp1Price, "#.##"))
+        
+        // Set entry signal flag
+        if not (strategy.position_size < 0)  // Only generate entry signal if not already short
+            if Entry_Method == 'Proximal_Touch_Market'
+                if high >= Bear_FVG_P
+                    shortEntrySignal := true
+            else if Entry_Method == 'FVG_Level_Limit_Order'
+                shortEntrySignal := true
+                shortEntryBar := bar_index
+            else if Entry_Method == 'Candle_Close_Inside_FVG'
+                if close < Bear_FVG_D and high > Bear_FVG_P
+                    shortEntrySignal := true
+
+// Safety checks for equity
+hasPositiveEquity = true
+
+// Adjust position size based on risk multiplier
+strategy.risk.allow_entry_in(strategy.direction.all)
+// Execute long entry only if signal is active and we have positive equity
+if longEntrySignal and hasPositiveEquity
+    // Only enter a new long if not already in a long position
+    if strategy.position_size <= 0
+        // Use fixed ID for proper exit matching
+        entryID = "Long"
+        
+        if Entry_Method == 'Proximal_Touch_Market' or Entry_Method == 'Candle_Close_Inside_FVG'
+            strategy.entry(entryID, strategy.long, comment="Long Entry TP:" + str.tostring(longTp1Price, "#.##"))
+            // Don't reset signal immediately to allow plotting
+            // longEntrySignal := false (commented out)
+        else if Entry_Method == 'FVG_Level_Limit_Order'
+            if bar_index - longEntryBar <= Entry_Order_Expiry_Bars
+                strategy.entry(entryID, strategy.long, limit=longEntryPrice)
+            else
+                longEntrySignal := false
+
+
+// Execute short entry only if signal is active and we have positive equity
+if shortEntrySignal and hasPositiveEquity
+    // Only enter a new short if not already in a short position
+    if strategy.position_size >= 0
+        // Use fixed ID for proper exit matching
+        entryID = "Short"
+        
+        if Entry_Method == 'Proximal_Touch_Market' or Entry_Method == 'Candle_Close_Inside_FVG'
+            strategy.entry(entryID, strategy.short, comment="Short Entry TP:" + str.tostring(shortTp1Price, "#.##"))
+            // Don't reset signal immediately to allow plotting
+            // shortEntrySignal := false (commented out)
+        else if Entry_Method == 'FVG_Level_Limit_Order'
+            if bar_index - shortEntryBar <= Entry_Order_Expiry_Bars
+                strategy.entry(entryID, strategy.short, limit=shortEntryPrice)
+            else
+                shortEntrySignal := false
+
+// Set stop loss and take profit for long position
+if strategy.position_size > 0
+    // Cancel any existing exit orders first to ensure clean slate
+    strategy.cancel_all()
+    
+    // Ensure we have valid TP prices
+    validLongTp1 = not na(longTp1Price) and longTp1Price > longEntryPrice
+
+    
+    if validLongTp1
+        // Single exit with both TP and SL for reliable execution
+        strategy.exit("Long Exit", from_entry="Long", limit=longTp1Price, stop=longStopPrice)
+    else
+        // If TP1 is invalid, just use SL
+        strategy.exit("Long Exit SL", from_entry="Long", stop=longStopPrice, comment="Invalid TP, using SL only")
+
+// Set stop loss and take profit for short position
+if strategy.position_size < 0
+    // Cancel any existing exit orders first to ensure clean slate
+    strategy.cancel_all()
+    
+    // Ensure we have valid TP prices
+    validShortTp1 = not na(shortTp1Price) and shortTp1Price < shortEntryPrice
+
+    if validShortTp1
+        // Single exit with both TP and SL for reliable execution
+        strategy.exit("Short Exit", from_entry="Short", limit=shortTp1Price, stop=shortStopPrice)
+        
+    // Set take profit orders based on configuration
+    if Enable_TP1
+        // Simplified implementation with combined SL/TP
+        strategy.exit("Short Exit TP1", from_entry="Short", limit=shortTp1Price, stop=shortStopPrice)
+
+// Update trading pause state - returns boolean instead of modifying global variable
+updatePauseState() =>
+    result = false
+    if Enable_Consecutive_Loss_Pause and consecutiveLosses >= Consecutive_Loss_Count_Threshold
+        timeSinceLastTrade = timenow - lastTradeTimestamp
+        pauseMilliseconds = Trading_Pause_Duration_Hours * 60 * 60 * 1000
+        result := timeSinceLastTrade <= pauseMilliseconds
+    result
+
+// Handle trade completion and update tracking variables
+if strategy.closedtrades > 0
+    // Get the last closed trade profit
+    lastTradeProfit = strategy.netprofit - strategy.openprofit - lastNetProfit
+    lastNetProfit := strategy.netprofit - strategy.openprofit
+    
+    // Update consecutive losses counter
+    if lastTradeProfit < 0
+        consecutiveLosses := consecutiveLosses + 1
+        lastTradeResult := -1
+    else
+        consecutiveLosses := 0
+        lastTradeResult := 1
+    
+    // Update last trade timestamp
+    lastTradeTimestamp := timenow
+
+// Update trading pause state on each bar
+inTradingPause := updatePauseState()
+
+// Breakeven stop-loss logic variables (kept for potential future implementation)
+var bool longTp1Hit = false
+var bool shortTp1Hit = false
+
+// Reset TP1 hit flags and entry signals when position is closed
+if strategy.position_size == 0
+    longTp1Hit := false
+    shortTp1Hit := false
+    
+    // Reset entry signals when no position is active
+    // This helps prevent stale entry signals from persisting
+    if bar_index % 5 == 0  // Only check periodically to allow signals to be visible
+        if not (low <= Bull_FVG_P and FVG_Bull_Trigger) and longEntrySignal
+            longEntrySignal := false
+            
+        if not (high >= Bear_FVG_P and FVG_Bear_Trigger) and shortEntrySignal
+            shortEntrySignal := false
+
+//================ VISUAL ELEMENTS ================
+// Reset entry signals only after they've been processed to ensure they're visible for plotting
+if strategy.position_size > 0 and longEntrySignal
+    longEntrySignal := false
+    
+if strategy.position_size < 0 and shortEntrySignal
+    shortEntrySignal := false
+
+
+// Plot actual entry points (when position is opened) - but only for true entries, not exits
+plotshape(strategy.position_size > 0 and strategy.position_size[1] <= 0, "Long Entry", shape.triangleup, location.belowbar, color.new(color.green, 0), size = size.tiny)
+plotshape(strategy.position_size < 0 and strategy.position_size[1] >= 0, "Short Entry", shape.triangledown, location.abovebar, color.new(color.red, 0), size = size.tiny)
+
+// NEW alerts for entry signals (limit orders)
+if longEntrySignal and not longEntrySignal[1] and Entry_Method == 'FVG_Level_Limit_Order'
+    alert('{"symbol":"' + syminfo.ticker + 
+          '","side":"long",' + 
+          '"entry":"' + str.tostring(longEntryPrice, "#.####") + '",' +
+          '"stop_loss":"' + str.tostring(longStopPrice, "#.####") + '",' + 
+          '"take_profit":"' + str.tostring(longTp1Price, "#.####") + '",' + 
+          '"trigger_time":"' + str.tostring(timenow) + '",' +
+          '"max_lag":"20",' +
+          '"order_type":"limit"}', alert.freq_once_per_bar_close)
+
+if shortEntrySignal and not shortEntrySignal[1] and Entry_Method == 'FVG_Level_Limit_Order'
+    alert('{"symbol":"' + syminfo.ticker + 
+          '","side":"short",' + 
+          '"entry":"' + str.tostring(shortEntryPrice, "#.####") + '",' +
+          '"stop_loss":"' + str.tostring(shortStopPrice, "#.####") + '",' + 
+          '"take_profit":"' + str.tostring(shortTp1Price, "#.####") + '",' + 
+          '"trigger_time":"' + str.tostring(timenow) + '",' +
+          '"max_lag":"20",' +
+          '"order_type":"limit"}', alert.freq_once_per_bar_close)
+
+// SIMPLIFIED TEST ALERTS - triggered on simple candle colors
+// Test switch - set to 'true' to enable test alerts
+// testAlertsEnabled = input.bool(false, "Enable Test Alerts", group="Testing")
+
+// // Simple condition: green candle for long, red candle for short
+// isGreenCandle = close > open
+// isRedCandle = close < open
+
+// // Mock price values for testing
+// mockEntryPrice = close
+// mockStopLossLong = close * 0.99  // 1% below current price
+// mockStopLossShort = close * 1.01  // 1% above current price
+// mockTpLong = close * 1.03  // 3% above current price
+// mockTpShort = close * 0.97  // 3% below current price
+
+// // Test alerts on candle close - note the alert.freq_once_per_bar_close parameter
+// if testAlertsEnabled and isGreenCandle
+//     alert('{"symbol":"' + syminfo.ticker + 
+//           '","side":"long",' + 
+//           '"entry":"' + str.tostring(mockEntryPrice, "#.####") + '",' +
+//           '"stop_loss":"' + str.tostring(mockStopLossLong, "#.####") + '",' + 
+//           '"take_profit":"' + str.tostring(mockTpLong, "#.####") + '",' + 
+//           '"trigger_time":"' + str.tostring(timenow) + '",' +
+//           '"max_lag":"20",' +
+//           '"order_type":"test_long"}', alert.freq_once_per_bar_close)
+
+// if testAlertsEnabled and isRedCandle
+//     alert('{"symbol":"' + syminfo.ticker + 
+//           '","side":"short",' + 
+//           '"entry":"' + str.tostring(mockEntryPrice, "#.####") + '",' +
+//           '"stop_loss":"' + str.tostring(mockStopLossShort, "#.####") + '",' + 
+//           '"take_profit":"' + str.tostring(mockTpShort, "#.####") + '",' + 
+//           '"trigger_time":"' + str.tostring(timenow) + '",' +
+//           '"max_lag":"20",' +
+//           '"order_type":"test_short"}', alert.freq_once_per_bar_close)
+
+
+// Add entry price labels using label.new() which accepts series strings - only for true entries, not exits
+if strategy.position_size > 0 and strategy.position_size[1] <= 0
+    label.new(bar_index, low - (ta.atr(14) * 0.5), "LONG\n" + str.tostring(strategy.position_avg_price, "#.##"), 
+              style=label.style_label_up, color=color.new(color.green, 15), textcolor=color.white, size=size.small)
+
+if strategy.position_size < 0 and strategy.position_size[1] >= 0
+    label.new(bar_index, high + (ta.atr(14) * 0.5), "SHORT\n" + str.tostring(strategy.position_avg_price, "#.##"), 
+              style=label.style_label_down, color=color.new(color.red, 15), textcolor=color.white, size=size.small)
+
+// Plot trade levels for active positions and pending limit orders
+var line entryLine = na
+var line stopLine = na
+var line tp1Line = na
+var label entryLabel = na
+var label slLabel = na
+var label tp1Label = na
+
+// Delete previous lines and labels
+line.delete(entryLine)
+line.delete(stopLine)
+line.delete(tp1Line)
+label.delete(entryLabel)
+label.delete(slLabel)
+label.delete(tp1Label)
+
+// Draw for long position or pending long limit orders
+if strategy.position_size > 0 or (longEntrySignal and (Entry_Method == 'FVG_Level_Limit_Order'))
+    // Use actual position price if in position, otherwise use pending limit price
+    entryPriceToShow = strategy.position_size > 0 ? strategy.position_avg_price : longEntryPrice
+    
+    // Draw entry price line with label
+    entryLine := line.new(bar_index - 20, entryPriceToShow, bar_index + 10, entryPriceToShow, color=color.blue, style=line.style_dashed, width=2)
+    entryLabel := label.new(bar_index + 11, entryPriceToShow, "ENTRY " + str.tostring(entryPriceToShow, "#.##"), color=color.blue, textcolor=color.white, style=label.style_label_left, size=size.small)
+    
+    // Draw stop loss level with label
+    stopLine := line.new(bar_index - 20, longStopPrice, bar_index + 10, longStopPrice, color=color.red, style=line.style_dashed, width=2)
+    slLabel := label.new(bar_index + 11, longStopPrice, "SL " + str.tostring(longStopPrice, "#.##"), color=color.red, textcolor=color.white, style=label.style_label_left, size=size.small)
+    
+    // Draw take profit levels with labels
+    if Enable_TP1
+        tp1Line := line.new(bar_index - 20, longTp1Price, bar_index + 10, longTp1Price, color=color.green, style=line.style_dashed, width=2)
+        tp1Label := label.new(bar_index + 11, longTp1Price, "TP1 " + str.tostring(longTp1Price, "#.##") + " (" + str.tostring(Partial_Profit_Percent_TP1) + "%)", color=color.green, textcolor=color.white, style=label.style_label_left, size=size.small)
+
+// Draw for short position or pending short limit orders
+else if strategy.position_size < 0 or (shortEntrySignal and (Entry_Method == 'FVG_Level_Limit_Order'))
+    // Use actual position price if in position, otherwise use pending limit price
+    entryPriceToShow = strategy.position_size < 0 ? strategy.position_avg_price : shortEntryPrice
+    
+    // Draw entry price line with label
+    entryLine := line.new(bar_index - 20, entryPriceToShow, bar_index + 10, entryPriceToShow, color=color.blue, style=line.style_dashed, width=2)
+    entryLabel := label.new(bar_index + 11, entryPriceToShow, "ENTRY " + str.tostring(entryPriceToShow, "#.##"), color=color.blue, textcolor=color.white, style=label.style_label_left, size=size.small)
+    
+    // Draw stop loss level with label
+    stopLine := line.new(bar_index - 20, shortStopPrice, bar_index + 10, shortStopPrice, color=color.red, style=line.style_dashed, width=2)
+    slLabel := label.new(bar_index + 11, shortStopPrice, "SL " + str.tostring(shortStopPrice, "#.##"), color=color.red, textcolor=color.white, style=label.style_label_left, size=size.small)
+    
+    // Draw take profit levels with labels
+    if Enable_TP1
+        tp1Line := line.new(bar_index - 20, shortTp1Price, bar_index + 10, shortTp1Price, color=color.green, style=line.style_dashed, width=2)
+        tp1Label := label.new(bar_index + 11, shortTp1Price, "TP1 " + str.tostring(shortTp1Price, "#.##") + " (" + str.tostring(Partial_Profit_Percent_TP1) + "%)", color=color.green, textcolor=color.white, style=label.style_label_left, size=size.small)
+
+// Plot trading pause indicator
+plotshape(inTradingPause, "Trading Pause", shape.xcross, location.bottom, color.gray, size = size.small)
+
+// Background color variables
+var color bgColor = na
+
+// Set background color based on HTF bias if filter is enabled
+if Enable_HTF_Bias_Filter
+    htfEma = request.security(syminfo.tickerid, convertTimeframe(HTF_Bias_Timeframe), ta.ema(close, HTF_Bias_EMA_Period))
+    bgColor := close > htfEma ? color.new(color.green, 95) : close < htfEma ? color.new(color.red, 95) : na
+
+// Apply background color
+bgcolor(Show_Daily_Bias_Background ? bgColor:na)
+
+// Color bars based on position
+barcolor(Show_Trade_Bar_Colors ? (strategy.position_size > 0 ? color.new(color.green, 50) : strategy.position_size < 0 ? color.new(color.red, 50) : na) : na)
+
+//================ STRATEGY STATISTICS TABLE ================
+// Display key statistics in a table
+var table infoTable = table.new(position.top_right, 5, 8, color.black, color.white, 1, color.gray, 1)
+
+// Update the table each bar
+if barstate.islast and Show_Strategy_Table
+    // Calculate statistics
+    netProfit = strategy.netprofit
+    winRate = strategy.closedtrades > 0 ? (strategy.wintrades / strategy.closedtrades) * 100 : 0
+    profitFactor = strategy.grossloss != 0 ? strategy.grossprofit / strategy.grossloss : (strategy.grossprofit > 0 ? 999.99 : 0)
+    maxDrawdown = strategy.max_drawdown
+    
+    // Calculate risk metrics
+    currentDrawdown = 100 * (1 - strategy.equity / initialEquity)
+    riskLevel = currentRiskMultiplier * 100
+    
+    // Format statistics
+    netProfitStr = str.tostring(netProfit, "$#.##")
+    winRateStr = str.tostring(winRate, "#.##") + "%"
+    profitFactorStr = str.tostring(profitFactor, "#.##")
+    maxDrawdownStr = str.tostring(maxDrawdown, "$#.##")
+    currentDrawdownStr = str.tostring(currentDrawdown, "#.##") + "%"
+    riskLevelStr = str.tostring(riskLevel, "#.##") + "%"
+    
+    // Clear previous data
+    table.clear(infoTable, 0, 0, 4, 7)
+    
+    // Set table headers
+    table.cell(infoTable, 0, 0, "ICT 2022 Strategy", bgcolor = color.blue, text_color = color.white)
+    table.cell(infoTable, 0, 1, "Statistics", bgcolor = color.blue, text_color = color.white)
+    
+    // Set statistics
+    table.cell(infoTable, 0, 2, "Net Profit:", text_color = color.white)
+    table.cell(infoTable, 1, 2, netProfitStr, text_color = color.white)
+    
+    table.cell(infoTable, 0, 3, "Win Rate:", text_color = color.white)
+    table.cell(infoTable, 1, 3, winRateStr, text_color = color.white)
+    
+    table.cell(infoTable, 0, 4, "Profit Factor:", text_color = color.white)
+    table.cell(infoTable, 1, 4, profitFactorStr, text_color = color.white)
+    
+    table.cell(infoTable, 0, 5, "Max Drawdown:", text_color = color.white)
+    table.cell(infoTable, 1, 5, maxDrawdownStr, text_color = color.white)
+    
+    table.cell(infoTable, 0, 6, "Position:", text_color = color.white)
+    
+    // Position status
+    posStr = strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "FLAT"
+    posColor = strategy.position_size > 0 ? color.green : strategy.position_size < 0 ? color.red : color.gray
+    
+    table.cell(infoTable, 1, 6, posStr, text_color = posColor)
+    
+    // Trading status
+    tradingStatus = inTradingPause ? "PAUSED" : "ACTIVE"
+    tradingStatusColor = inTradingPause ? color.red : color.green
+    
+    // Show consecutive losses
+    table.cell(infoTable, 0, 7, "Trading Status:", text_color = color.white)
+    table.cell(infoTable, 1, 7, tradingStatus + " (" + str.tostring(consecutiveLosses) + " losses)", text_color = tradingStatusColor)
+    
+    // Number of trades
+    table.cell(infoTable, 2, 2, "Total Trades:", text_color = color.white)
+    table.cell(infoTable, 3, 2, str.tostring(strategy.closedtrades), text_color = color.white)
+    
+    // Win/Loss
+    table.cell(infoTable, 2, 3, "Wins/Losses:", text_color = color.white)
+    table.cell(infoTable, 3, 3, str.tostring(strategy.wintrades) + "/" + str.tostring(strategy.losstrades), text_color = color.white)
+    
+    // Avg Win/Loss
+    avgWin = strategy.wintrades > 0 ? strategy.grossprofit / strategy.wintrades : 0
+    avgLoss = strategy.losstrades > 0 ? strategy.grossloss / strategy.losstrades : 0
+    table.cell(infoTable, 2, 4, "Avg Win/Loss:", text_color = color.white)
+    table.cell(infoTable, 3, 4, "$" + str.tostring(avgWin, "#.##") + "/$" + str.tostring(avgLoss, "#.##"), text_color = color.white)
+    
+    // Win/Loss Ratio
+    winLossRatio = avgLoss != 0 ? avgWin / avgLoss : (avgWin > 0 ? 999.99 : 0)
+    table.cell(infoTable, 2, 5, "Win/Loss Ratio:", text_color = color.white)
+    table.cell(infoTable, 3, 5, str.tostring(winLossRatio, "#.##"), text_color = color.white)
+    
+    // Risk management stats
+    table.cell(infoTable, 2, 6, "Current DD:", text_color = color.white)
+    table.cell(infoTable, 3, 6, currentDrawdownStr, text_color = currentDrawdown > maxDrawdownPercent ? color.red : color.white)

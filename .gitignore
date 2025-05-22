@@ -149,6 +149,21 @@ dmypy.json
 .pytype/
 
 # Cython debug symbols
-cython_debug/ 
-logs/trade_journal.db-shm
-logs/trade_journal.db-wal
+cython_debug/
+
+# Application logs
+logs/
+
+# Docker
+# Dockerfile # This should NOT be ignored
+.dockerignore
+docker-compose.yml
+
+# Google Cloud Platform
+.gcloud/
+*.gcloudignore
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.backup

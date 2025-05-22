@@ -10,4 +10,9 @@ python-dotenv
 PyYAML
 loguru
 python-telegram-bot
-discord.py 
+discord.py
+fastapi
+uvicorn[standard]
+pydantic
+requests
+httpx 

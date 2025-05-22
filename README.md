@@ -1,106 +1,150 @@
-# Bybit Futures Trading Scanner & Bot
+# Bybit Trading Bot
 
-This project is a Python-based system to scan cryptocurrency futures markets on Bybit for trading setups based on the "5m/15m BOS/FVG/Fib Confluence - $1 Fixed Risk" strategy. It also includes plans for future extensions into an algorithmic trading bot.
+A webhook-based trading bot that executes trades on Bybit based on TradingView signals. Designed to work with the ICT 2022 Mentorship Model Strategy.
 
-**Strategy Document:** [Trading_Strategy_5m_15m_BOS_FVG_Fib_Confluence.md](Trading_Strategy_5m_15m_BOS_FVG_Fib_Confluence.md)
-**Implementation Plan:** [Implementation_Plan_Crypto_Scanner_Bot.md](Implementation_Plan_Crypto_Scanner_Bot.md)
-**Progress Summary:** [PROGRESS_SUMMARY.md](PROGRESS_SUMMARY.md)
+## Features
 
-## Current Features (Scanner Focus)
+- Receive webhook signals from TradingView alert
+- Process signals asynchronously
+- Fetch instrument details from Bybit API
+- Set maximum leverage for each trading pair
+- Calculate order quantity based on Value at Risk (VaR)
+- Place limit orders with stop-loss and take-profit levels
+- Robust error handling and logging
 
-*   Connects to Bybit (testnet by default) via `ccxt`.
-*   Loads configuration from `config.json` and API secrets from `.env`.
-*   Comprehensive logging to console and file (`logs/bot.log`) using `loguru`.
-*   **Data Ingestion:**
-    *   Fetches and processes OHLCV data into Pandas DataFrames.
-    *   Fetches and caches contract specifications (tick size, lot size, etc.).
-*   **Analysis Engine (In Progress):**
-    *   Detects Swing Highs and Swing Lows.
-    *   Detects Break of Structure (BOS) events.
+## Requirements
 
-## Setup Instructions
+- Python 3.9+
+- Bybit account with API keys (with "Contract - Orders & Positions" permissions)
+- TradingView account (for sending webhook alerts)
 
-1.  **Clone the Repository:**
-    ```bash
-    git clone <repository_url>
-    cd bybit_bot
-    ```
+## Installation
 
-2.  **Python Version:**
-    Ensure you have Python 3.9+ installed. You can check with `python --version` or `python3 --version`.
-
-3.  **Create a Virtual Environment:**
-    It's highly recommended to use a virtual environment to manage dependencies.
-    ```bash
-    python3 -m venv venv
-    ```
-
-4.  **Activate the Virtual Environment:**
-    *   On macOS and Linux:
-        ```bash
-        source venv/bin/activate
-        ```
-    *   On Windows:
-        ```bash
-        .\venv\Scripts\activate
-        ```
-    Your terminal prompt should change to indicate the virtual environment is active (e.g., `(venv) ...`).
-
-5.  **Install Dependencies:**
-    ```bash
-    pip install -r requirements.txt
-    ```
-
-6.  **Configure API Keys:**
-    *   Copy the example environment file:
-        ```bash
-        cp example.env .env
-        ```
-    *   Open the `.env` file in a text editor.
-    *   Add your Bybit API key and secret. For initial development and testing, use **Testnet V5 API keys**.
-        *   You can generate these from [Bybit Testnet](https://testnet.bybit.com) after logging in.
-        *   Ensure the keys have appropriate permissions (Read-Only for scanner, trade permissions if you intend to develop bot features).
-    *   The `.env` file should look like this (replace placeholders):
-        ```env
-        TESTNET_BYBIT_API_KEY="YOUR_TESTNET_API_KEY_HERE"
-        TESTNET_BYBIT_API_SECRET="YOUR_TESTNET_API_SECRET_HERE"
-        ```
-
-7.  **Review Configuration (`config.json`):
-    *   Open `config.json` and review the default settings.
-    *   By default, it's set to use Bybit testnet (`"testnet": true`).
-    *   It uses `TESTNET_BYBIT_API_KEY` and `TESTNET_BYBIT_API_SECRET` from your `.env` file.
-    *   Adjust `coins_to_scan`, strategy parameters, etc., as needed for your testing.
-
-## Running the Application
-
-To run the main application (which currently performs a test data fetch and initial analysis steps):
+1. Clone this repository:
 
 ```bash
-python -m src.main
+git clone https://github.com/yourusername/bybit_bot.git
+cd bybit_bot
 ```
 
-This command should be run from the project root directory (`bybit_bot`).
-
-## Running Individual Module Tests
-
-Each core module in the `src/` directory often contains an `if __name__ == '__main__':` block for direct testing of its functionality. You can run these similarly:
+2. Create and activate a virtual environment:
 
 ```bash
-python -m src.config_manager
-python -m src.logging_service # (May need config loaded if run standalone without context)
-python -m src.data_ingestion
-python -m src.analysis_engine
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
 ```
 
-Make sure your virtual environment is active when running these commands.
+3. Install the dependencies:
 
-## Development
+```bash
+pip install -r requirements.txt
+```
 
-(Details about development workflow, branching strategy, etc., can be added here later.)
+4. Set up your environment variables in the `.env` file:
 
-## Next Steps
+```
+MAINNET_LIVE_BYBIT_API_KEY=your_api_key
+MAINNET_LIVE_BYBIT_API_SECRET=your_api_secret
+```
 
-Refer to [PROGRESS_SUMMARY.md](PROGRESS_SUMMARY.md) for the latest development status and immediate next steps.
+5. Configure the bot settings in `config.json`:
 
---
+```json
+{
+  "server": {
+    "host": "0.0.0.0",
+    "port": 8000
+  },
+  "bybit_api": {
+    "category": "linear",
+    "default_time_in_force": "GTC",
+    "max_leverage_cap": null
+  },
+  "risk_management": {
+    "var_type": "fixed_amount",
+    "var_value": 1.0,
+    "portfolio_currency": "USDT"
+  },
+  "logging": {
+    "level": "INFO",
+    "file": "logs/trading_bot.log",
+    "format": "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  }
+}
+```
+
+## Usage
+
+1. Start the bot:
+
+```bash
+python run.py
+```
+
+2. Set up TradingView alerts with webhook URL:
+   - Webhook URL: `http://your_server_address:8001/webhook/tradingview`
+   - Format: JSON
+   - Example alert message:
+```json
+{
+  "symbol": "{{ticker}}",
+  "side": "{{strategy.order.action}}",
+  "entry": "{{strategy.order.price}}",
+  "stop_loss": "{{strategy.order.stop_price}}",
+  "take_profit": "{{strategy.order.alert_message}}",
+  "trigger_time": "{{timenow}}",
+  "max_lag": "20",
+  "order_type": "limit"
+}
+```
+
+3. The bot will receive the webhook, process it, and place the order on Bybit.
+
+## Endpoints
+
+- `GET /`: Health check endpoint
+- `GET /health`: Health check endpoint
+- `POST /webhook/tradingview`: Webhook endpoint for TradingView signals
+- `POST /webhook/test`: Test endpoint for manually testing signal processing
+
+## Testing
+
+You can test the webhook endpoint with cURL:
+
+```bash
+curl -X POST http://localhost:8001/webhook/test \
+  -H "Content-Type: application/json" \
+  -d '{
+    "symbol": "BTCUSDT.P",
+    "side": "long",
+    "entry": 65000.0,
+    "stop_loss": 64000.0,
+    "take_profit": 67000.0,
+    "trigger_time": "1747778400208",
+    "max_lag": 20,
+    "order_type": "limit"
+  }'
+```
+
+## Risk Management
+
+The bot uses a Value at Risk (VaR) approach to risk management:
+
+- `fixed_amount`: Always risk a fixed amount of USDT per trade (e.g., 1 USDT)
+- `portfolio_percentage`: Risk a percentage of your portfolio per trade (e.g., 1% of your USDT balance)
+
+## Deployment
+
+For production deployment, consider using:
+
+- A reverse proxy like Nginx
+- A process manager like Supervisor or PM2
+- Expose the webhook endpoint via a proper domain with SSL
+
+## License
+
+[MIT License](LICENSE)
+
+## Disclaimer
+
+This bot is for educational purposes only. Use at your own risk. Trading involves substantial risk, and you can lose a substantial amount of money. The bot author is not responsible for any financial losses. 
