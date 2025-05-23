@@ -5,6 +5,7 @@ Bybit API service for interacting with the Bybit exchange.
 import ccxt
 import re
 import time
+import math
 from typing import Dict, Any, Tuple, Optional, List, Union
 from src.config import get_api_credentials, config, logger
 
@@ -313,20 +314,36 @@ class BybitService:
             try:
                 market = self.exchange.markets[market_id]
                 price_precision = market['precision']['price']
+                amount_precision = market['precision']['amount']
+                
+                # Format prices as strings with proper precision
                 if isinstance(price_precision, int):
                     price_str = format(price, f'.{price_precision}f')
                     sl_str = format(sl, f'.{price_precision}f')
                     tp_str = format(tp, f'.{price_precision}f')
                 else:
-                    # If precision is a decimal, convert to appropriate format
                     price_str = str(price)
                     sl_str = str(sl)
                     tp_str = str(tp)
+                
+                # Process quantity according to market requirements
+                # For linear futures, check if whole number quantity is required
+                lot_size_filter = self._get_lot_size_filter(market)
+                qty_adjusted = self._adjust_quantity_for_market(qty, market, lot_size_filter)
+                
+                # Create both string and float versions
+                if isinstance(amount_precision, int):
+                    qty_str = format(qty_adjusted, f'.{amount_precision}f')
+                else:
+                    qty_str = str(qty_adjusted)
+                    
             except (KeyError, TypeError):
                 # If precision info not available, use string conversion
                 price_str = str(price)
                 sl_str = str(sl)
                 tp_str = str(tp)
+                qty_str = str(qty)
+                qty_adjusted = qty
             
             # Prepare parameters
             params = {
@@ -342,18 +359,19 @@ class BybitService:
             
             # Place the order
             try:
-                logger.info(f"Placing {side} limit order for {symbol} ({market_type}): {qty} @ {price_str} (SL: {sl_str}, TP: {tp_str})")
+                logger.info(f"Placing {side} limit order for {symbol} ({market_type}): {qty_str} @ {price_str} (SL: {sl_str}, TP: {tp_str})")
                 
+                # Try with adjusted numeric quantity first
                 order = self.exchange.create_order(
                     symbol=market_id,
                     type='limit',
                     side=side.lower(),  # ccxt uses lowercase side
-                    amount=qty,
+                    amount=qty_adjusted,  # Use numeric value
                     price=price_str,
                     params=params
                 )
                 
-                logger.info(f"Placed {side} limit order for {symbol}: {qty} @ {price_str} (SL: {sl_str}, TP: {tp_str})")
+                logger.info(f"Placed {side} limit order for {symbol}: {qty_str} @ {price_str} (SL: {sl_str}, TP: {tp_str})")
                 return {
                     'success': True,
                     'order': order,
@@ -368,12 +386,72 @@ class BybitService:
                     'order_details': {
                         'symbol': symbol,
                         'side': side,
-                        'quantity': qty,
+                        'quantity': qty_str,
                         'price': price_str,
                         'stop_loss': sl_str,
                         'take_profit': tp_str
                     }
                 }
+            except ccxt.ExchangeError as e:
+                error_message = str(e)
+                if "Qty invalid" in error_message:
+                    # Try with a different quantity approach - some markets require whole numbers
+                    try:
+                        logger.warning(f"Qty invalid error for {symbol}. Trying with integer quantity.")
+                        rounded_qty = math.floor(float(qty_adjusted))
+                        
+                        # Skip if the rounded quantity would be zero
+                        if rounded_qty <= 0:
+                            rounded_qty = 1
+                        
+                        logger.info(f"Retrying with integer quantity: {rounded_qty}")
+                        
+                        order = self.exchange.create_order(
+                            symbol=market_id,
+                            type='limit',
+                            side=side.lower(),
+                            amount=rounded_qty,
+                            price=price_str,
+                            params=params
+                        )
+                        
+                        logger.info(f"Placed {side} limit order for {symbol} with integer quantity: {rounded_qty} @ {price_str}")
+                        return {
+                            'success': True,
+                            'order': order,
+                            'message': 'Order placed successfully with integer quantity'
+                        }
+                    except Exception as retry_error:
+                        logger.error(f"Error retrying with integer quantity: {retry_error}")
+                        return {
+                            'success': False,
+                            'message': f"Failed to place order with integer quantity: {str(retry_error)}",
+                            'error': 'order_placement_failed',
+                            'order_details': {
+                                'symbol': symbol,
+                                'side': side,
+                                'quantity': rounded_qty if 'rounded_qty' in locals() else qty_str,
+                                'price': price_str,
+                                'stop_loss': sl_str,
+                                'take_profit': tp_str
+                            }
+                        }
+                else:
+                    # Handle other exchange errors
+                    logger.error(f"Exchange error for {symbol}: {e}")
+                    return {
+                        'success': False,
+                        'message': f"Exchange error: {str(e)}",
+                        'error': 'exchange_error',
+                        'order_details': {
+                            'symbol': symbol,
+                            'side': side,
+                            'quantity': qty_str,
+                            'price': price_str,
+                            'stop_loss': sl_str,
+                            'take_profit': tp_str
+                        }
+                    }
         
         except Exception as e:
             logger.error(f"Error placing limit order for {symbol}: {e}")
@@ -384,9 +462,76 @@ class BybitService:
                 'order_details': {
                     'symbol': symbol,
                     'side': side,
-                    'quantity': qty,
-                    'price': str(price),
-                    'stop_loss': str(sl),
-                    'take_profit': str(tp)
+                    'quantity': qty_str if 'qty_str' in locals() else str(qty),
+                    'price': price_str if 'price_str' in locals() else str(price),
+                    'stop_loss': sl_str if 'sl_str' in locals() else str(sl),
+                    'take_profit': tp_str if 'tp_str' in locals() else str(tp)
                 }
-            } 
+            }
+
+    def _get_lot_size_filter(self, market_info: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Extract lot size filter from market info.
+        
+        Args:
+            market_info (Dict[str, Any]): Market information
+            
+        Returns:
+            Dict[str, Any]: Lot size filter information or empty dict if not found
+        """
+        try:
+            if 'info' in market_info and isinstance(market_info['info'], dict):
+                if 'lotSizeFilter' in market_info['info']:
+                    return market_info['info']['lotSizeFilter']
+            return {}
+        except Exception as e:
+            logger.error(f"Error extracting lot size filter: {e}")
+            return {}
+            
+    def _adjust_quantity_for_market(self, qty: float, market_info: Dict[str, Any], lot_size_filter: Dict[str, Any]) -> float:
+        """
+        Adjust quantity based on market requirements and lot size filter.
+        
+        Args:
+            qty (float): Original quantity
+            market_info (Dict[str, Any]): Market information
+            lot_size_filter (Dict[str, Any]): Lot size filter information
+            
+        Returns:
+            float: Adjusted quantity
+        """
+        try:
+            # Get min quantity and quantity step from lot size filter
+            min_qty = float(lot_size_filter.get('minOrderQty', 0.0))
+            qty_step = float(lot_size_filter.get('qtyStep', 0.0))
+            
+            # If both values are available, adjust properly
+            if min_qty > 0 and qty_step > 0:
+                # Round down to the nearest step
+                steps = math.floor(qty / qty_step)
+                adjusted_qty = steps * qty_step
+                
+                # Ensure it meets minimum
+                if adjusted_qty < min_qty:
+                    adjusted_qty = min_qty
+                    
+                logger.info(f"Adjusted quantity from {qty} to {adjusted_qty} based on min: {min_qty}, step: {qty_step}")
+                return adjusted_qty
+                
+            # Some linear futures require integers for contract sizes
+            if market_info.get('type') == 'linear' or market_info.get('market_type') == 'linear':
+                # Check if minOrderQty is a whole number - indicates contract sizing
+                if min_qty.is_integer() and min_qty >= 1.0:
+                    # Use integer quantity for linear contracts that appear to use whole contract sizes
+                    adjusted_qty = math.floor(qty)
+                    if adjusted_qty < min_qty:
+                        adjusted_qty = int(min_qty)
+                    logger.info(f"Using integer quantity {adjusted_qty} for linear contract")
+                    return adjusted_qty
+            
+            # Default: return original quantity if no adjustments needed
+            return qty
+            
+        except Exception as e:
+            logger.error(f"Error adjusting quantity: {e}")
+            return qty 

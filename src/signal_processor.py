@@ -327,11 +327,21 @@ class SignalProcessor:
                 logger.info(f"Price difference: {price_difference} ({entry_price} - {stop_loss})")
                 
                 # Calculate raw quantity based on VaR and price difference
-                # VaR = position size × (entry - stop loss) / leverage
-                # position size = VaR × leverage / (entry - stop loss)
-                raw_qty = var_amount * max_leverage / price_difference
+                # For linear futures (like BTCUSDT), qty is in base currency (BTC)
+                # VaR = qty * price_difference
+                # qty = VaR / price_difference
+                raw_qty = (var_amount * max_leverage) / price_difference
                 
                 logger.info(f"Raw quantity calculation: {var_amount} × {max_leverage} ÷ {price_difference} = {raw_qty}")
+                
+                # Check for minimum notional value requirements
+                min_order_value = self._get_min_notional_value(instrument_info)
+                order_value = raw_qty * entry_price
+                
+                if min_order_value > 0 and order_value < min_order_value:
+                    logger.warning(f"Order value ({order_value}) is below minimum ({min_order_value}). Adjusting quantity.")
+                    # Adjust raw quantity to meet minimum notional value
+                    raw_qty = (min_order_value / entry_price) * 1.01  # Add 1% buffer
             else:
                 # For spot markets (no leverage)
                 logger.info("Using spot calculation (no leverage)")
@@ -344,7 +354,23 @@ class SignalProcessor:
             
             logger.info(f"Raw quantity: {raw_qty}, Qty step: {qty_step}, Min qty: {min_qty}")
             
-            # Adjust the quantity to the correct step size (always round down)
+            # Check if this market requires whole numbers
+            requires_whole_numbers = self._check_if_requires_whole_numbers(instrument_info)
+            
+            if requires_whole_numbers:
+                logger.info(f"Market appears to require whole numbers for quantity")
+                # Round down to whole number
+                adjusted_qty = math.floor(raw_qty)
+                
+                # Ensure the quantity is at least the minimum
+                if adjusted_qty < min_qty:
+                    logger.warning(f"Calculated quantity ({adjusted_qty}) is below minimum ({min_qty}). Using minimum.")
+                    adjusted_qty = math.ceil(min_qty)  # Use ceiling to ensure we meet minimum
+                
+                logger.info(f"Final quantity (whole number): {adjusted_qty}")
+                return adjusted_qty, min_qty, qty_step
+            
+            # For other markets, apply standard quantity adjustments
             # Use Decimal for more precise calculations
             d_raw_qty = Decimal(str(raw_qty))
             d_qty_step = Decimal(str(qty_step))
@@ -485,4 +511,80 @@ class SignalProcessor:
         
         except Exception as e:
             logger.error(f"Error determining quantity precision: {e}")
-            return default_precision 
+            return default_precision
+    
+    def _get_min_notional_value(self, instrument_info: Dict[str, Any]) -> float:
+        """
+        Get the minimum notional value from instrument info.
+        
+        Args:
+            instrument_info (Dict[str, Any]): Instrument information
+        
+        Returns:
+            float: Minimum notional value
+        """
+        # Default to zero (no minimum) if not found
+        default_min = 0.0
+        
+        try:
+            # Try CCXT standardized format first
+            if 'limits' in instrument_info and 'cost' in instrument_info['limits']:
+                cost_limits = instrument_info['limits']['cost']
+                if cost_limits is not None and 'min' in cost_limits and cost_limits['min'] is not None:
+                    return float(cost_limits['min'])
+            
+            # Try Bybit-specific formats
+            if 'info' in instrument_info and isinstance(instrument_info['info'], dict):
+                # Try lotSizeFilter for minOrderAmt
+                if 'lotSizeFilter' in instrument_info['info']:
+                    lot_filter = instrument_info['info']['lotSizeFilter']
+                    if isinstance(lot_filter, dict) and 'minOrderAmt' in lot_filter:
+                        return float(lot_filter['minOrderAmt'])
+            
+            # If all else fails, use the default
+            logger.debug(f"Could not find min notional value in instrument info. Using default: {default_min}")
+            return default_min
+        
+        except Exception as e:
+            logger.error(f"Error extracting min notional value: {e}")
+            return default_min
+    
+    def _check_if_requires_whole_numbers(self, instrument_info: Dict[str, Any]) -> bool:
+        """
+        Check if the instrument requires whole number quantities (common for some futures).
+        
+        Args:
+            instrument_info (Dict[str, Any]): Instrument information
+            
+        Returns:
+            bool: True if the instrument likely requires whole numbers
+        """
+        try:
+            # Check market type
+            market_type = instrument_info.get('market_type', '')
+            if market_type not in ['linear', 'inverse', 'swap', 'future']:
+                return False
+            
+            # Check if minOrderQty is a whole number - indicates contract sizing
+            min_qty = self._get_min_qty(instrument_info)
+            if min_qty.is_integer() and min_qty >= 1.0:
+                # Check qty step
+                qty_step = self._get_qty_step(instrument_info)
+                # If step size is also a whole number, it's likely a contract-based instrument
+                if qty_step.is_integer() and qty_step >= 1.0:
+                    return True
+            
+            # Check 'lot_size_filter' for additional clues
+            if 'info' in instrument_info and isinstance(instrument_info['info'], dict):
+                lot_filter = instrument_info['info'].get('lotSizeFilter', {})
+                if isinstance(lot_filter, dict):
+                    # If basePrecision is 0 or 1, it likely means whole numbers are required
+                    base_precision = lot_filter.get('basePrecision', '')
+                    if base_precision in ['0', '1', 0, 1]:
+                        return True
+            
+            return False
+        
+        except Exception as e:
+            logger.error(f"Error checking if market requires whole numbers: {e}")
+            return False 
