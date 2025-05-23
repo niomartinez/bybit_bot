@@ -1,5 +1,5 @@
 //@version=6
-strategy("ICT Silver Bullet Strategy", overlay=true, max_bars_back=5000, max_lines_count=500, max_labels_count=500, max_boxes_count=500, default_qty_type=strategy.percent_of_equity, default_qty_value=10, initial_capital=10000, currency=currency.USD)
+strategy("ICT Silver Bullet Strategy", overlay=true, max_bars_back=5000, max_lines_count=500, max_labels_count=500, max_boxes_count=500, default_qty_type=strategy.percent_of_equity, default_qty_value=10, initial_capital=10000, currency=currency.USD, pyramiding=10)
 
 //================ STRATEGY PARAMETERS ================
 // FVG Settings
@@ -12,6 +12,9 @@ extend = input.bool(true, 'extend FVG', inline='fvg', group='FVG Settings')
 showSB = input.bool(true, 'Show SB session', inline='SB', group='Silver Bullet Session')
 col_SB = input.color(#b2b5be50, '', inline='SB', group='Silver Bullet Session')
 
+// Trade Management Settings
+max_pyramiding = input.int(3, 'Max Pyramiding Trades', minval=1, maxval=10, group='Trade Management', tooltip='Maximum number of same-direction trades allowed per session')
+
 // Entry Settings
 entry_method = input.string('Proximal', 'Entry Level', options=['Proximal', '50% OB', 'Distal'], group='Entry Settings', tooltip='Determines where to place limit orders within the Fair Value Gap')
 
@@ -21,14 +24,14 @@ atr_smoothing = input.string('RMA', 'ATR Smoothing', options=['RMA', 'SMA', 'EMA
 atr_multiplier = input.float(2.0, 'ATR Multiplier', minval=0.1, step=0.1, group='Stop Loss Settings')
 
 // Take Profit Settings
-risk_reward_ratio = input.float(1.5, 'Risk:Reward Ratio', minval=0.1, step=0.1, group='Take Profit Settings')
+risk_reward_ratio = input.float(2.0, 'Risk:Reward Ratio', minval=0.1, step=0.1, group='Take Profit Settings')
 
 // Display Settings
 show_trade_levels = input.bool(true, 'Show Entry/SL/TP Levels', group='Display Settings')
 show_trade_labels = input.bool(true, 'Show Trade Labels', group='Display Settings')
 
 //================ SILVER BULLET SESSIONS ================
-// Time functions - Fixed to match the original code
+// Time functions
 timeSess(timezone, session) => 
     not na(time(timeframe.period, session, timezone))
 
@@ -39,32 +42,110 @@ SB_PM_per = timeSess("America/New_York", "1400-1500") // PM Session (2 PM - 3 PM
 
 // Session status
 is_in_SB = SB_LN_per or SB_AM_per or SB_PM_per
-strSB = is_in_SB and not is_in_SB[1]
-endSB = not is_in_SB and is_in_SB[1]
+strSB = is_in_SB and not is_in_SB[1]  // Start of any SB session
+endSB = not is_in_SB and is_in_SB[1]  // End of any SB session
 
-// Session start detection
-strLN = SB_LN_per and not SB_LN_per[1]
-strAM = SB_AM_per and not SB_AM_per[1]
-strPM = SB_PM_per and not SB_PM_per[1]
+//================ FVG TRACKING TYPE ================
+type FVG_Data
+    int bar_index
+    float high_price
+    float low_price
+    bool is_bullish
+    bool is_tapped
+    bool created_while_in_trade
 
-// Session end detection
-endLN = not SB_LN_per and SB_LN_per[1]
-endAM = not SB_AM_per and SB_AM_per[1]
-endPM = not SB_PM_per and SB_PM_per[1]
+//================ ORDER STATUS TRACKING TYPE ================
+type OrderStatus
+    string order_id
+    string status  // "pending", "filled", "cancelled"
+    int session_bar  // Bar index when order was created
 
-//================ VARIABLES & ARRAYS ================
-var aTrend = array.new_int(1, 0)
-var l_SB = array.new_line()
-var box[] bFVG_bull = array.new_box()
-var box[] bFVG_bear = array.new_box()
-var float[] bullFVG_prices_high = array.new_float()
-var float[] bullFVG_prices_low = array.new_float()
-var float[] bearFVG_prices_high = array.new_float()
-var float[] bearFVG_prices_low = array.new_float()
-var int[] fvg_bars = array.new_int()
-var bool[] fvg_is_bull = array.new_bool()
+//================ ORDER VISUAL TRACKING TYPE ================
+type OrderVisuals
+    string order_id
+    line entry_line
+    line sl_line  
+    line tp_line
+    label entry_label
+    label sl_label
+    label tp_label
 
-// ATR Calculation
+//================ SESSION TRACKING VARIABLES ================
+var bool sessionActive = false
+var FVG_Data[] untapped_fvgs = array.new<FVG_Data>()
+var int sessionStartBar = 0
+var int current_long_trades = 0
+var int current_short_trades = 0
+var bool was_in_position_last_bar = false
+var int cancelled_orders_count = 0
+var OrderStatus[] tracked_orders = array.new<OrderStatus>()
+var OrderVisuals[] active_order_visuals = array.new<OrderVisuals>()
+var int trade_counter = 0
+
+// Reset session tracking when new session starts
+if strSB
+    sessionActive := true
+    sessionStartBar := bar_index
+    // Clear previous session FVGs
+    array.clear(untapped_fvgs)
+    current_long_trades := 0
+    current_short_trades := 0
+    trade_counter := 0  // Reset trade counter for new session
+    
+    // Clean up old order tracking data from previous sessions
+    // Keep only pending orders that might still be relevant
+    if array.size(tracked_orders) > 0
+        for i = array.size(tracked_orders) - 1 to 0
+            tracked_order = array.get(tracked_orders, i)
+            // Remove filled and cancelled orders from previous sessions
+            if tracked_order.status == "filled" or tracked_order.status == "cancelled"
+                array.remove(tracked_orders, i)
+    
+    // Visual indication of new session start
+    // if showSB
+    //     label.new(bar_index, low, "NEW SB SESSION\nStarted", color=color.blue, textcolor=color.white, style=label.style_label_up, size=size.small)
+
+if endSB
+    sessionActive := false
+    array.clear(untapped_fvgs)
+    current_long_trades := 0
+    current_short_trades := 0
+    
+    // Smart cancellation: only cancel orders that are still "pending"
+    var string[] pending_to_cancel = array.new<string>()
+    
+    if array.size(tracked_orders) > 0
+        for i = 0 to array.size(tracked_orders) - 1
+            tracked_order = array.get(tracked_orders, i)
+            if tracked_order.status == "pending"
+                // This order is still a limit order that hasn't been filled
+                array.push(pending_to_cancel, tracked_order.order_id)
+                // Mark as cancelled
+                tracked_order.status := "cancelled"
+    
+    // Cancel only the pending orders
+    if array.size(pending_to_cancel) > 0
+        for i = 0 to array.size(pending_to_cancel) - 1
+            order_id = array.get(pending_to_cancel, i)
+            strategy.cancel(order_id)
+            
+            // Debug: Show which order was cancelled
+            debug_cancel_text = "ORDER CANCELLED\nID: " + order_id
+            //label.new(bar_index, close + (high - low) * (0.2 + i * 0.1), 
+            //         debug_cancel_text, color=color.red, textcolor=color.white, 
+            //         style=label.style_label_left, size=size.tiny)
+                         
+        cancelled_orders_count := cancelled_orders_count + array.size(pending_to_cancel)
+        
+        // Visual indication of cancelled orders
+        // if showSB
+        //     label.new(bar_index, high + (high - low) * 0.1, "CANCELLED " + str.tostring(array.size(pending_to_cancel)) + " PENDING ORDERS", color=color.orange, textcolor=color.white, style=label.style_label_down, size=size.tiny)
+    
+    // Don't clear tracked_orders - keep for reference of filled orders
+    // Visual cleanup is handled by cleanupOrderVisuals() function only
+    // No visual cleanup here to avoid interfering with active trades
+
+//================ ATR CALCULATION ================
 atr_ma(source, length, smoothing) =>
     if smoothing == 'RMA'
         ta.rma(source, length)
@@ -77,160 +158,312 @@ atr_ma(source, length, smoothing) =>
 
 atr_value = atr_ma(ta.tr(true), atr_length, atr_smoothing)
 
-//================ FVG DETECTION ================
-// Detect Fair Value Gaps
-detectFVGs() =>
-    // Check for bullish FVG (low > previous high)
-    if low > high[2]
-        box b = box.new(bar_index, low, bar_index+1, high[2], border_color=color.new(color.blue, 100), bgcolor=cBullFVG)
-        bFVG_bull.push(b)
-        bullFVG_prices_high.push(low)        // Proximal is actually the higher price (low of current bar)
-        bullFVG_prices_low.push(high[2])     // Distal is the lower price (high of bar 2 bars ago)
-        fvg_bars.push(bar_index)
-        fvg_is_bull.push(true)
-        
-    // Check for bearish FVG (high < previous low)
-    if high < low[2]
-        box b = box.new(bar_index, low[2], bar_index+1, high, border_color=color.new(color.red, 100), bgcolor=cBearFVG)
-        bFVG_bear.push(b)
-        bearFVG_prices_high.push(high)       // Proximal is actually the lower price (high of current bar)
-        bearFVG_prices_low.push(low[2])      // Distal is the higher price (low of bar 2 bars ago)
-        fvg_bars.push(bar_index)
-        fvg_is_bull.push(false)
+// Plot ATR-based Stop Loss Levels (like the reference indicator)
+atr_upper = high + (atr_value * atr_multiplier)  // Short stop loss level
+atr_lower = low - (atr_value * atr_multiplier)   // Long stop loss level
 
-//================ SESSION HANDLING ================
-// Handle session start
-if strSB and showSB
-    l_SB.push(line.new(bar_index, close, bar_index, close + syminfo.mintick, color=col_SB, extend=extend.both))
+plot(atr_upper, title="ATR Short SL", color=color.new(color.red, 80), linewidth=1)
+plot(atr_lower, title="ATR Long SL", color=color.new(color.green, 80), linewidth=1)
 
-// Detect FVGs during Silver Bullet sessions
-if is_in_SB
-    detectFVGs()
+//================ POSITION TRACKING ================
+// Track position changes
+bool just_exited_long = strategy.position_size[1] > 0 and strategy.position_size == 0
+bool just_exited_short = strategy.position_size[1] < 0 and strategy.position_size == 0
+bool currently_in_position = strategy.position_size != 0
 
-// Handle session end
-if endSB and showSB
-    l_SB.push(line.new(bar_index, close, bar_index, close + syminfo.mintick, color=col_SB, extend=extend.both))
+// Update position counters
+if strategy.position_size > 0 and strategy.position_size[1] <= 0
+    current_long_trades := current_long_trades + 1
+    
+if strategy.position_size < 0 and strategy.position_size[1] >= 0
+    current_short_trades := current_short_trades + 1
 
-//================ ENTRY LOGIC ================
-// Function to calculate entry price based on FVG and entry method
+// Update order status when positions change (orders get filled)
+if strategy.position_size != strategy.position_size[1]
+    // Position changed - check if any pending orders got filled
+    if array.size(tracked_orders) > 0
+        for i = 0 to array.size(tracked_orders) - 1
+            tracked_order = array.get(tracked_orders, i)
+            if tracked_order.status == "pending"
+                // Check if this order ID matches any current position
+                // We can't directly check, but if position size changed, likely an order filled
+                // Mark the most recent pending order as filled
+                tracked_order.status := "filled"
+                
+                // Debug: Show order fill
+                // debug_fill_text = "ORDER FILLED\nID: " + tracked_order.order_id + "\nSession: " + (sessionActive ? "ACTIVE" : "ENDED")
+                // label.new(bar_index, strategy.position_size > 0 ? low - (high - low) * 0.1 : high + (high - low) * 0.1, 
+                //          debug_fill_text, color=sessionActive ? color.green : color.orange, textcolor=color.white, 
+                //          style=strategy.position_size > 0 ? label.style_label_up : label.style_label_down, size=size.tiny)
+                break
+
+// Mark FVGs created while in position
+if currently_in_position and not was_in_position_last_bar
+    // Just entered position, mark future FVGs as created while in trade
+    was_in_position_last_bar := true
+else if not currently_in_position and was_in_position_last_bar
+    // Just exited position
+    was_in_position_last_bar := false
+else
+    was_in_position_last_bar := currently_in_position
+
+//================ FVG DETECTION & TRACKING ================
+// Simple FVG detection during sessions
+bullish_fvg_detected = sessionActive and low > high[2]
+bearish_fvg_detected = sessionActive and high < low[2]
+
+// Add detected FVGs to tracking array
+if bullish_fvg_detected
+    new_fvg = FVG_Data.new(bar_index, low, high[2], true, false, currently_in_position)
+    array.push(untapped_fvgs, new_fvg)
+
+if bearish_fvg_detected
+    new_fvg = FVG_Data.new(bar_index, low[2], high, false, false, currently_in_position)
+    array.push(untapped_fvgs, new_fvg)
+
+//================ HELPER FUNCTIONS ================
+// Entry price calculation
 getEntryPrice(fvgHigh, fvgLow, isBullish) =>
     if entry_method == 'Proximal'
-        if isBullish
-            fvgHigh  // High of bullish FVG is the proximal entry
-        else
-            fvgLow   // Low of bearish FVG is the proximal entry
+        isBullish ? fvgHigh : fvgLow  // Proximal (closest to current price)
     else if entry_method == '50% OB'
-        (fvgHigh + fvgLow) / 2
+        (fvgHigh + fvgLow) / 2  // Middle of FVG
     else  // Distal
-        if isBullish
-            fvgLow  // Low of bullish FVG is the distal entry
-        else
-            fvgHigh  // High of bearish FVG is the distal entry
+        isBullish ? fvgLow : fvgHigh  // Distal (furthest from current price)
 
-// Calculate stop loss based on ATR
-getStopLossPrice(entryPrice, isBullish) =>
-    stopDistance = atr_value * atr_multiplier
-    if isBullish
-        entryPrice - stopDistance  // Stop loss below entry for longs
-    else
-        entryPrice + stopDistance  // Stop loss above entry for shorts
+// Calculate stop loss and take profit
+getStopLoss(entryPrice, isBullish) =>
+    atrDistance = atr_value * atr_multiplier
+    isBullish ? entryPrice - atrDistance : entryPrice + atrDistance
 
-// Calculate take profit based on risk-reward ratio
-getTakeProfitPrice(entryPrice, stopPrice, isBullish) =>
+getTakeProfit(entryPrice, stopPrice) =>
     riskDistance = math.abs(entryPrice - stopPrice)
-    if isBullish
-        entryPrice + (riskDistance * risk_reward_ratio)  // TP above entry for longs
-    else
-        entryPrice - (riskDistance * risk_reward_ratio)  // TP below entry for shorts
+    rewardDistance = riskDistance * risk_reward_ratio
+    entryPrice > stopPrice ? entryPrice + rewardDistance : entryPrice - rewardDistance
 
-//================ TRADE EXECUTION ================
-// Process all detected FVGs for potential entries
-for i = 0 to math.min(fvg_bars.size() - 1, 500)
-    // Get FVG data
-    fvgBar = fvg_bars.get(i)
-    isBullish = fvg_is_bull.get(i)
+// Find next untapped FVG for trading
+findNextFVG(preferBullish) =>
+    FVG_Data result = na
     
-    // Check if FVG is from current session
-    if bar_index - fvgBar <= 20  // Only recent FVGs (within about 20 bars)
-        // Calculate entry/exit levels
-        float fvgHigh = 0.0
-        float fvgLow = 0.0
+    if array.size(untapped_fvgs) > 0
+        // First, look for FVGs created while we were NOT in a position (immediate FVGs)
+        for i = 0 to array.size(untapped_fvgs) - 1
+            fvg = array.get(untapped_fvgs, i)
+            if not fvg.is_tapped and not fvg.created_while_in_trade and fvg.is_bullish == preferBullish
+                result := fvg
+                break
+                
+        // If no immediate FVGs found, look for FVGs created while in position
+        if na(result)
+            for i = 0 to array.size(untapped_fvgs) - 1
+                fvg = array.get(untapped_fvgs, i)
+                if not fvg.is_tapped and fvg.created_while_in_trade and fvg.is_bullish == preferBullish
+                    result := fvg
+                    break
+    
+    result
+
+//================ TRADE EXECUTION LOGIC ================
+// Check if we can enter a long trade
+canEnterLong = sessionActive and current_long_trades < max_pyramiding and strategy.position_size >= 0
+
+// Check if we can enter a short trade  
+canEnterShort = sessionActive and current_short_trades < max_pyramiding and strategy.position_size <= 0
+
+// Function to execute trade
+executeTrade(fvg, direction, tradeId) =>
+    // Mark FVG as tapped
+    fvg.is_tapped := true
+    
+    // Calculate trade levels
+    entryPrice = getEntryPrice(fvg.high_price, fvg.low_price, fvg.is_bullish)
+    stopPrice = getStopLoss(entryPrice, fvg.is_bullish)
+    tpPrice = getTakeProfit(entryPrice, stopPrice)
+    
+    // Track this order ID
+    array.push(tracked_orders, OrderStatus.new(tradeId, "pending", bar_index))
+    
+    // Enter trade
+    if direction == "Long"
+        strategy.entry(tradeId, strategy.long, limit=entryPrice, comment="SB Long #" + str.tostring(current_long_trades + 1))
         
-        if isBullish
-            fvgHigh := bullFVG_prices_high.get(i)
-            fvgLow := bullFVG_prices_low.get(i)
-        else
-            fvgHigh := bearFVG_prices_high.get(i)
-            fvgLow := bearFVG_prices_low.get(i)
+        // Alert for long limit order creation
+        alert('{"symbol":"' + syminfo.ticker + 
+              '","side":"long",' + 
+              '"entry":"' + str.tostring(entryPrice, "#.####") + '",' +
+              '"stop_loss":"' + str.tostring(stopPrice, "#.####") + '",' + 
+              '"take_profit":"' + str.tostring(tpPrice, "#.####") + '",' + 
+              '"trigger_time":"' + str.tostring(timenow) + '",' +
+              '"order_id":"' + tradeId + '",' +
+              '"max_lag":"20",' +
+              '"order_type":"sb_limit_long"}', alert.freq_once_per_bar_close)
+              
+    else
+        strategy.entry(tradeId, strategy.short, limit=entryPrice, comment="SB Short #" + str.tostring(current_short_trades + 1))
+        
+        // Alert for short limit order creation  
+        alert('{"symbol":"' + syminfo.ticker + 
+              '","side":"short",' + 
+              '"entry":"' + str.tostring(entryPrice, "#.####") + '",' +
+              '"stop_loss":"' + str.tostring(stopPrice, "#.####") + '",' + 
+              '"take_profit":"' + str.tostring(tpPrice, "#.####") + '",' + 
+              '"trigger_time":"' + str.tostring(timenow) + '",' +
+              '"order_id":"' + tradeId + '",' +
+              '"max_lag":"20",' +
+              '"order_type":"sb_limit_short"}', alert.freq_once_per_bar_close)
+    
+    // Set exit orders
+    strategy.exit(tradeId + "_exit", tradeId, stop=stopPrice, limit=tpPrice)
+    
+    // Create order visuals immediately when order is placed
+    var OrderVisuals visuals = na
+    
+    if show_trade_levels or show_trade_labels
+        line_color = fvg.is_bullish ? color.green : color.red
+        label_x_position = bar_index + 25  // Move labels to the right
+        
+        // Create lines
+        entry_line = show_trade_levels ? line.new(bar_index, entryPrice, bar_index+20, entryPrice, color=line_color, style=line.style_dashed, width=2) : na
+        sl_line = show_trade_levels ? line.new(bar_index, stopPrice, bar_index+20, stopPrice, color=color.red, style=line.style_dashed, width=2) : na
+        tp_line = show_trade_levels ? line.new(bar_index, tpPrice, bar_index+20, tpPrice, color=color.blue, style=line.style_dashed, width=2) : na
+        
+        // Create labels (moved to the right)
+        entry_text = (direction == "Long" ? "LONG" : "SHORT") + " ENTRY\n" + str.tostring(entryPrice, '#.####')
+        entry_style = fvg.is_bullish ? label.style_label_down : label.style_label_up
+        entry_color = fvg.is_bullish ? color.green : color.red
+        
+        entry_label = show_trade_labels ? label.new(label_x_position, entryPrice, entry_text, color=entry_color, textcolor=color.white, style=entry_style, size=size.small) : na
+        sl_label = show_trade_labels ? label.new(label_x_position, stopPrice, 'SL\n' + str.tostring(stopPrice, '#.####'), color=color.red, textcolor=color.white, style=label.style_label_up, size=size.small) : na
+        tp_label = show_trade_labels ? label.new(label_x_position, tpPrice, 'TP\n' + str.tostring(tpPrice, '#.####'), color=color.blue, textcolor=color.white, style=label.style_label_down, size=size.small) : na
+        
+        // Store visuals for tracking
+        visuals := OrderVisuals.new(tradeId, entry_line, sl_line, tp_line, entry_label, sl_label, tp_label)
+        array.push(active_order_visuals, visuals)
+    
+    // Draw FVG box
+    box_color = fvg.is_bullish ? cBullFVG : cBearFVG
+    border_color = fvg.is_bullish ? color.new(color.blue, 100) : color.new(color.red, 100)
+    
+    if extend
+        box.new(fvg.bar_index-2, fvg.low_price, bar_index+10, fvg.high_price, border_color=border_color, bgcolor=box_color)
+    else
+        box.new(fvg.bar_index-2, fvg.low_price, fvg.bar_index, fvg.high_price, border_color=border_color, bgcolor=box_color)
+
+// Main trade execution logic
+if sessionActive
+    // Look for immediate FVG opportunities (first priority)
+    if canEnterLong
+        nextBullFVG = findNextFVG(true)
+        if not na(nextBullFVG) and not nextBullFVG.created_while_in_trade
+            trade_counter := trade_counter + 1
+            tradeId = "Long_" + str.tostring(trade_counter)
+            executeTrade(nextBullFVG, "Long", tradeId)
+    
+    if canEnterShort  
+        nextBearFVG = findNextFVG(false)
+        if not na(nextBearFVG) and not nextBearFVG.created_while_in_trade
+            trade_counter := trade_counter + 1
+            tradeId = "Short_" + str.tostring(trade_counter)
+            executeTrade(nextBearFVG, "Short", tradeId)
+    
+    // Check for post-exit opportunities (after TP)
+    if just_exited_long and canEnterLong
+        nextBullFVG = findNextFVG(true)
+        if not na(nextBullFVG)
+            trade_counter := trade_counter + 1
+            tradeId = "Long_" + str.tostring(trade_counter)
+            executeTrade(nextBullFVG, "Long", tradeId)
+    
+    if just_exited_short and canEnterShort
+        nextBearFVG = findNextFVG(false) 
+        if not na(nextBearFVG)
+            trade_counter := trade_counter + 1
+            tradeId = "Short_" + str.tostring(trade_counter)
+            executeTrade(nextBearFVG, "Short", tradeId)
+
+// Function to clean up visuals for completed/cancelled orders
+cleanupOrderVisuals() =>
+    if array.size(active_order_visuals) > 0
+        // Clean up visuals only when positions are actually closed or orders were cancelled
+        // Keep visuals active even after session ends as long as position exists
+        for i = array.size(active_order_visuals) - 1 to 0
+            visuals = array.get(active_order_visuals, i)
+            order_id = visuals.order_id
             
-        entryPrice = getEntryPrice(fvgHigh, fvgLow, isBullish)
-        stopPrice = getStopLossPrice(entryPrice, isBullish)
-        tpPrice = getTakeProfitPrice(entryPrice, stopPrice, isBullish)
-        
-        // Generate unique ID for this trade
-        tradeId = 'SB_' + str.tostring(fvgBar)
-        
-        // Execute entry if in appropriate session and price reaches entry level
-        if is_in_SB
-            // For long entries
-            if isBullish
-                // Only enter if not in short position
-                if strategy.position_size >= 0
-                    strategy.entry(tradeId, strategy.long, limit=entryPrice, comment='Long Entry')
-                    
-                    // Set stop loss and take profit
-                    strategy.exit(tradeId + '_exit', tradeId, stop=stopPrice, limit=tpPrice, comment='SL/TP')
-                    
-                    // Visualization
-                    if show_trade_levels
-                        line.new(bar_index, entryPrice, bar_index+10, entryPrice, color=color.green, style=line.style_dashed)
-                        line.new(bar_index, stopPrice, bar_index+10, stopPrice, color=color.red, style=line.style_dashed)
-                        line.new(bar_index, tpPrice, bar_index+10, tpPrice, color=color.blue, style=line.style_dashed)
-                    
-                    if show_trade_labels
-                        label.new(bar_index, entryPrice, 'ENTRY\n' + str.tostring(entryPrice, '#.####'), 
-                                 color=color.green, textcolor=color.white, style=label.style_label_down)
-                        label.new(bar_index, stopPrice, 'SL\n' + str.tostring(stopPrice, '#.####'), 
-                                 color=color.red, textcolor=color.white, style=label.style_label_down)
-                        label.new(bar_index, tpPrice, 'TP\n' + str.tostring(tpPrice, '#.####'), 
-                                 color=color.blue, textcolor=color.white, style=label.style_label_down)
+            // Find the order status
+            order_status = "unknown"
+            if array.size(tracked_orders) > 0
+                for j = 0 to array.size(tracked_orders) - 1
+                    if array.get(tracked_orders, j).order_id == order_id
+                        order_status := array.get(tracked_orders, j).status
+                        break
             
-            // For short entries
-            else
-                // Only enter if not in long position
-                if strategy.position_size <= 0
-                    strategy.entry(tradeId, strategy.short, limit=entryPrice, comment='Short Entry')
-                    
-                    // Set stop loss and take profit
-                    strategy.exit(tradeId + '_exit', tradeId, stop=stopPrice, limit=tpPrice, comment='SL/TP')
-                    
-                    // Visualization
-                    if show_trade_levels
-                        line.new(bar_index, entryPrice, bar_index+10, entryPrice, color=color.red, style=line.style_dashed)
-                        line.new(bar_index, stopPrice, bar_index+10, stopPrice, color=color.red, style=line.style_dashed)
-                        line.new(bar_index, tpPrice, bar_index+10, tpPrice, color=color.blue, style=line.style_dashed)
-                    
-                    if show_trade_labels
-                        label.new(bar_index, entryPrice, 'ENTRY\n' + str.tostring(entryPrice, '#.####'), 
-                                 color=color.red, textcolor=color.white, style=label.style_label_down)
-                        label.new(bar_index, stopPrice, 'SL\n' + str.tostring(stopPrice, '#.####'), 
-                                 color=color.red, textcolor=color.white, style=label.style_label_down)
-                        label.new(bar_index, tpPrice, 'TP\n' + str.tostring(tpPrice, '#.####'), 
-                                 color=color.blue, textcolor=color.white, style=label.style_label_down)
+            // Only clean up if:
+            // 1. Order was cancelled (never got filled)
+            // 2. Order was filled BUT position is now closed (strategy.position_size == 0)
+            // Keep visuals for active positions regardless of session status
+            should_cleanup = false
+            
+            // SAFETY: Never clean up if there's an active position
+            if strategy.position_size != 0
+                should_cleanup := false
+            else if order_status == "cancelled"
+                should_cleanup := true
+            else if order_status == "filled" and strategy.position_size == 0
+                // Position was closed after being filled - now safe to clean up
+                should_cleanup := true
+            
+            if should_cleanup
+                // Delete visual elements
+                if not na(visuals.entry_line)
+                    line.delete(visuals.entry_line)
+                if not na(visuals.sl_line)
+                    line.delete(visuals.sl_line)
+                if not na(visuals.tp_line)
+                    line.delete(visuals.tp_line)
+                if not na(visuals.entry_label)
+                    label.delete(visuals.entry_label)
+                if not na(visuals.sl_label)
+                    label.delete(visuals.sl_label)
+                if not na(visuals.tp_label)
+                    label.delete(visuals.tp_label)
+                
+                // Remove from array
+                array.remove(active_order_visuals, i)
+
+// Clean up visuals on each bar
+cleanupOrderVisuals()
 
 //================ VISUALIZATIONS ================
-// Plot silver bullet sessions
-plotchar(strLN and showSB, 
-         title='3-4 AM', location=location.top, text='3-4 AM\nNY', color=color(na), textcolor=col_SB)
+// Session lines
+var line[] session_lines = array.new_line()
 
-plotchar(strAM and showSB, 
-         title='10-11 AM', location=location.top, text='10-11 AM\nNY', color=color(na), textcolor=col_SB)
+// Handle session start and end lines
+if strSB and showSB
+    array.push(session_lines, line.new(bar_index, close, bar_index, close + syminfo.mintick, color=col_SB, extend=extend.both))
 
-plotchar(strPM and showSB, 
-         title='2-3 PM', location=location.top, text='2-3 PM\nNY', color=color(na), textcolor=col_SB)
+if endSB and showSB
+    array.push(session_lines, line.new(bar_index, close, bar_index, close + syminfo.mintick, color=col_SB, extend=extend.both))
 
-// Statistics Table
-var table statsTable = table.new(position.top_right, 5, 5, color.black, color.white, 1, color.gray, 1)
+// Clean up old lines
+if array.size(session_lines) > 100
+    line.delete(array.shift(session_lines))
+
+// Plot session markers
+plotchar(SB_LN_per and not SB_LN_per[1] and showSB, 
+         title='3-4 AM', location=location.top, text='3-4 AM\nNY', color=color(na), textcolor=col_SB, size=size.small)
+
+plotchar(SB_AM_per and not SB_AM_per[1] and showSB, 
+         title='10-11 AM', location=location.top, text='10-11 AM\nNY', color=color(na), textcolor=col_SB, size=size.small)
+
+plotchar(SB_PM_per and not SB_PM_per[1] and showSB, 
+         title='2-3 PM', location=location.top, text='2-3 PM\nNY', color=color(na), textcolor=col_SB, size=size.small)
+
+// Session background
+// bgcolor(sessionActive ? color.new(col_SB, 90) : na, title="Silver Bullet Session")
+
+//================ STATISTICS TABLE ================
+var table statsTable = table.new(position.top_right, 6, 8, color.black, color.white, 2, color.gray, 2)
 
 if barstate.islast
     // Calculate statistics
@@ -245,25 +478,47 @@ if barstate.islast
     profitFactorStr = str.tostring(profitFactor, "#.##")
     maxDrawdownStr = str.tostring(maxDrawdown, "$#.##")
     
-    // Set table headers
-    table.cell(statsTable, 0, 0, "Silver Bullet Strategy", bgcolor=color.blue, text_color=color.white)
-    table.cell(statsTable, 0, 1, "Statistics", bgcolor=color.blue, text_color=color.white)
+    // Set table headers (bigger and spanning columns)
+    table.cell(statsTable, 0, 0, "ICT SILVER BULLET STRATEGY", bgcolor=color.blue, text_color=color.white, text_size=size.normal)
+    table.merge_cells(statsTable, 0, 0, 5, 0)
     
-    // Set statistics
-    table.cell(statsTable, 0, 2, "Net Profit:", text_color=color.white)
-    table.cell(statsTable, 1, 2, netProfitStr, text_color=color.white)
+    table.cell(statsTable, 0, 1, "PERFORMANCE STATISTICS", bgcolor=color.navy, text_color=color.white, text_size=size.small)
+    table.merge_cells(statsTable, 0, 1, 5, 1)
     
-    table.cell(statsTable, 0, 3, "Win Rate:", text_color=color.white)
-    table.cell(statsTable, 1, 3, winRateStr, text_color=color.white)
+    // Performance metrics (larger text)
+    table.cell(statsTable, 0, 2, "Net Profit:", text_color=color.white, text_size=size.small)
+    table.cell(statsTable, 1, 2, netProfitStr, text_color=color.white, text_size=size.small)
+    table.cell(statsTable, 2, 2, "Win Rate:", text_color=color.white, text_size=size.small)
+    table.cell(statsTable, 3, 2, winRateStr, text_color=color.white, text_size=size.small)
     
-    table.cell(statsTable, 0, 4, "Profit Factor:", text_color=color.white)
-    table.cell(statsTable, 1, 4, profitFactorStr, text_color=color.white)
+    table.cell(statsTable, 0, 3, "Profit Factor:", text_color=color.white, text_size=size.small)
+    table.cell(statsTable, 1, 3, profitFactorStr, text_color=color.white, text_size=size.small)
+    table.cell(statsTable, 2, 3, "Max Drawdown:", text_color=color.white, text_size=size.small)
+    table.cell(statsTable, 3, 3, maxDrawdownStr, text_color=color.white, text_size=size.small)
     
-    table.cell(statsTable, 2, 2, "Total Trades:", text_color=color.white)
-    table.cell(statsTable, 3, 2, str.tostring(strategy.closedtrades), text_color=color.white)
+    table.cell(statsTable, 0, 4, "Total Trades:", text_color=color.white, text_size=size.small)
+    table.cell(statsTable, 1, 4, str.tostring(strategy.closedtrades), text_color=color.white, text_size=size.small)
+    table.cell(statsTable, 2, 4, "Wins/Losses:", text_color=color.white, text_size=size.small)
+    table.cell(statsTable, 3, 4, str.tostring(strategy.wintrades) + "/" + str.tostring(strategy.losstrades), text_color=color.white, text_size=size.small)
     
-    table.cell(statsTable, 2, 3, "Wins/Losses:", text_color=color.white)
-    table.cell(statsTable, 3, 3, str.tostring(strategy.wintrades) + "/" + str.tostring(strategy.losstrades), text_color=color.white)
+    // Current status section
+    table.cell(statsTable, 0, 5, "CURRENT STATUS", bgcolor=color.navy, text_color=color.white, text_size=size.small)
+    table.merge_cells(statsTable, 0, 5, 5, 5)
     
-    table.cell(statsTable, 2, 4, "Max Drawdown:", text_color=color.white)
-    table.cell(statsTable, 3, 4, maxDrawdownStr, text_color=color.white)
+    table.cell(statsTable, 0, 6, "Session Active:", text_color=color.white, text_size=size.small)
+    table.cell(statsTable, 1, 6, sessionActive ? "YES" : "NO", text_color=sessionActive ? color.green : color.red, text_size=size.small)
+    table.cell(statsTable, 2, 6, "Pending Orders:", text_color=color.white, text_size=size.small)
+    
+    // Count pending orders
+    pending_count = 0
+    if array.size(tracked_orders) > 0
+        for i = 0 to array.size(tracked_orders) - 1
+            if array.get(tracked_orders, i).status == "pending"
+                pending_count := pending_count + 1
+    
+    table.cell(statsTable, 3, 6, str.tostring(pending_count), text_color=color.yellow, text_size=size.small)
+    
+    table.cell(statsTable, 0, 7, "Positions:", text_color=color.white, text_size=size.small)
+    table.cell(statsTable, 1, 7, "L:" + str.tostring(current_long_trades) + " S:" + str.tostring(current_short_trades), text_color=color.white, text_size=size.small)
+    table.cell(statsTable, 2, 7, "Cancelled:", text_color=color.white, text_size=size.small)
+    table.cell(statsTable, 3, 7, str.tostring(cancelled_orders_count), text_color=color.orange, text_size=size.small)
