@@ -1,0 +1,269 @@
+//@version=6
+strategy("ICT Silver Bullet Strategy", overlay=true, max_bars_back=5000, max_lines_count=500, max_labels_count=500, max_boxes_count=500, default_qty_type=strategy.percent_of_equity, default_qty_value=10, initial_capital=10000, currency=currency.USD)
+
+//================ STRATEGY PARAMETERS ================
+// FVG Settings
+choice = input.string('All FVG', 'FVG Type', options=['All FVG', 'Only FVG in the same direction of trend', 'Strict', 'Super-Strict'], group='FVG Settings')
+cBullFVG = input.color(#4dd0e160, 'Bull FVG Color', inline='fvg', group='FVG Settings')
+cBearFVG = input.color(#ffc1b160, 'Bear FVG Color', inline='fvg', group='FVG Settings')
+extend = input.bool(true, 'extend FVG', inline='fvg', group='FVG Settings')
+
+// Silver Bullet Session Settings
+showSB = input.bool(true, 'Show SB session', inline='SB', group='Silver Bullet Session')
+col_SB = input.color(#b2b5be50, '', inline='SB', group='Silver Bullet Session')
+
+// Entry Settings
+entry_method = input.string('Proximal', 'Entry Level', options=['Proximal', '50% OB', 'Distal'], group='Entry Settings', tooltip='Determines where to place limit orders within the Fair Value Gap')
+
+// Stop Loss Settings
+atr_length = input.int(14, 'ATR Length', minval=1, group='Stop Loss Settings')
+atr_smoothing = input.string('RMA', 'ATR Smoothing', options=['RMA', 'SMA', 'EMA', 'WMA'], group='Stop Loss Settings')
+atr_multiplier = input.float(2.0, 'ATR Multiplier', minval=0.1, step=0.1, group='Stop Loss Settings')
+
+// Take Profit Settings
+risk_reward_ratio = input.float(1.5, 'Risk:Reward Ratio', minval=0.1, step=0.1, group='Take Profit Settings')
+
+// Display Settings
+show_trade_levels = input.bool(true, 'Show Entry/SL/TP Levels', group='Display Settings')
+show_trade_labels = input.bool(true, 'Show Trade Labels', group='Display Settings')
+
+//================ SILVER BULLET SESSIONS ================
+// Time functions - Fixed to match the original code
+timeSess(timezone, session) => 
+    not na(time(timeframe.period, session, timezone))
+
+// Silver Bullet Sessions
+SB_LN_per = timeSess("America/New_York", "0300-0400") // London Open (3 AM - 4 AM NY time)
+SB_AM_per = timeSess("America/New_York", "1000-1100") // AM Session (10 AM - 11 AM NY time)
+SB_PM_per = timeSess("America/New_York", "1400-1500") // PM Session (2 PM - 3 PM NY time)
+
+// Session status
+is_in_SB = SB_LN_per or SB_AM_per or SB_PM_per
+strSB = is_in_SB and not is_in_SB[1]
+endSB = not is_in_SB and is_in_SB[1]
+
+// Session start detection
+strLN = SB_LN_per and not SB_LN_per[1]
+strAM = SB_AM_per and not SB_AM_per[1]
+strPM = SB_PM_per and not SB_PM_per[1]
+
+// Session end detection
+endLN = not SB_LN_per and SB_LN_per[1]
+endAM = not SB_AM_per and SB_AM_per[1]
+endPM = not SB_PM_per and SB_PM_per[1]
+
+//================ VARIABLES & ARRAYS ================
+var aTrend = array.new_int(1, 0)
+var l_SB = array.new_line()
+var box[] bFVG_bull = array.new_box()
+var box[] bFVG_bear = array.new_box()
+var float[] bullFVG_prices_high = array.new_float()
+var float[] bullFVG_prices_low = array.new_float()
+var float[] bearFVG_prices_high = array.new_float()
+var float[] bearFVG_prices_low = array.new_float()
+var int[] fvg_bars = array.new_int()
+var bool[] fvg_is_bull = array.new_bool()
+
+// ATR Calculation
+atr_ma(source, length, smoothing) =>
+    if smoothing == 'RMA'
+        ta.rma(source, length)
+    else if smoothing == 'SMA'
+        ta.sma(source, length)
+    else if smoothing == 'EMA'
+        ta.ema(source, length)
+    else
+        ta.wma(source, length)
+
+atr_value = atr_ma(ta.tr(true), atr_length, atr_smoothing)
+
+//================ FVG DETECTION ================
+// Detect Fair Value Gaps
+detectFVGs() =>
+    // Check for bullish FVG (low > previous high)
+    if low > high[2]
+        box b = box.new(bar_index, low, bar_index+1, high[2], border_color=color.new(color.blue, 100), bgcolor=cBullFVG)
+        bFVG_bull.push(b)
+        bullFVG_prices_high.push(low)        // Proximal is actually the higher price (low of current bar)
+        bullFVG_prices_low.push(high[2])     // Distal is the lower price (high of bar 2 bars ago)
+        fvg_bars.push(bar_index)
+        fvg_is_bull.push(true)
+        
+    // Check for bearish FVG (high < previous low)
+    if high < low[2]
+        box b = box.new(bar_index, low[2], bar_index+1, high, border_color=color.new(color.red, 100), bgcolor=cBearFVG)
+        bFVG_bear.push(b)
+        bearFVG_prices_high.push(high)       // Proximal is actually the lower price (high of current bar)
+        bearFVG_prices_low.push(low[2])      // Distal is the higher price (low of bar 2 bars ago)
+        fvg_bars.push(bar_index)
+        fvg_is_bull.push(false)
+
+//================ SESSION HANDLING ================
+// Handle session start
+if strSB and showSB
+    l_SB.push(line.new(bar_index, close, bar_index, close + syminfo.mintick, color=col_SB, extend=extend.both))
+
+// Detect FVGs during Silver Bullet sessions
+if is_in_SB
+    detectFVGs()
+
+// Handle session end
+if endSB and showSB
+    l_SB.push(line.new(bar_index, close, bar_index, close + syminfo.mintick, color=col_SB, extend=extend.both))
+
+//================ ENTRY LOGIC ================
+// Function to calculate entry price based on FVG and entry method
+getEntryPrice(fvgHigh, fvgLow, isBullish) =>
+    if entry_method == 'Proximal'
+        if isBullish
+            fvgHigh  // High of bullish FVG is the proximal entry
+        else
+            fvgLow   // Low of bearish FVG is the proximal entry
+    else if entry_method == '50% OB'
+        (fvgHigh + fvgLow) / 2
+    else  // Distal
+        if isBullish
+            fvgLow  // Low of bullish FVG is the distal entry
+        else
+            fvgHigh  // High of bearish FVG is the distal entry
+
+// Calculate stop loss based on ATR
+getStopLossPrice(entryPrice, isBullish) =>
+    stopDistance = atr_value * atr_multiplier
+    if isBullish
+        entryPrice - stopDistance  // Stop loss below entry for longs
+    else
+        entryPrice + stopDistance  // Stop loss above entry for shorts
+
+// Calculate take profit based on risk-reward ratio
+getTakeProfitPrice(entryPrice, stopPrice, isBullish) =>
+    riskDistance = math.abs(entryPrice - stopPrice)
+    if isBullish
+        entryPrice + (riskDistance * risk_reward_ratio)  // TP above entry for longs
+    else
+        entryPrice - (riskDistance * risk_reward_ratio)  // TP below entry for shorts
+
+//================ TRADE EXECUTION ================
+// Process all detected FVGs for potential entries
+for i = 0 to math.min(fvg_bars.size() - 1, 500)
+    // Get FVG data
+    fvgBar = fvg_bars.get(i)
+    isBullish = fvg_is_bull.get(i)
+    
+    // Check if FVG is from current session
+    if bar_index - fvgBar <= 20  // Only recent FVGs (within about 20 bars)
+        // Calculate entry/exit levels
+        float fvgHigh = 0.0
+        float fvgLow = 0.0
+        
+        if isBullish
+            fvgHigh := bullFVG_prices_high.get(i)
+            fvgLow := bullFVG_prices_low.get(i)
+        else
+            fvgHigh := bearFVG_prices_high.get(i)
+            fvgLow := bearFVG_prices_low.get(i)
+            
+        entryPrice = getEntryPrice(fvgHigh, fvgLow, isBullish)
+        stopPrice = getStopLossPrice(entryPrice, isBullish)
+        tpPrice = getTakeProfitPrice(entryPrice, stopPrice, isBullish)
+        
+        // Generate unique ID for this trade
+        tradeId = 'SB_' + str.tostring(fvgBar)
+        
+        // Execute entry if in appropriate session and price reaches entry level
+        if is_in_SB
+            // For long entries
+            if isBullish
+                // Only enter if not in short position
+                if strategy.position_size >= 0
+                    strategy.entry(tradeId, strategy.long, limit=entryPrice, comment='Long Entry')
+                    
+                    // Set stop loss and take profit
+                    strategy.exit(tradeId + '_exit', tradeId, stop=stopPrice, limit=tpPrice, comment='SL/TP')
+                    
+                    // Visualization
+                    if show_trade_levels
+                        line.new(bar_index, entryPrice, bar_index+10, entryPrice, color=color.green, style=line.style_dashed)
+                        line.new(bar_index, stopPrice, bar_index+10, stopPrice, color=color.red, style=line.style_dashed)
+                        line.new(bar_index, tpPrice, bar_index+10, tpPrice, color=color.blue, style=line.style_dashed)
+                    
+                    if show_trade_labels
+                        label.new(bar_index, entryPrice, 'ENTRY\n' + str.tostring(entryPrice, '#.####'), 
+                                 color=color.green, textcolor=color.white, style=label.style_label_down)
+                        label.new(bar_index, stopPrice, 'SL\n' + str.tostring(stopPrice, '#.####'), 
+                                 color=color.red, textcolor=color.white, style=label.style_label_down)
+                        label.new(bar_index, tpPrice, 'TP\n' + str.tostring(tpPrice, '#.####'), 
+                                 color=color.blue, textcolor=color.white, style=label.style_label_down)
+            
+            // For short entries
+            else
+                // Only enter if not in long position
+                if strategy.position_size <= 0
+                    strategy.entry(tradeId, strategy.short, limit=entryPrice, comment='Short Entry')
+                    
+                    // Set stop loss and take profit
+                    strategy.exit(tradeId + '_exit', tradeId, stop=stopPrice, limit=tpPrice, comment='SL/TP')
+                    
+                    // Visualization
+                    if show_trade_levels
+                        line.new(bar_index, entryPrice, bar_index+10, entryPrice, color=color.red, style=line.style_dashed)
+                        line.new(bar_index, stopPrice, bar_index+10, stopPrice, color=color.red, style=line.style_dashed)
+                        line.new(bar_index, tpPrice, bar_index+10, tpPrice, color=color.blue, style=line.style_dashed)
+                    
+                    if show_trade_labels
+                        label.new(bar_index, entryPrice, 'ENTRY\n' + str.tostring(entryPrice, '#.####'), 
+                                 color=color.red, textcolor=color.white, style=label.style_label_down)
+                        label.new(bar_index, stopPrice, 'SL\n' + str.tostring(stopPrice, '#.####'), 
+                                 color=color.red, textcolor=color.white, style=label.style_label_down)
+                        label.new(bar_index, tpPrice, 'TP\n' + str.tostring(tpPrice, '#.####'), 
+                                 color=color.blue, textcolor=color.white, style=label.style_label_down)
+
+//================ VISUALIZATIONS ================
+// Plot silver bullet sessions
+plotchar(strLN and showSB, 
+         title='3-4 AM', location=location.top, text='3-4 AM\nNY', color=color(na), textcolor=col_SB)
+
+plotchar(strAM and showSB, 
+         title='10-11 AM', location=location.top, text='10-11 AM\nNY', color=color(na), textcolor=col_SB)
+
+plotchar(strPM and showSB, 
+         title='2-3 PM', location=location.top, text='2-3 PM\nNY', color=color(na), textcolor=col_SB)
+
+// Statistics Table
+var table statsTable = table.new(position.top_right, 5, 5, color.black, color.white, 1, color.gray, 1)
+
+if barstate.islast
+    // Calculate statistics
+    netProfit = strategy.netprofit
+    winRate = strategy.closedtrades > 0 ? (strategy.wintrades / strategy.closedtrades) * 100 : 0
+    profitFactor = strategy.grossloss != 0 ? strategy.grossprofit / math.abs(strategy.grossloss) : 0
+    maxDrawdown = strategy.max_drawdown
+    
+    // Format statistics
+    netProfitStr = str.tostring(netProfit, "$#.##")
+    winRateStr = str.tostring(winRate, "#.##") + "%"
+    profitFactorStr = str.tostring(profitFactor, "#.##")
+    maxDrawdownStr = str.tostring(maxDrawdown, "$#.##")
+    
+    // Set table headers
+    table.cell(statsTable, 0, 0, "Silver Bullet Strategy", bgcolor=color.blue, text_color=color.white)
+    table.cell(statsTable, 0, 1, "Statistics", bgcolor=color.blue, text_color=color.white)
+    
+    // Set statistics
+    table.cell(statsTable, 0, 2, "Net Profit:", text_color=color.white)
+    table.cell(statsTable, 1, 2, netProfitStr, text_color=color.white)
+    
+    table.cell(statsTable, 0, 3, "Win Rate:", text_color=color.white)
+    table.cell(statsTable, 1, 3, winRateStr, text_color=color.white)
+    
+    table.cell(statsTable, 0, 4, "Profit Factor:", text_color=color.white)
+    table.cell(statsTable, 1, 4, profitFactorStr, text_color=color.white)
+    
+    table.cell(statsTable, 2, 2, "Total Trades:", text_color=color.white)
+    table.cell(statsTable, 3, 2, str.tostring(strategy.closedtrades), text_color=color.white)
+    
+    table.cell(statsTable, 2, 3, "Wins/Losses:", text_color=color.white)
+    table.cell(statsTable, 3, 3, str.tostring(strategy.wintrades) + "/" + str.tostring(strategy.losstrades), text_color=color.white)
+    
+    table.cell(statsTable, 2, 4, "Max Drawdown:", text_color=color.white)
+    table.cell(statsTable, 3, 4, maxDrawdownStr, text_color=color.white)
