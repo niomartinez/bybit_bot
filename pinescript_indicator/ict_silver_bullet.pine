@@ -2,12 +2,30 @@
 // © nioboi
 strategy("ICT Silver Bullet Strategy", overlay=true, max_bars_back=5000, max_lines_count=500, max_labels_count=500, max_boxes_count=500, default_qty_type=strategy.percent_of_equity, default_qty_value=10, initial_capital=10000, currency=currency.USD, pyramiding=10)
 
+//================ IMPORT LIBRARIES ================ courtesy of @TFlab
+//import Order Block Refiner
+import TFlab/OrderBlockRefiner_TradingFinder/2 as Refiner
+//import Order Block Drawing Library
+import TFlab/OrderBlockDrawing_TradingFinder/4 as Drawing
+//import FVG Detector Library
+import TFlab/FVGDetectorLibrary/3 as FVG
+
 //================ STRATEGY PARAMETERS ================
 // FVG Settings
 choice = 'All FVG'
 cBullFVG = input.color(#4dd0e160, 'Bull FVG Color', inline='fvg', group='FVG Settings')
 cBearFVG = input.color(#ffc1b160, 'Bear FVG Color', inline='fvg', group='FVG Settings')
 extend = input.bool(true, 'extend FVG', inline='fvg', group='FVG Settings')
+
+// FVG Library Settings (from ICT 2022 Mentorship)
+PFVGFilter = input.bool(false, 'Enable FVG Width Filter', group='FVG Settings')
+PFVGFilterType = input.string('Defensive', 'Filter Type', ['Very Aggressive', 'Aggressive', 'Defensive', 'Very Defensive'], group='FVG Settings')
+FVG_Length = input.int(120, 'FVG Length', minval=1, group='FVG Settings')
+MLFVG = input.string('Proximal', 'FVG Internal Entry Level', ['Proximal', '50 % OB', 'Distal'], group='FVG Settings')
+
+// Display FVG Settings
+DFVGShow = input.bool(true, 'Show Demand FVG', group='FVG Settings')
+SFVGShow = input.bool(true, 'Show Supply FVG', group='FVG Settings')
 
 // Silver Bullet Session Settings
 showSB = input.bool(true, 'Show SB session', inline='SB', group='Silver Bullet Session')
@@ -30,6 +48,7 @@ risk_reward_ratio = input.float(2.0, 'Risk:Reward Ratio', minval=0.1, step=0.1, 
 // Display Settings
 show_trade_levels = input.bool(true, 'Show Entry/SL/TP Levels', group='Display Settings')
 show_trade_labels = input.bool(true, 'Show Trade Labels', group='Display Settings')
+show_atr_trackprice = input.bool(true, 'Track ATR Lines with Price', group='Display Settings')
 
 //================ SILVER BULLET SESSIONS ================
 // Time functions
@@ -163,8 +182,8 @@ atr_value = atr_ma(ta.tr(true), atr_length, atr_smoothing)
 atr_upper = high + (atr_value * atr_multiplier)  // Short stop loss level
 atr_lower = low - (atr_value * atr_multiplier)   // Long stop loss level
 
-plot(atr_upper, title="ATR Short SL", color=color.new(color.red, 80), linewidth=1)
-plot(atr_lower, title="ATR Long SL", color=color.new(color.green, 80), linewidth=1)
+plot(atr_upper, title="ATR Short SL", color=color.new(color.red, 80), linewidth=1, trackprice=show_atr_trackprice)
+plot(atr_lower, title="ATR Long SL", color=color.new(color.green, 80), linewidth=1, trackprice=show_atr_trackprice)
 
 //================ POSITION TRACKING ================
 // Track position changes
@@ -209,7 +228,10 @@ else
     was_in_position_last_bar := currently_in_position
 
 //================ FVG DETECTION & TRACKING ================
-// Simple FVG detection during sessions
+// Library-based FVG detection (like ICT 2022 Mentorship)
+[DConditionFVG, DDFVG, DPFVG, BarDFVG, SConditionFVG, SDFVG, SPFVG, BarSFVG] = FVG.FVGDetector(PFVGFilter ? 'On' : 'Off', PFVGFilterType, false, false)
+
+// Simple FVG detection during sessions for our own tracking
 bullish_fvg_detected = sessionActive and low > high[2]
 bearish_fvg_detected = sessionActive and high < low[2]
 
@@ -221,6 +243,13 @@ if bullish_fvg_detected
 if bearish_fvg_detected
     new_fvg = FVG_Data.new(bar_index, low[2], high, false, false, currently_in_position)
     array.push(untapped_fvgs, new_fvg)
+
+// Dynamic FVG Drawing using the library (like ICT 2022 Mentorship)
+if bar_index - BarDFVG < 500 and DConditionFVG
+    Drawing.OBDrawing('Demand', DConditionFVG, DDFVG, DPFVG, BarDFVG, true, FVG_Length, MLFVG, MLFVG, true, false, DFVGShow, false, cBullFVG, #ffffff00)
+
+if bar_index - BarSFVG < 500 and SConditionFVG  
+    Drawing.OBDrawing('Supply', SConditionFVG, SDFVG, SPFVG, BarSFVG, true, FVG_Length, MLFVG, MLFVG, true, false, SFVGShow, false, cBearFVG, #ffffff00)
 
 //================ HELPER FUNCTIONS ================
 // Entry price calculation
@@ -250,7 +279,7 @@ findNextFVG(preferBullish) =>
         // First, look for FVGs created while we were NOT in a position (immediate FVGs)
         for i = 0 to array.size(untapped_fvgs) - 1
             fvg = array.get(untapped_fvgs, i)
-            if not fvg.is_tapped and not fvg.created_while_in_trade and fvg.is_bullish == preferBullish
+            if not na(fvg) and not fvg.is_tapped and not fvg.created_while_in_trade and fvg.is_bullish == preferBullish
                 result := fvg
                 break
                 
@@ -258,7 +287,7 @@ findNextFVG(preferBullish) =>
         if na(result)
             for i = 0 to array.size(untapped_fvgs) - 1
                 fvg = array.get(untapped_fvgs, i)
-                if not fvg.is_tapped and fvg.created_while_in_trade and fvg.is_bullish == preferBullish
+                if not na(fvg) and not fvg.is_tapped and fvg.created_while_in_trade and fvg.is_bullish == preferBullish
                     result := fvg
                     break
     
@@ -273,6 +302,10 @@ canEnterShort = sessionActive and current_short_trades < max_pyramiding and stra
 
 // Function to execute trade
 executeTrade(fvg, direction, tradeId) =>
+    // Safety check - ensure FVG is not na
+    if na(fvg)
+        runtime.error("executeTrade called with na FVG object")
+    
     // Mark FVG as tapped
     fvg.is_tapped := true
     
@@ -356,17 +389,19 @@ if sessionActive
     // Look for immediate FVG opportunities (first priority)
     if canEnterLong
         nextBullFVG = findNextFVG(true)
-        if not na(nextBullFVG) and not nextBullFVG.created_while_in_trade
-            trade_counter := trade_counter + 1
-            tradeId = "Long_" + str.tostring(trade_counter)
-            executeTrade(nextBullFVG, "Long", tradeId)
+        if not na(nextBullFVG)
+            if not nextBullFVG.created_while_in_trade
+                trade_counter := trade_counter + 1
+                tradeId = "Long_" + str.tostring(trade_counter)
+                executeTrade(nextBullFVG, "Long", tradeId)
     
     if canEnterShort  
         nextBearFVG = findNextFVG(false)
-        if not na(nextBearFVG) and not nextBearFVG.created_while_in_trade
-            trade_counter := trade_counter + 1
-            tradeId = "Short_" + str.tostring(trade_counter)
-            executeTrade(nextBearFVG, "Short", tradeId)
+        if not na(nextBearFVG)
+            if not nextBearFVG.created_while_in_trade
+                trade_counter := trade_counter + 1
+                tradeId = "Short_" + str.tostring(trade_counter)
+                executeTrade(nextBearFVG, "Short", tradeId)
     
     // Check for post-exit opportunities (after TP)
     if just_exited_long and canEnterLong
