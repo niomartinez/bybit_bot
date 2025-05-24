@@ -524,7 +524,8 @@ class BybitService:
                 'sellLeverage': str(leverage)
             }
             
-            response = self.exchange.privatePostV5PositionSetLeverage(params)
+            # Use the correct CCXT method name for Bybit V5
+            response = self.exchange.private_post_v5_position_set_leverage(params)
             
             if response.get('retCode') == 0:
                 logger.info(f"Direct API leverage setting successful for {symbol}: {leverage}x")
@@ -573,7 +574,9 @@ class BybitService:
         qty: float,
         price: float,
         sl: float,
-        tp: float
+        tp: float,
+        strategy_id: str = None,
+        priority: int = 2
     ) -> Dict[str, Any]:
         """
         Place a limit order with stop loss and take profit.
@@ -585,6 +588,8 @@ class BybitService:
             price (float): Order price
             sl (float): Stop loss price
             tp (float): Take profit price
+            strategy_id (str): Strategy identifier for multi-strategy support
+            priority (int): Order priority
         
         Returns:
             Dict[str, Any]: Order response or error details
@@ -611,6 +616,39 @@ class BybitService:
                         'success': False,
                         'message': f"Symbol {symbol} not found in available markets",
                         'error': 'symbol_not_found'
+                    }
+            
+            # Multi-strategy support for linear markets (ONE-WAY MODE ONLY)
+            if market_type == 'linear' and hasattr(config, 'multi_strategy') and config.multi_strategy and config.multi_strategy.enabled:
+                logger.info(f"Multi-strategy mode enabled for {symbol} (one-way mode)")
+                
+                # Check existing positions and orders to determine current direction
+                existing_positions = await self.get_existing_positions(symbol)
+                existing_orders = await self.get_existing_orders(symbol)
+                
+                # Log existing positions/orders for debugging
+                if existing_positions:
+                    logger.info(f"Existing positions: {[{'side': p.get('side'), 'size': p.get('size'), 'contracts': p.get('contracts')} for p in existing_positions]}")
+                if existing_orders:
+                    logger.info(f"Existing orders: {[{'side': o.get('side'), 'amount': o.get('amount')} for o in existing_orders]}")
+                
+                # Check for direction conflicts
+                direction_conflict = self.check_direction_conflict(side, existing_positions, existing_orders)
+                if direction_conflict:
+                    return {
+                        'success': False,
+                        'message': f"Direction conflict: Cannot place {side} order when existing {direction_conflict} position/orders exist. Reversing not allowed in one-way mode.",
+                        'error': 'direction_conflict',
+                        'existing_direction': direction_conflict,
+                        'requested_direction': side
+                    }
+                
+                # Check pyramiding limits for same direction
+                if not self.check_pyramiding_limits(side, strategy_id, existing_orders, existing_positions):
+                    return {
+                        'success': False,
+                        'message': f"Pyramiding limit reached for {symbol} {side} direction",
+                        'error': 'pyramiding_limit_reached'
                     }
             
             # Use the exact market_id found - don't try to convert it
@@ -657,40 +695,50 @@ class BybitService:
                 qty_str = str(qty)
                 qty_adjusted = qty
             
+            # Generate unique order ID for tracking
+            timestamp = int(time.time())
+            symbol_clean = symbol.replace('/', '').replace(':', '')
+            strategy_suffix = f"_{strategy_id}" if strategy_id else ""
+            
+            # Include priority in order ID for tracking
+            priority_prefix = f"prio{priority}_" if priority != 2 else "tv_"
+            order_id = f"{priority_prefix}{timestamp}_{symbol_clean}{strategy_suffix}"
+            
             # Prepare parameters for Bybit V5 API
+            # Using standard Bybit SL/TP attached to the main order for simplicity and reliability
             params = {
+                'orderLinkId': order_id,
                 'stopLoss': sl_str,
                 'takeProfit': tp_str,
                 'timeInForce': config.bybit_api.default_time_in_force,
             }
             
+            logger.info(f"Using standard attached SL/TP for reliable order execution")
+            
             # For Bybit V5 API, category is REQUIRED and must be explicit
             if market_type == 'linear':
                 params['category'] = 'linear'  # USDT perpetuals
-                logger.info(f"Setting category=linear for perpetual futures")
+                params['positionIdx'] = 0  # Always use one-way mode (simplified approach)
+                logger.info(f"Setting category=linear for perpetual futures (one-way mode)")
             elif market_type == 'inverse':
                 params['category'] = 'inverse'  # Inverse perpetuals  
-                logger.info(f"Setting category=inverse for inverse perpetuals")
+                params['positionIdx'] = 0  # Always use one-way mode
+                logger.info(f"Setting category=inverse for inverse perpetuals (one-way mode)")
             elif market_type == 'spot':
                 params['category'] = 'spot'    # Spot trading
                 logger.info(f"Setting category=spot for spot trading")
             
-            # Create unique order ID based on timestamp and symbol
-            order_link_id = f"tv_{int(time.time())}_{symbol.replace('/', '').replace(':', '')}"
+            # Create unique order ID based on timestamp, symbol, and strategy
+            strategy_suffix = f"_{strategy_id}" if strategy_id else ""
+            order_link_id = f"tv_{int(time.time())}_{symbol.replace('/', '').replace(':', '')}{strategy_suffix}"
             params['orderLinkId'] = order_link_id
             
-            # Additional Bybit V5 specific parameters for perpetuals
-            if market_type == 'linear':
-                # For linear perpetuals, we can also specify position index for hedge mode
-                # Default to 0 for one-way mode (most common)
-                params['positionIdx'] = 0
-                
             logger.info(f"Final API params: {params}")
             
             # Place the order using the exact market ID found
             try:
                 logger.info(f"Placing {side} limit order for {symbol} ({market_type}): {qty_str} @ {price_str} (SL: {sl_str}, TP: {tp_str})")
-                logger.info(f"Using market_id: {market_id} with category: {params.get('category')}")
+                logger.info(f"Using market_id: {market_id} with category: {params.get('category')}, strategy: {strategy_id or 'default'}")
                 
                 order = self.exchange.create_order(
                     symbol=order_symbol,  # Use the exact market_id found
@@ -702,11 +750,15 @@ class BybitService:
                 )
                 
                 logger.info(f"✅ Placed {side} limit order for {symbol}: {qty_str} @ {price_str} (SL: {sl_str}, TP: {tp_str})")
-                logger.info(f"Order placed in market: {order.get('symbol', 'Unknown')} with category: {params.get('category')}")
+                logger.info(f"Order placed in market: {order.get('symbol', 'Unknown')} with category: {params.get('category')}, strategy: {strategy_id or 'default'}")
+                
                 return {
                     'success': True,
                     'order': order,
-                    'message': 'Order placed successfully'
+                    'message': 'Order placed successfully with attached SL/TP',
+                    'strategy_id': strategy_id,
+                    'priority': priority,
+                    'position_idx': params.get('positionIdx', 0)
                 }
                 
             except ccxt.InsufficientFunds as e:
@@ -754,10 +806,14 @@ class BybitService:
                         
                         logger.info(f"✅ Placed {side} limit order for {symbol} with integer quantity: {rounded_qty} @ {price_str}")
                         logger.info(f"Order placed in market: {order.get('symbol', 'Unknown')}")
+                        
                         return {
                             'success': True,
                             'order': order,
-                            'message': 'Order placed successfully with integer quantity'
+                            'message': 'Order placed successfully with integer quantity and attached SL/TP',
+                            'strategy_id': strategy_id,
+                            'priority': priority,
+                            'position_idx': params.get('positionIdx', 0)
                         }
                     except Exception as retry_error:
                         logger.error(f"Error retrying with integer quantity: {retry_error}")
@@ -879,4 +935,520 @@ class BybitService:
             logger.error(f"Error adjusting quantity: {e}")
             return qty
     
-    # Removed debug_bybit_instruments method as it was specific to NEAR debugging 
+    # Removed debug_bybit_instruments method as it was specific to NEAR debugging
+    
+    async def get_position_mode(self, symbol: str) -> str:
+        """
+        Get the current position mode for a symbol.
+        
+        Args:
+            symbol (str): Symbol to check position mode for
+        
+        Returns:
+            str: Position mode ('one-way' or 'hedge')
+        """
+        try:
+            # Use Bybit V5 API to get position mode
+            # For unified trading account, we need to check the specific coin's position mode
+            base_coin = symbol.replace('USDT', '').replace('/', '').replace(':', '').upper()
+            
+            params = {
+                'category': 'linear',
+                'coin': base_coin  # Just the base coin (e.g., 'NEAR', 'BTC')
+            }
+            
+            # Use the correct CCXT method name for Bybit V5
+            response = self.exchange.private_get_v5_position_switch_mode(params)
+            
+            if response.get('retCode') == 0:
+                result = response.get('result', {})
+                # Position mode: 0 = one-way, 3 = hedge
+                mode = result.get('mode', 0)
+                return 'hedge' if mode == 3 else 'one-way'
+            else:
+                logger.warning(f"Could not get position mode for {symbol}: {response.get('retMsg', 'Unknown error')}")
+                return 'one-way'  # Default assumption
+                
+        except Exception as e:
+            logger.error(f"Error getting position mode for {symbol}: {e}")
+            return 'one-way'  # Default assumption
+    
+    async def set_position_mode(self, symbol: str, mode: str = 'hedge') -> Dict[str, Any]:
+        """
+        Set position mode for a symbol.
+        
+        Args:
+            symbol (str): Symbol to set position mode for
+            mode (str): 'hedge' or 'one-way'
+        
+        Returns:
+            Dict[str, Any]: Result of the operation
+        """
+        try:
+            # Convert mode to Bybit format
+            bybit_mode = 3 if mode == 'hedge' else 0
+            
+            # Get base coin for the API call - need to be more careful about the format
+            base_coin = symbol.replace('USDT', '').replace('/', '').replace(':', '').upper()
+            
+            # For some coins like NEAR, we might need to check if it's supported
+            # Let's try different formats
+            coin_alternatives = [
+                base_coin,                    # NEAR
+                f"{base_coin}USDT",          # NEARUSDT  
+                symbol.replace('/', '').replace(':', '').upper()  # Full symbol
+            ]
+            
+            logger.info(f"Attempting to set position mode for {symbol} ({base_coin}) to {mode} (mode={bybit_mode})")
+            
+            for coin_format in coin_alternatives:
+                try:
+                    params = {
+                        'category': 'linear',
+                        'coin': coin_format,
+                        'mode': str(bybit_mode)
+                    }
+                    
+                    logger.info(f"Trying coin format: {coin_format}")
+                    
+                    # Use the correct CCXT method name for Bybit V5
+                    response = self.exchange.private_post_v5_position_switch_mode(params)
+                    
+                    if response.get('retCode') == 0:
+                        logger.info(f"✅ Successfully set position mode for {symbol} to {mode} using coin format: {coin_format}")
+                        return {'success': True, 'message': f'Position mode set to {mode}'}
+                    else:
+                        error_msg = response.get('retMsg', 'Unknown error')
+                        logger.warning(f"Failed with coin format {coin_format}: {error_msg}")
+                        
+                        # If this coin format failed, try the next one
+                        continue
+                        
+                except Exception as format_error:
+                    logger.warning(f"Error with coin format {coin_format}: {format_error}")
+                    continue
+            
+            # If all formats failed
+            logger.error(f"Failed to set position mode for {symbol} with all coin formats: {coin_alternatives}")
+            return {'success': False, 'message': f'Failed to set position mode: all coin formats failed'}
+                
+        except Exception as e:
+            logger.error(f"Error setting position mode for {symbol}: {e}")
+            return {'success': False, 'message': f'Error setting position mode: {str(e)}'}
+    
+    async def get_existing_positions(self, symbol: str) -> List[Dict[str, Any]]:
+        """
+        Get existing positions for a symbol.
+        
+        Args:
+            symbol (str): Symbol to check positions for
+        
+        Returns:
+            List[Dict[str, Any]]: List of existing positions
+        """
+        try:
+            # Get the correct market ID
+            market_id = self.get_market_id(symbol, 'linear')
+            
+            # Use CCXT to fetch positions
+            positions = self.exchange.fetch_positions([market_id])
+            
+            # Filter for positions with non-zero size
+            active_positions = [
+                pos for pos in positions 
+                if pos.get('size', 0) != 0 and pos.get('contracts', 0) != 0
+            ]
+            
+            logger.info(f"Found {len(active_positions)} active positions for {symbol}")
+            return active_positions
+            
+        except Exception as e:
+            logger.error(f"Error getting positions for {symbol}: {e}")
+            return []
+    
+    async def get_existing_orders(self, symbol: str) -> List[Dict[str, Any]]:
+        """
+        Get existing open orders for a symbol.
+        
+        Args:
+            symbol (str): Symbol to check orders for
+        
+        Returns:
+            List[Dict[str, Any]]: List of existing orders
+        """
+        try:
+            # Get the correct market ID
+            market_id = self.get_market_id(symbol, 'linear')
+            
+            # Use CCXT to fetch open orders
+            orders = self.exchange.fetch_open_orders(market_id)
+            
+            logger.info(f"Found {len(orders)} open orders for {symbol}")
+            return orders
+            
+        except Exception as e:
+            logger.error(f"Error getting orders for {symbol}: {e}")
+            return []
+    
+    def determine_position_idx(self, side: str, strategy_id: str, existing_positions: List[Dict[str, Any]]) -> int:
+        """
+        Determine the appropriate positionIdx for hedge mode based on side and existing positions.
+        
+        Args:
+            side (str): Order side ('Buy' or 'Sell')
+            strategy_id (str): Strategy identifier
+            existing_positions (List[Dict[str, Any]]): Existing positions
+        
+        Returns:
+            int: Position index (0=one-way, 1=buy hedge, 2=sell hedge)
+        """
+        try:
+            # If multi-strategy is not enabled or not in hedge mode, use one-way
+            if (not hasattr(config, 'multi_strategy') or 
+                not config.multi_strategy or 
+                not config.multi_strategy.hedge_mode):
+                return 0
+            
+            # In hedge mode, determine position index based on side
+            if side.lower() == 'buy':
+                return 1  # Buy side of hedge position
+            else:
+                return 2  # Sell side of hedge position
+            
+        except Exception as e:
+            logger.error(f"Error determining position index: {e}")
+            return 0  # Default to one-way mode
+    
+    def check_pyramiding_limits(self, side: str, strategy_id: str, existing_orders: List[Dict[str, Any]], existing_positions: List[Dict[str, Any]]) -> bool:
+        """
+        Check if pyramiding limits allow placing a new order.
+        
+        Args:
+            side (str): Order side ('Buy' or 'Sell')
+            strategy_id (str): Strategy identifier
+            existing_orders (List[Dict[str, Any]]): Existing orders
+            existing_positions (List[Dict[str, Any]]): Existing positions
+        
+        Returns:
+            bool: True if pyramiding is allowed, False otherwise
+        """
+        try:
+            # If multi-strategy is not enabled, allow the order
+            if (not hasattr(config, 'multi_strategy') or 
+                not config.multi_strategy or 
+                not config.multi_strategy.allow_pyramiding):
+                # Check if there's already a position in the same direction
+                for pos in existing_positions:
+                    pos_side = pos.get('side')
+                    if ((side.lower() == 'buy' and pos_side == 'long') or
+                        (side.lower() == 'sell' and pos_side == 'short')):
+                        logger.warning(f"Pyramiding disabled: Position already exists in {side} direction")
+                        return False
+                return True
+            
+            # Count existing orders and positions in the same direction
+            same_direction_count = 0
+            
+            # Count positions
+            for pos in existing_positions:
+                pos_side = pos.get('side')
+                if ((side.lower() == 'buy' and pos_side == 'long') or
+                    (side.lower() == 'sell' and pos_side == 'short')):
+                    same_direction_count += 1
+            
+            # Count open orders
+            for order in existing_orders:
+                order_side = order.get('side')
+                if order_side and order_side.lower() == side.lower():
+                    same_direction_count += 1
+            
+            max_pyramiding = config.multi_strategy.max_pyramiding_orders
+            
+            if same_direction_count >= max_pyramiding:
+                logger.warning(f"Pyramiding limit reached: {same_direction_count}/{max_pyramiding} orders/positions in {side} direction")
+                return False
+            
+            logger.info(f"Pyramiding check passed: {same_direction_count}/{max_pyramiding} orders/positions in {side} direction")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error checking pyramiding limits: {e}")
+            return True  # Default to allowing the order 
+
+    def check_direction_conflict(self, requested_side: str, existing_positions: List[Dict[str, Any]], existing_orders: List[Dict[str, Any]]) -> Optional[str]:
+        """
+        Check if there's a direction conflict between requested order and existing positions/orders.
+        In one-way mode, we don't allow reversing the position direction.
+        
+        Args:
+            requested_side (str): Requested order side ('Buy' or 'Sell')
+            existing_positions (List[Dict[str, Any]]): Existing positions
+            existing_orders (List[Dict[str, Any]]): Existing orders
+        
+        Returns:
+            Optional[str]: The conflicting direction if found, None if no conflict
+        """
+        try:
+            requested_direction = 'long' if requested_side.lower() == 'buy' else 'short'
+            
+            # Check existing positions for opposite direction
+            for pos in existing_positions:
+                if pos.get('size', 0) != 0 or pos.get('contracts', 0) != 0:  # Active position
+                    pos_side = pos.get('side', '').lower()
+                    if pos_side:
+                        if requested_direction == 'long' and pos_side == 'short':
+                            logger.warning(f"Direction conflict: Requested {requested_direction} but existing {pos_side} position found")
+                            return 'short'
+                        elif requested_direction == 'short' and pos_side == 'long':
+                            logger.warning(f"Direction conflict: Requested {requested_direction} but existing {pos_side} position found")
+                            return 'long'
+            
+            # Check existing orders for opposite direction
+            for order in existing_orders:
+                order_side = order.get('side', '').lower()
+                if order_side:
+                    order_direction = 'long' if order_side == 'buy' else 'short'
+                    if requested_direction != order_direction:
+                        logger.warning(f"Direction conflict: Requested {requested_direction} but existing {order_direction} order found")
+                        return order_direction
+            
+            # No conflict found
+            logger.info(f"No direction conflict: Requested {requested_direction} direction is clear")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error checking direction conflict: {e}")
+            # In case of error, be conservative and assume conflict
+            return "unknown"
+    
+    async def check_priority_conflicts(self, symbol: str, requested_priority: int, requested_side: str) -> Dict[str, Any]:
+        """
+        Check for priority conflicts and determine what actions to take.
+        
+        Args:
+            symbol (str): Symbol to check
+            requested_priority (int): Priority of new signal (1 = high, 2 = low)
+            requested_side (str): Side of new signal ('Buy' or 'Sell')
+        
+        Returns:
+            Dict[str, Any]: Action plan with conflicts and orders to cancel
+        """
+        try:
+            logger.info(f"🎯 Checking priority conflicts for {symbol}: requested priority {requested_priority} ({requested_side})")
+            
+            # Get existing orders and positions
+            existing_orders = await self.get_existing_orders(symbol)
+            existing_positions = await self.get_existing_positions(symbol)
+            
+            conflict_info = {
+                'allow_order': True,
+                'orders_to_cancel': [],
+                'conflicts_found': [],
+                'reason': '',
+                'existing_priorities': {}
+            }
+            
+            # Analyze existing orders by priority
+            for order in existing_orders:
+                order_link_id = order.get('clientOrderId', order.get('info', {}).get('orderLinkId', ''))
+                order_side = order.get('side', '').title()
+                order_amount = order.get('amount', 0)
+                
+                # Extract priority from order ID (format: tv_timestamp_symbol_strategy or prio1_timestamp_symbol_strategy)
+                extracted_priority = self._extract_priority_from_order_id(order_link_id)
+                
+                logger.info(f"Existing order: {order_link_id} | Side: {order_side} | Amount: {order_amount} | Priority: {extracted_priority}")
+                
+                if extracted_priority not in conflict_info['existing_priorities']:
+                    conflict_info['existing_priorities'][extracted_priority] = []
+                
+                conflict_info['existing_priorities'][extracted_priority].append({
+                    'order_id': order.get('id'),
+                    'order_link_id': order_link_id,
+                    'side': order_side,
+                    'amount': order_amount,
+                    'order': order
+                })
+            
+            # Priority conflict resolution logic
+            if requested_priority == 1:
+                # Priority 1: Always executes, cancel any Priority 2 orders
+                if 2 in conflict_info['existing_priorities']:
+                    logger.warning(f"Priority 1 signal received - will cancel all Priority 2 orders for {symbol}")
+                    for p2_order in conflict_info['existing_priorities'][2]:
+                        conflict_info['orders_to_cancel'].append(p2_order)
+                        conflict_info['conflicts_found'].append(f"Priority 2 order {p2_order['order_link_id']} will be cancelled")
+                
+                # Also check for existing Priority 1 orders for direction conflicts or pyramiding
+                if 1 in conflict_info['existing_priorities']:
+                    same_direction_p1 = [o for o in conflict_info['existing_priorities'][1] if o['side'].lower() == requested_side.lower()]
+                    opposite_direction_p1 = [o for o in conflict_info['existing_priorities'][1] if o['side'].lower() != requested_side.lower()]
+                    
+                    if opposite_direction_p1:
+                        # Priority 1 wants opposite direction - cancel existing Priority 1 orders
+                        logger.warning(f"Priority 1 direction conflict: cancelling existing Priority 1 {opposite_direction_p1[0]['side']} orders")
+                        for p1_order in conflict_info['existing_priorities'][1]:
+                            conflict_info['orders_to_cancel'].append(p1_order)
+                            conflict_info['conflicts_found'].append(f"Priority 1 direction conflict - cancelling {p1_order['order_link_id']}")
+                    elif same_direction_p1:
+                        # Same direction Priority 1 - check pyramiding limits
+                        if len(same_direction_p1) >= config.multi_strategy.max_pyramiding_orders:
+                            conflict_info['allow_order'] = False
+                            conflict_info['reason'] = f"Priority 1 pyramiding limit reached: {len(same_direction_p1)}/{config.multi_strategy.max_pyramiding_orders}"
+                            logger.warning(conflict_info['reason'])
+                
+                conflict_info['reason'] = f"Priority 1 signal approved - cancelling {len(conflict_info['orders_to_cancel'])} lower priority orders"
+                
+            elif requested_priority == 2:
+                # Priority 2: Only execute if no Priority 1 exists
+                if 1 in conflict_info['existing_priorities']:
+                    conflict_info['allow_order'] = False
+                    conflict_info['reason'] = f"Priority 2 blocked: Priority 1 orders exist for {symbol}"
+                    logger.warning(conflict_info['reason'])
+                    for p1_order in conflict_info['existing_priorities'][1]:
+                        conflict_info['conflicts_found'].append(f"Blocked by Priority 1 order: {p1_order['order_link_id']}")
+                else:
+                    # No Priority 1, check Priority 2 pyramiding and direction conflicts
+                    if 2 in conflict_info['existing_priorities']:
+                        same_direction_p2 = [o for o in conflict_info['existing_priorities'][2] if o['side'].lower() == requested_side.lower()]
+                        opposite_direction_p2 = [o for o in conflict_info['existing_priorities'][2] if o['side'].lower() != requested_side.lower()]
+                        
+                        if opposite_direction_p2:
+                            conflict_info['allow_order'] = False
+                            conflict_info['reason'] = f"Priority 2 direction conflict: existing {opposite_direction_p2[0]['side']} orders prevent {requested_side}"
+                            logger.warning(conflict_info['reason'])
+                        elif len(same_direction_p2) >= config.multi_strategy.max_pyramiding_orders:
+                            conflict_info['allow_order'] = False
+                            conflict_info['reason'] = f"Priority 2 pyramiding limit reached: {len(same_direction_p2)}/{config.multi_strategy.max_pyramiding_orders}"
+                            logger.warning(conflict_info['reason'])
+                        else:
+                            conflict_info['reason'] = f"Priority 2 signal approved - no conflicts"
+                    else:
+                        conflict_info['reason'] = f"Priority 2 signal approved - no existing orders"
+            
+            # Check for active positions that might conflict (for direction changes)
+            if existing_positions and conflict_info['allow_order']:
+                for pos in existing_positions:
+                    pos_side = pos.get('side', '').lower()
+                    requested_direction = 'long' if requested_side.lower() == 'buy' else 'short'
+                    
+                    if pos_side and pos_side != requested_direction:
+                        if requested_priority == 1:
+                            logger.warning(f"Priority 1 signal will reverse position from {pos_side} to {requested_direction}")
+                            # Priority 1 can reverse positions
+                        else:
+                            # Priority 2 cannot reverse positions
+                            conflict_info['allow_order'] = False
+                            conflict_info['reason'] = f"Priority 2 cannot reverse position from {pos_side} to {requested_direction}"
+                            logger.warning(conflict_info['reason'])
+            
+            logger.info(f"Priority conflict resolution: {conflict_info['reason']}")
+            return conflict_info
+            
+        except Exception as e:
+            logger.error(f"Error checking priority conflicts: {e}")
+            return {
+                'allow_order': False,
+                'orders_to_cancel': [],
+                'conflicts_found': [f"Error checking conflicts: {str(e)}"],
+                'reason': f"Error in priority check: {str(e)}",
+                'existing_priorities': {}
+            }
+    
+    def _extract_priority_from_order_id(self, order_link_id: str) -> int:
+        """
+        Extract priority from order link ID.
+        
+        Args:
+            order_link_id (str): Order link ID
+        
+        Returns:
+            int: Extracted priority (1 or 2, defaults to 2)
+        """
+        try:
+            if not order_link_id:
+                return 2
+            
+            # Check for explicit priority prefixes
+            if order_link_id.startswith('prio1_') or order_link_id.startswith('p1_'):
+                return 1
+            elif order_link_id.startswith('prio2_') or order_link_id.startswith('p2_'):
+                return 2
+            elif order_link_id.startswith('tv_'):
+                # Default TradingView orders are priority 2 unless specified
+                return 2
+            else:
+                # Unknown format, assume priority 2
+                return 2
+                
+        except Exception as e:
+            logger.warning(f"Error extracting priority from order ID '{order_link_id}': {e}")
+            return 2
+    
+    async def cancel_orders_by_priority(self, orders_to_cancel: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Cancel a list of orders.
+        
+        Args:
+            orders_to_cancel (List[Dict[str, Any]]): List of order info dicts to cancel
+        
+        Returns:
+            Dict[str, Any]: Results of cancellation attempts
+        """
+        try:
+            results = {
+                'cancelled_orders': [],
+                'failed_cancellations': [],
+                'total_attempted': len(orders_to_cancel)
+            }
+            
+            if not orders_to_cancel:
+                return results
+            
+            logger.info(f"🗑️ Cancelling {len(orders_to_cancel)} lower priority orders...")
+            
+            for order_info in orders_to_cancel:
+                try:
+                    order_id = order_info['order_id']
+                    order_link_id = order_info['order_link_id']
+                    symbol = order_info['order'].get('symbol', 'Unknown')
+                    
+                    logger.info(f"Cancelling order: {order_link_id} (ID: {order_id})")
+                    
+                    # Cancel the order
+                    cancel_result = self.exchange.cancel_order(order_id, symbol)
+                    
+                    results['cancelled_orders'].append({
+                        'order_id': order_id,
+                        'order_link_id': order_link_id,
+                        'symbol': symbol,
+                        'cancel_result': cancel_result
+                    })
+                    
+                    logger.info(f"✅ Cancelled order: {order_link_id}")
+                    
+                except Exception as cancel_error:
+                    error_msg = f"Failed to cancel order {order_info.get('order_link_id', 'Unknown')}: {str(cancel_error)}"
+                    logger.error(error_msg)
+                    results['failed_cancellations'].append({
+                        'order_info': order_info,
+                        'error': error_msg
+                    })
+            
+            success_count = len(results['cancelled_orders'])
+            total_count = len(orders_to_cancel)
+            
+            if success_count == total_count:
+                logger.info(f"✅ Successfully cancelled all {success_count}/{total_count} orders")
+            else:
+                logger.warning(f"⚠️ Cancelled {success_count}/{total_count} orders, {len(results['failed_cancellations'])} failed")
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"Error in bulk order cancellation: {e}")
+            return {
+                'cancelled_orders': [],
+                'failed_cancellations': [{'error': f"Bulk cancellation error: {str(e)}"}],
+                'total_attempted': len(orders_to_cancel)
+            } 

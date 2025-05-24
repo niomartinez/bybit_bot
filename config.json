@@ -13,6 +13,31 @@
     "var_value": 1.0,
     "portfolio_currency": "USDT"
   },
+  "multi_strategy": {
+    "enabled": true,
+    "hedge_mode": false,
+    "auto_switch_to_hedge": false,
+    "max_strategies_per_symbol": 5,
+    "allow_pyramiding": true,
+    "max_pyramiding_orders": 3,
+    "strategy_configs": {
+      "default": {
+        "var_multiplier": 1.0,
+        "max_leverage_override": null,
+        "enabled": true
+      },
+      "ict_strategy_a": {
+        "var_multiplier": 1.0,
+        "max_leverage_override": null,
+        "enabled": true
+      },
+      "ict_strategy_b": {
+        "var_multiplier": 0.8,
+        "max_leverage_override": 50,
+        "enabled": true
+      }
+    }
+  },
   "logging": {
     "level": "INFO",
     "file": "logs/trading_bot.log",

@@ -6,7 +6,7 @@ import math
 import traceback
 from decimal import Decimal, ROUND_DOWN
 from typing import Dict, Any, Optional, Tuple
-from src.models import TradingViewSignal
+from src.models import TradingViewSignal, StrategyConfig
 from src.bybit_service import BybitService
 from src.config import config, logger
 
@@ -33,6 +33,22 @@ class SignalProcessor:
         try:
             logger.info(f"Processing signal: {signal.model_dump_json()}")
             
+            # Extract strategy ID and validate if multi-strategy is enabled
+            strategy_id = signal.strategy_id or "default"
+            logger.info(f"Processing signal for strategy: {strategy_id}")
+            
+            # Check if strategy is enabled
+            if hasattr(config, 'multi_strategy') and config.multi_strategy and config.multi_strategy.enabled:
+                strategy_config = self._get_strategy_config(strategy_id)
+                if not strategy_config.enabled:
+                    logger.warning(f"Strategy {strategy_id} is disabled, skipping signal")
+                    return {
+                        "success": False,
+                        "message": f"Strategy {strategy_id} is disabled",
+                        "error": "strategy_disabled",
+                        "strategy_id": strategy_id
+                    }
+            
             # Step 1: Normalize the symbol (remove .P suffix if present)
             symbol = self.bybit_service.normalize_symbol(signal.symbol)
             logger.info(f"Normalized symbol: {symbol}")
@@ -45,15 +61,22 @@ class SignalProcessor:
             # Log key instrument info
             self._log_instrument_info(symbol, instrument_info)
             
-            # Step 3: Determine max leverage
+            # Step 3: Determine max leverage (with strategy-specific override)
             max_leverage = self._get_max_leverage(instrument_info)
+            
+            # Apply strategy-specific leverage override
+            if hasattr(config, 'multi_strategy') and config.multi_strategy and config.multi_strategy.enabled:
+                strategy_config = self._get_strategy_config(strategy_id)
+                if strategy_config.max_leverage_override:
+                    max_leverage = min(max_leverage, strategy_config.max_leverage_override)
+                    logger.info(f"Applied strategy {strategy_id} leverage override: {max_leverage}x")
             
             # Step 4: Apply leverage cap from config if needed
             if (config.bybit_api.max_leverage_cap is not None and 
                 config.bybit_api.max_leverage_cap > 0 and 
                 config.bybit_api.max_leverage_cap < max_leverage):
                 max_leverage = config.bybit_api.max_leverage_cap
-                logger.info(f"Applied leverage cap: {max_leverage}x")
+                logger.info(f"Applied global leverage cap: {max_leverage}x")
             
             # Step 5: Set leverage for the symbol if it's a leveraged market
             if market_type in ['linear', 'inverse', 'swap', 'future']:
@@ -66,37 +89,98 @@ class SignalProcessor:
             else:
                 logger.info(f"Skipping leverage setting for {symbol} as it's a {market_type} market")
             
-            # Step 6: Calculate VaR (Value at Risk)
-            var_amount = await self._calculate_var()
-            logger.info(f"Calculated VaR amount: {var_amount} USDT")
+            # Step 6: Calculate VaR (Value at Risk) with strategy-specific multiplier
+            var_amount = await self._calculate_var(strategy_id)
+            logger.info(f"Calculated VaR amount for strategy {strategy_id}: {var_amount} USDT")
             
-            # Step 7: Calculate order quantity
-            quantity, min_qty, qty_step = await self._calculate_quantity(
-                symbol=symbol,
-                instrument_info=instrument_info,
-                entry_price=signal.entry,
-                stop_loss=signal.stop_loss,
-                var_amount=var_amount,
-                max_leverage=max_leverage
-            )
-            logger.info(f"Calculated order quantity: {quantity} (min: {min_qty}, step: {qty_step})")
+            # Step 7: Calculate order quantity (or use override if provided)
+            if signal.quantity is not None:
+                quantity = signal.quantity
+                logger.info(f"Using override quantity from signal: {quantity}")
+                # Still get min_qty and qty_step for validation
+                _, min_qty, qty_step = await self._calculate_quantity(
+                    symbol=symbol,
+                    instrument_info=instrument_info,
+                    entry_price=signal.entry,
+                    stop_loss=signal.stop_loss,
+                    var_amount=var_amount,
+                    max_leverage=max_leverage
+                )
+            else:
+                quantity, min_qty, qty_step = await self._calculate_quantity(
+                    symbol=symbol,
+                    instrument_info=instrument_info,
+                    entry_price=signal.entry,
+                    stop_loss=signal.stop_loss,
+                    var_amount=var_amount,
+                    max_leverage=max_leverage
+                )
+                logger.info(f"Calculated order quantity: {quantity} (min: {min_qty}, step: {qty_step})")
             
             # Step 8: Convert signal side ("long", "short") to Bybit API side ("Buy", "Sell")
             order_side = "Buy" if signal.side == "long" else "Sell"
             
-            # Step 9: Place the limit order with SL/TP
+            # Step 9: Check for priority conflicts and handle order cancellations
+            logger.info(f"🎯 Checking priority conflicts for {symbol} (Priority: {signal.priority}, Side: {order_side})")
+            
+            conflict_check = await self.bybit_service.check_priority_conflicts(
+                symbol=symbol,
+                requested_priority=signal.priority,
+                requested_side=order_side
+            )
+            
+            if not conflict_check['allow_order']:
+                logger.warning(f"Order blocked due to priority conflict: {conflict_check['reason']}")
+                return {
+                    "success": False,
+                    "message": f"Order blocked: {conflict_check['reason']}",
+                    "error": "priority_conflict",
+                    "symbol": symbol,
+                    "side": order_side,
+                    "priority": signal.priority,
+                    "conflicts": conflict_check['conflicts_found'],
+                    "strategy_id": strategy_id
+                }
+            
+            # Cancel lower priority orders if needed
+            if conflict_check['orders_to_cancel']:
+                logger.info(f"🗑️ Cancelling {len(conflict_check['orders_to_cancel'])} conflicting orders before placing new order")
+                cancellation_result = await self.bybit_service.cancel_orders_by_priority(conflict_check['orders_to_cancel'])
+                
+                success_count = len(cancellation_result['cancelled_orders'])
+                total_count = cancellation_result['total_attempted']
+                
+                if success_count < total_count:
+                    logger.warning(f"Only cancelled {success_count}/{total_count} orders. Proceeding anyway.")
+                else:
+                    logger.info(f"✅ Successfully cancelled all {success_count} conflicting orders")
+            
+            # Step 10: Handle special order types
+            if signal.reduce_only:
+                logger.info(f"Processing reduce-only order for {symbol}")
+                # For reduce-only orders, we might need different logic
+                # This could be implemented later for partial TP/SL functionality
+            
+            if signal.close_position:
+                logger.info(f"Processing close position order for {symbol}")
+                # For closing positions, we might want to close specific strategy positions
+                # This could be implemented later for strategy-specific position closure
+            
+            # Step 11: Place the limit order with SL/TP and strategy ID
             order_result = await self.bybit_service.place_limit_order(
                 symbol=symbol,
                 side=order_side,
                 qty=quantity,
                 price=signal.entry,
                 sl=signal.stop_loss,
-                tp=signal.take_profit
+                tp=signal.take_profit,
+                strategy_id=strategy_id,
+                priority=signal.priority
             )
             
             # Check if order placement was successful
             if order_result.get('success', False):
-                logger.info(f"Order placed successfully: {order_result}")
+                logger.info(f"Order placed successfully for strategy {strategy_id}: {order_result}")
                 return {
                     "success": True,
                     "message": "Order placed successfully",
@@ -107,11 +191,14 @@ class SignalProcessor:
                     "entry": signal.entry,
                     "stop_loss": signal.stop_loss,
                     "take_profit": signal.take_profit,
-                    "risk_amount": var_amount
+                    "risk_amount": var_amount,
+                    "strategy_id": strategy_id,
+                    "priority": signal.priority,
+                    "position_idx": order_result.get('position_idx', 0)
                 }
             else:
                 # Order placement failed but handled gracefully
-                logger.warning(f"Order placement failed: {order_result.get('message', 'Unknown error')}")
+                logger.warning(f"Order placement failed for strategy {strategy_id}: {order_result.get('message', 'Unknown error')}")
                 return {
                     "success": False,
                     "message": f"Order placement failed: {order_result.get('message', 'Unknown error')}",
@@ -123,12 +210,14 @@ class SignalProcessor:
                     "entry": signal.entry,
                     "stop_loss": signal.stop_loss,
                     "take_profit": signal.take_profit,
-                    "risk_amount": var_amount
+                    "risk_amount": var_amount,
+                    "strategy_id": strategy_id,
+                    "priority": signal.priority
                 }
         
         except Exception as e:
             stack_trace = traceback.format_exc()
-            logger.error(f"Error processing signal: {e}\n{stack_trace}")
+            logger.error(f"Error processing signal for strategy {signal.strategy_id or 'default'}: {e}\n{stack_trace}")
             return {
                 "success": False,
                 "message": f"Error processing signal: {str(e)}",
@@ -137,7 +226,9 @@ class SignalProcessor:
                 "side": signal.side,
                 "entry": signal.entry,
                 "stop_loss": signal.stop_loss,
-                "take_profit": signal.take_profit
+                "take_profit": signal.take_profit,
+                "strategy_id": signal.strategy_id or "default",
+                "priority": getattr(signal, 'priority', 2)
             }
     
     def _log_instrument_info(self, symbol: str, instrument_info: Dict[str, Any]) -> None:
@@ -273,9 +364,12 @@ class SignalProcessor:
             logger.info(f"Using default leverage due to error: {default_leverage}x")
             return default_leverage
     
-    async def _calculate_var(self) -> float:
+    async def _calculate_var(self, strategy_id: str) -> float:
         """
-        Calculate the Value at Risk (VaR) amount based on configuration.
+        Calculate the Value at Risk (VaR) amount based on configuration and strategy-specific multiplier.
+        
+        Args:
+            strategy_id (str): Strategy identifier for strategy-specific VaR calculation
         
         Returns:
             float: VaR amount in USDT
@@ -283,21 +377,31 @@ class SignalProcessor:
         var_type = config.risk_management.var_type
         var_value = config.risk_management.var_value
         
+        # Get strategy-specific multiplier
+        var_multiplier = 1.0
+        if hasattr(config, 'multi_strategy') and config.multi_strategy and config.multi_strategy.enabled:
+            strategy_config = self._get_strategy_config(strategy_id)
+            var_multiplier = strategy_config.var_multiplier
+            logger.info(f"Using VaR multiplier for strategy {strategy_id}: {var_multiplier}x")
+        
         if var_type == "fixed_amount":
-            logger.info(f"Using fixed amount VaR: {var_value} USDT")
-            return var_value
+            base_var = var_value
+            final_var = base_var * var_multiplier
+            logger.info(f"Using fixed amount VaR: {base_var} × {var_multiplier} = {final_var} USDT")
+            return final_var
         
         elif var_type == "portfolio_percentage":
             # Get the USDT balance
             balance = await self.bybit_service.get_usdt_balance()
             
-            # Calculate the VaR amount as a percentage of the balance
-            var_amount = balance * var_value
+            # Calculate the base VaR amount as a percentage of the balance
+            base_var = balance * var_value
+            final_var = base_var * var_multiplier
             
             # Log the calculation
-            logger.info(f"Calculated VaR as {var_value * 100}% of {balance} USDT = {var_amount} USDT")
+            logger.info(f"Calculated VaR as {var_value * 100}% of {balance} USDT × {var_multiplier} = {final_var} USDT")
             
-            return var_amount
+            return final_var
         
         else:
             # This shouldn't happen due to Pydantic validation, but just in case
@@ -652,4 +756,36 @@ class SignalProcessor:
         
         except Exception as e:
             logger.error(f"Error checking if market requires whole numbers: {e}")
-            return False 
+            return False
+    
+    def _get_strategy_config(self, strategy_id: str):
+        """
+        Get configuration for a specific strategy.
+        
+        Args:
+            strategy_id (str): Strategy identifier
+        
+        Returns:
+            StrategyConfig: Strategy configuration
+        """
+        try:
+            if (hasattr(config, 'multi_strategy') and 
+                config.multi_strategy and 
+                config.multi_strategy.strategy_configs):
+                
+                # Try to get specific strategy config
+                if strategy_id in config.multi_strategy.strategy_configs:
+                    return config.multi_strategy.strategy_configs[strategy_id]
+                
+                # Fall back to default strategy config
+                if 'default' in config.multi_strategy.strategy_configs:
+                    logger.info(f"Strategy {strategy_id} not found, using default config")
+                    return config.multi_strategy.strategy_configs['default']
+            
+            # If no multi-strategy config, create default
+            logger.info(f"No strategy config found for {strategy_id}, using defaults")
+            return StrategyConfig()
+            
+        except Exception as e:
+            logger.error(f"Error getting strategy config for {strategy_id}: {e}")
+            return StrategyConfig() 

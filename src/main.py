@@ -144,14 +144,17 @@ async def process_signal_task(signal_processor: SignalProcessor, signal: Trading
         signal (TradingViewSignal): The signal to process
     """
     try:
-        logger.info(f"Processing signal in background task: {signal.symbol} {signal.side}")
+        strategy_id = signal.strategy_id or "default"
+        logger.info(f"Processing signal in background task: {signal.symbol} {signal.side} (strategy: {strategy_id})")
         
         result = await signal_processor.process_signal(signal)
         
         if result.get("success"):
-            logger.info(f"Signal processing completed successfully: {signal.symbol} {signal.side}")
+            position_idx = result.get("position_idx", 0)
+            position_mode = "one-way" if position_idx == 0 else ("buy hedge" if position_idx == 1 else "sell hedge")
+            logger.info(f"Signal processing completed successfully: {signal.symbol} {signal.side} (strategy: {strategy_id}, mode: one-way)")
         else:
-            logger.warning(f"Signal processing failed: {signal.symbol} {signal.side} - {result.get('message')}")
+            logger.warning(f"Signal processing failed: {signal.symbol} {signal.side} (strategy: {strategy_id}) - {result.get('message')}")
             
         logger.info(f"Signal processing result: {result}")
     except Exception as e:
@@ -254,6 +257,7 @@ async def webhook_tradingview(
                 "message": "Signal received and processing started",
                 "symbol": signal.symbol,
                 "side": signal.side,
+                "strategy_id": signal.strategy_id or "default",
                 "processing": "async",
                 "response_time_ms": round(response_time, 2)
             }
@@ -306,6 +310,7 @@ async def webhook_test(
                 "message": "Test signal received and processing started",
                 "symbol": signal.symbol,
                 "side": signal.side,
+                "strategy_id": signal.strategy_id or "default",
                 "processing": "async",
                 "response_time_ms": round(response_time, 2)
             }
