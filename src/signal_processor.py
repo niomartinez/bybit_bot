@@ -204,50 +204,73 @@ class SignalProcessor:
         Returns:
             int: Maximum leverage
         """
-        # Default to a conservative value if not found
-        default_leverage = 1
+        # Set reasonable defaults based on market type
+        market_type = instrument_info.get('market_type', '')
+        if market_type == 'spot':
+            logger.info(f"Market type is spot, using leverage: 1x")
+            return 1
+        elif market_type in ['linear', 'inverse', 'swap', 'future']:
+            # Use a more reasonable default for perpetual futures
+            default_leverage = 10  # Conservative but reasonable for most perpetuals
+        else:
+            default_leverage = 1
         
         try:
-            # Check if it's a spot market
-            market_type = instrument_info.get('market_type', '')
-            if market_type == 'spot':
-                logger.info(f"Market type is spot, using default leverage: {default_leverage}x")
-                return default_leverage
-            
-            # Try various paths to get leverage info based on Bybit's API structure
-            
-            # First, check if limits.leverage.max exists in the standardized CCXT format
+            # First, check if we successfully fetched leverage from Bybit V5 API
             if ('limits' in instrument_info and 
                 'leverage' in instrument_info['limits'] and 
-                instrument_info['limits']['leverage']['max'] is not None):
+                instrument_info['limits']['leverage'].get('max') is not None):
                 max_lev = int(instrument_info['limits']['leverage']['max'])
                 logger.info(f"Found max leverage in limits.leverage.max: {max_lev}x")
                 return max_lev
+            
+            # Try Bybit-specific leverageFilter in the raw API response
+            if ('info' in instrument_info and 
+                isinstance(instrument_info['info'], dict) and 
+                'leverageFilter' in instrument_info['info']):
+                leverage_filter = instrument_info['info']['leverageFilter']
+                if isinstance(leverage_filter, dict) and 'maxLeverage' in leverage_filter:
+                    max_lev_str = leverage_filter['maxLeverage']
+                    if max_lev_str and max_lev_str != '0':
+                        max_lev = int(float(max_lev_str))
+                        logger.info(f"Found max leverage in info.leverageFilter.maxLeverage: {max_lev}x")
+                        return max_lev
             
             # Try direct leverage field in the raw API response
             if ('info' in instrument_info and 
                 isinstance(instrument_info['info'], dict) and 
                 'leverage' in instrument_info['info']):
-                max_lev = int(instrument_info['info']['leverage'])
-                logger.info(f"Found max leverage in info.leverage: {max_lev}x")
-                return max_lev
+                leverage_value = instrument_info['info']['leverage']
+                if leverage_value and str(leverage_value) != '0':
+                    max_lev = int(float(leverage_value))
+                    logger.info(f"Found max leverage in info.leverage: {max_lev}x")
+                    return max_lev
             
-            # Try leverageFilter.maxLeverage field in the raw API response
-            if ('info' in instrument_info and 
-                isinstance(instrument_info['info'], dict) and 
-                'leverageFilter' in instrument_info['info'] and
-                isinstance(instrument_info['info']['leverageFilter'], dict) and
-                'maxLeverage' in instrument_info['info']['leverageFilter']):
-                max_lev = int(instrument_info['info']['leverageFilter']['maxLeverage'])
-                logger.info(f"Found max leverage in info.leverageFilter.maxLeverage: {max_lev}x")
-                return max_lev
+            # Check CCXT standardized leverage limits
+            if ('limits' in instrument_info and 
+                'leverage' in instrument_info['limits'] and 
+                instrument_info['limits']['leverage'] is not None):
+                leverage_limits = instrument_info['limits']['leverage']
+                if isinstance(leverage_limits, dict) and 'max' in leverage_limits:
+                    max_lev_value = leverage_limits['max']
+                    if max_lev_value is not None and max_lev_value > 0:
+                        max_lev = int(max_lev_value)
+                        logger.info(f"Found max leverage in CCXT limits: {max_lev}x")
+                        return max_lev
             
-            # If all else fails, use the default
-            logger.warning(f"Could not find max leverage in instrument info. Using default: {default_leverage}x")
+            # For linear perpetuals, try to infer from symbol patterns
+            if market_type == 'linear':
+                # Most USDT perpetuals on Bybit have decent leverage
+                logger.info(f"Linear perpetual detected, using reasonable default leverage: {default_leverage}x")
+                return default_leverage
+            
+            # If all else fails, use the default based on market type
+            logger.warning(f"Could not find max leverage in instrument info for {market_type} market. Using default: {default_leverage}x")
             return default_leverage
         
         except Exception as e:
             logger.error(f"Error extracting max leverage: {e}")
+            logger.info(f"Using default leverage due to error: {default_leverage}x")
             return default_leverage
     
     async def _calculate_var(self) -> float:
@@ -327,21 +350,29 @@ class SignalProcessor:
                 logger.info(f"Price difference: {price_difference} ({entry_price} - {stop_loss})")
                 
                 # Calculate raw quantity based on VaR and price difference
-                # For linear futures (like BTCUSDT), qty is in base currency (BTC)
-                # VaR = qty * price_difference
-                # qty = VaR / price_difference
-                raw_qty = (var_amount * max_leverage) / price_difference
+                # VaR-based position sizing: risk per contract = price_difference
+                # Maximum quantity = VaR / risk_per_contract
+                raw_qty = var_amount / price_difference
                 
-                logger.info(f"Raw quantity calculation: {var_amount} × {max_leverage} ÷ {price_difference} = {raw_qty}")
+                logger.info(f"Raw quantity calculation: {var_amount} ÷ {price_difference} = {raw_qty}")
+                
+                # Calculate the notional value and required margin
+                notional_value = raw_qty * entry_price
+                required_margin = notional_value / max_leverage
+                
+                logger.info(f"Notional value: {raw_qty} × {entry_price} = {notional_value} USDT")
+                logger.info(f"Required margin with {max_leverage}x leverage: {notional_value} ÷ {max_leverage} = {required_margin} USDT")
                 
                 # Check for minimum notional value requirements
                 min_order_value = self._get_min_notional_value(instrument_info)
-                order_value = raw_qty * entry_price
                 
-                if min_order_value > 0 and order_value < min_order_value:
-                    logger.warning(f"Order value ({order_value}) is below minimum ({min_order_value}). Adjusting quantity.")
+                if min_order_value > 0 and notional_value < min_order_value:
+                    logger.warning(f"Order notional value ({notional_value}) is below minimum ({min_order_value}). Adjusting quantity.")
                     # Adjust raw quantity to meet minimum notional value
                     raw_qty = (min_order_value / entry_price) * 1.01  # Add 1% buffer
+                    notional_value = raw_qty * entry_price
+                    required_margin = notional_value / max_leverage
+                    logger.info(f"Adjusted quantity to meet minimum notional: {raw_qty} (notional: {notional_value}, margin: {required_margin})")
             else:
                 # For spot markets (no leverage)
                 logger.info("Using spot calculation (no leverage)")
@@ -353,6 +384,40 @@ class SignalProcessor:
                 logger.info(f"Raw spot quantity calculation: {var_amount} ÷ {entry_price} = {raw_qty}")
             
             logger.info(f"Raw quantity: {raw_qty}, Qty step: {qty_step}, Min qty: {min_qty}")
+            
+            # For leveraged markets, check if we have sufficient margin
+            if market_type in ['linear', 'inverse', 'swap', 'future']:
+                # Get available balance to check margin requirements
+                try:
+                    available_balance = await self.bybit_service.get_usdt_balance()
+                    notional_value = raw_qty * entry_price
+                    required_margin = notional_value / max_leverage
+                    
+                    logger.info(f"Balance check: Available={available_balance} USDT, Required margin={required_margin} USDT")
+                    
+                    if required_margin > available_balance:
+                        # Calculate maximum possible quantity with available balance
+                        max_possible_notional = available_balance * max_leverage * 0.95  # Use 95% of available balance for safety
+                        max_possible_qty = max_possible_notional / entry_price
+                        max_var_with_balance = max_possible_qty * price_difference
+                        
+                        logger.warning(f"Insufficient margin! Required: {required_margin} USDT, Available: {available_balance} USDT")
+                        logger.info(f"Maximum possible VaR with current balance: {max_var_with_balance} USDT")
+                        logger.info(f"Maximum possible quantity: {max_possible_qty} contracts")
+                        
+                        # Auto-adjust the quantity to fit available balance
+                        if max_possible_qty >= min_qty:
+                            logger.info(f"Auto-adjusting quantity from {raw_qty} to {max_possible_qty} to fit available balance")
+                            raw_qty = max_possible_qty
+                            # Recalculate margins with adjusted quantity
+                            notional_value = raw_qty * entry_price
+                            required_margin = notional_value / max_leverage
+                            logger.info(f"Adjusted position: Quantity={raw_qty}, Notional={notional_value} USDT, Margin={required_margin} USDT")
+                        else:
+                            logger.error(f"Even minimum quantity ({min_qty}) would require more margin than available")
+                            # We'll proceed and let the exchange reject it with a clear error
+                except Exception as balance_error:
+                    logger.warning(f"Could not check balance for margin validation: {balance_error}")
             
             # Check if this market requires whole numbers
             requires_whole_numbers = self._check_if_requires_whole_numbers(instrument_info)
