@@ -245,10 +245,10 @@ if bearish_fvg_detected
     array.push(untapped_fvgs, new_fvg)
 
 // Dynamic FVG Drawing using the library (like ICT 2022 Mentorship)
-if bar_index - BarDFVG < 500 and DConditionFVG
+if bar_index - BarDFVG < 500 and DConditionFVG and sessionActive
     Drawing.OBDrawing('Demand', DConditionFVG, DDFVG, DPFVG, BarDFVG, true, FVG_Length, MLFVG, MLFVG, true, false, DFVGShow, false, cBullFVG, #ffffff00)
 
-if bar_index - BarSFVG < 500 and SConditionFVG  
+if bar_index - BarSFVG < 500 and SConditionFVG and sessionActive  
     Drawing.OBDrawing('Supply', SConditionFVG, SDFVG, SPFVG, BarSFVG, true, FVG_Length, MLFVG, MLFVG, true, false, SFVGShow, false, cBearFVG, #ffffff00)
 
 //================ HELPER FUNCTIONS ================
