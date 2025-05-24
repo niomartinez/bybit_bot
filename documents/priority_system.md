@@ -20,6 +20,7 @@ The system supports priority levels (expandable but currently configured for 2 l
 ### Priority 1 (High Priority)
 - ✅ **Always executes** regardless of existing orders
 - ✅ **Cancels all Priority 2 orders** for the same symbol before execution
+- ✅ **Closes all Priority 2 positions** for the same symbol before execution
 - ✅ **Can reverse positions** (change from long to short or vice versa)
 - ✅ **Follows pyramiding limits** with other Priority 1 orders (max 3 same-direction orders)
 - ✅ **Cancels conflicting Priority 1 orders** when changing direction
@@ -77,10 +78,11 @@ Examples:
 
 ### When Priority 1 Signal Arrives:
 1. **Check existing Priority 2 orders** → Cancel all Priority 2 orders for symbol
-2. **Check existing Priority 1 orders**:
+2. **Check existing Priority 2 positions** → Close all Priority 2 positions for symbol
+3. **Check existing Priority 1 orders**:
    - Same direction → Check pyramiding limits (max 3)
    - Opposite direction → Cancel all existing Priority 1 orders
-3. **Execute order** with attached SL/TP
+4. **Execute order** with attached SL/TP
 
 ### When Priority 2 Signal Arrives:
 1. **Check for Priority 1 orders** → Block execution if any exist
@@ -155,9 +157,10 @@ Multiple Priority 2 signals in the same direction (up to 3) will be allowed:
 
 1. **Simplified SL/TP**: Uses standard Bybit attached SL/TP instead of complex separate orders
 2. **Clear Priority Hierarchy**: Priority 1 always wins, Priority 2 follows rules
-3. **Position Protection**: Prevents unwanted position reversals for lower priority signals
-4. **Pyramiding Control**: Allows controlled scaling into positions
-5. **Reliable Execution**: No timing issues with order filling before SL/TP creation
+3. **Complete Position Control**: Priority 1 can both cancel orders AND close positions
+4. **Position Protection**: Prevents unwanted position reversals for lower priority signals
+5. **Pyramiding Control**: Allows controlled scaling into positions
+6. **Reliable Execution**: No timing issues with order filling before SL/TP creation
 
 ## Migration Notes
 

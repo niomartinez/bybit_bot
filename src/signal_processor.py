@@ -155,6 +155,19 @@ class SignalProcessor:
                 else:
                     logger.info(f"✅ Successfully cancelled all {success_count} conflicting orders")
             
+            # Close lower priority positions if needed (Priority 1 override)
+            if conflict_check['positions_to_close']:
+                logger.info(f"🔄 Closing {len(conflict_check['positions_to_close'])} Priority 2 positions for Priority 1 override")
+                closure_result = await self.bybit_service.close_all_positions(symbol, f"Priority {signal.priority} override")
+                
+                closed_count = len(closure_result['closed_positions'])
+                total_positions = closure_result['total_attempted']
+                
+                if closed_count < total_positions:
+                    logger.warning(f"Only closed {closed_count}/{total_positions} positions. Proceeding anyway.")
+                else:
+                    logger.info(f"✅ Successfully closed all {closed_count} Priority 2 positions")
+            
             # Step 10: Handle special order types
             if signal.reduce_only:
                 logger.info(f"Processing reduce-only order for {symbol}")

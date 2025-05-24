@@ -1053,13 +1053,58 @@ class BybitService:
             # Use CCXT to fetch positions
             positions = self.exchange.fetch_positions([market_id])
             
-            # Filter for positions with non-zero size
-            active_positions = [
-                pos for pos in positions 
-                if pos.get('size', 0) != 0 and pos.get('contracts', 0) != 0
-            ]
+            # Log all positions for debugging
+            logger.info(f"Raw positions response for {symbol} ({market_id}): {len(positions)} total")
             
-            logger.info(f"Found {len(active_positions)} active positions for {symbol}")
+            active_positions = []
+            
+            for pos in positions:
+                pos_symbol = pos.get('symbol', '')
+                pos_size = pos.get('size', 0)
+                pos_contracts = pos.get('contracts', 0)  
+                pos_side = pos.get('side', '')
+                pos_info = pos.get('info', {})
+                
+                # Log each position for debugging
+                logger.info(f"Position check - Symbol: {pos_symbol}, Size: {pos_size}, Contracts: {pos_contracts}, Side: {pos_side}")
+                
+                # Check multiple ways to determine if position is active
+                is_active = False
+                
+                # Method 1: Check size
+                if pos_size != 0:
+                    is_active = True
+                    logger.info(f"Position is active via size: {pos_size}")
+                
+                # Method 2: Check contracts
+                if pos_contracts != 0:
+                    is_active = True
+                    logger.info(f"Position is active via contracts: {pos_contracts}")
+                
+                # Method 3: Check raw info from Bybit API
+                if pos_info:
+                    raw_size = pos_info.get('size', '0')
+                    raw_side = pos_info.get('side', '')
+                    
+                    # Bybit sometimes returns string values
+                    try:
+                        if float(raw_size) != 0:
+                            is_active = True
+                            logger.info(f"Position is active via raw info size: {raw_size}")
+                    except (ValueError, TypeError):
+                        pass
+                    
+                    # Check if side is not 'None' or empty
+                    if raw_side and raw_side.lower() not in ['none', '']:
+                        logger.info(f"Position has side in raw info: {raw_side}")
+                
+                if is_active:
+                    active_positions.append(pos)
+                    logger.info(f"✅ Added active position: {pos_side} {pos_size} contracts for {pos_symbol}")
+                else:
+                    logger.info(f"❌ Skipped inactive position for {pos_symbol}")
+            
+            logger.info(f"Found {len(active_positions)} active positions for {symbol} out of {len(positions)} total")
             return active_positions
             
         except Exception as e:
@@ -1243,6 +1288,7 @@ class BybitService:
             conflict_info = {
                 'allow_order': True,
                 'orders_to_cancel': [],
+                'positions_to_close': [],
                 'conflicts_found': [],
                 'reason': '',
                 'existing_priorities': {}
@@ -1270,14 +1316,47 @@ class BybitService:
                     'order': order
                 })
             
+            # Analyze existing positions and determine if they need to be closed
+            active_positions = []
+            for position in existing_positions:
+                pos_size = position.get('size', 0)
+                pos_contracts = position.get('contracts', 0)
+                pos_side = position.get('side', '').lower()
+                
+                if pos_size != 0 or pos_contracts != 0:  # Active position
+                    # For now, assume all positions are Priority 2 unless we implement position tracking by priority
+                    # This could be enhanced later by tracking position creation with order IDs
+                    position_priority = 2  # Default assumption for existing positions
+                    
+                    active_positions.append({
+                        'side': pos_side,
+                        'size': pos_size,
+                        'contracts': pos_contracts,
+                        'priority': position_priority,
+                        'position': position
+                    })
+                    
+                    logger.info(f"Active position: {pos_side} | Size: {pos_size} | Contracts: {pos_contracts} | Assumed Priority: {position_priority}")
+            
             # Priority conflict resolution logic
             if requested_priority == 1:
-                # Priority 1: Always executes, cancel any Priority 2 orders
+                # Priority 1: Always executes, cancel any Priority 2 orders and close Priority 2 positions
                 if 2 in conflict_info['existing_priorities']:
                     logger.warning(f"Priority 1 signal received - will cancel all Priority 2 orders for {symbol}")
                     for p2_order in conflict_info['existing_priorities'][2]:
                         conflict_info['orders_to_cancel'].append(p2_order)
                         conflict_info['conflicts_found'].append(f"Priority 2 order {p2_order['order_link_id']} will be cancelled")
+                
+                # Close any active Priority 2 positions 
+                requested_direction = 'long' if requested_side.lower() == 'buy' else 'short'
+                for pos in active_positions:
+                    if pos['priority'] == 2:  # Priority 2 position
+                        # Close regardless of direction to allow Priority 1 full control
+                        conflict_info['positions_to_close'].append(pos)
+                        if pos['side'] != requested_direction:
+                            conflict_info['conflicts_found'].append(f"Priority 2 {pos['side']} position will be closed for direction change")
+                        else:
+                            conflict_info['conflicts_found'].append(f"Priority 2 {pos['side']} position will be closed for Priority 1 override")
                 
                 # Also check for existing Priority 1 orders for direction conflicts or pyramiding
                 if 1 in conflict_info['existing_priorities']:
@@ -1297,7 +1376,10 @@ class BybitService:
                             conflict_info['reason'] = f"Priority 1 pyramiding limit reached: {len(same_direction_p1)}/{config.multi_strategy.max_pyramiding_orders}"
                             logger.warning(conflict_info['reason'])
                 
-                conflict_info['reason'] = f"Priority 1 signal approved - cancelling {len(conflict_info['orders_to_cancel'])} lower priority orders"
+                if conflict_info['allow_order']:
+                    order_count = len(conflict_info['orders_to_cancel'])
+                    position_count = len(conflict_info['positions_to_close'])
+                    conflict_info['reason'] = f"Priority 1 signal approved - cancelling {order_count} orders, closing {position_count} positions"
                 
             elif requested_priority == 2:
                 # Priority 2: Only execute if no Priority 1 exists
@@ -1325,22 +1407,18 @@ class BybitService:
                             conflict_info['reason'] = f"Priority 2 signal approved - no conflicts"
                     else:
                         conflict_info['reason'] = f"Priority 2 signal approved - no existing orders"
-            
-            # Check for active positions that might conflict (for direction changes)
-            if existing_positions and conflict_info['allow_order']:
-                for pos in existing_positions:
-                    pos_side = pos.get('side', '').lower()
-                    requested_direction = 'long' if requested_side.lower() == 'buy' else 'short'
                     
-                    if pos_side and pos_side != requested_direction:
-                        if requested_priority == 1:
-                            logger.warning(f"Priority 1 signal will reverse position from {pos_side} to {requested_direction}")
-                            # Priority 1 can reverse positions
-                        else:
-                            # Priority 2 cannot reverse positions
-                            conflict_info['allow_order'] = False
-                            conflict_info['reason'] = f"Priority 2 cannot reverse position from {pos_side} to {requested_direction}"
-                            logger.warning(conflict_info['reason'])
+                    # Check for active positions that might conflict (for direction changes)
+                    if conflict_info['allow_order'] and active_positions:
+                        requested_direction = 'long' if requested_side.lower() == 'buy' else 'short'
+                        
+                        for pos in active_positions:
+                            if pos['side'] != requested_direction:
+                                # Priority 2 cannot reverse positions
+                                conflict_info['allow_order'] = False
+                                conflict_info['reason'] = f"Priority 2 cannot reverse position from {pos['side']} to {requested_direction}"
+                                logger.warning(conflict_info['reason'])
+                                break
             
             logger.info(f"Priority conflict resolution: {conflict_info['reason']}")
             return conflict_info
@@ -1350,6 +1428,7 @@ class BybitService:
             return {
                 'allow_order': False,
                 'orders_to_cancel': [],
+                'positions_to_close': [],
                 'conflicts_found': [f"Error checking conflicts: {str(e)}"],
                 'reason': f"Error in priority check: {str(e)}",
                 'existing_priorities': {}
@@ -1451,4 +1530,103 @@ class BybitService:
                 'cancelled_orders': [],
                 'failed_cancellations': [{'error': f"Bulk cancellation error: {str(e)}"}],
                 'total_attempted': len(orders_to_cancel)
+            }
+    
+    async def close_all_positions(self, symbol: str, reason: str = "Priority override") -> Dict[str, Any]:
+        """
+        Close all active positions for a symbol using market orders.
+        
+        Args:
+            symbol (str): Symbol to close positions for
+            reason (str): Reason for closing positions
+        
+        Returns:
+            Dict[str, Any]: Results of position closure attempts
+        """
+        try:
+            results = {
+                'closed_positions': [],
+                'failed_closures': [],
+                'total_attempted': 0
+            }
+            
+            logger.info(f"🔄 Closing all positions for {symbol} - Reason: {reason}")
+            
+            # Get existing positions
+            existing_positions = await self.get_existing_positions(symbol)
+            
+            if not existing_positions:
+                logger.info(f"No active positions found for {symbol}")
+                return results
+            
+            results['total_attempted'] = len(existing_positions)
+            
+            for position in existing_positions:
+                try:
+                    pos_size = position.get('size', 0)
+                    pos_side = position.get('side', '').lower()
+                    pos_contracts = position.get('contracts', 0)
+                    
+                    if pos_size == 0 and pos_contracts == 0:
+                        logger.info(f"Position {pos_side} has zero size, skipping")
+                        continue
+                    
+                    # Determine the opposite side for closing
+                    close_side = 'sell' if pos_side == 'long' else 'buy'
+                    close_quantity = abs(pos_size) if pos_size != 0 else abs(pos_contracts)
+                    
+                    logger.info(f"Closing {pos_side} position: {close_quantity} contracts via {close_side} market order")
+                    
+                    # Get the correct market ID
+                    market_id = self.get_market_id(symbol, 'linear')
+                    
+                    # Place market order to close the position
+                    params = {
+                        'category': 'linear',
+                        'positionIdx': 0,  # One-way mode
+                        'reduceOnly': True  # This ensures we're closing, not opening new position
+                    }
+                    
+                    close_order = self.exchange.create_order(
+                        symbol=market_id,
+                        type='market',
+                        side=close_side,
+                        amount=close_quantity,
+                        params=params
+                    )
+                    
+                    results['closed_positions'].append({
+                        'original_side': pos_side,
+                        'close_side': close_side,
+                        'quantity': close_quantity,
+                        'close_order': close_order,
+                        'reason': reason
+                    })
+                    
+                    logger.info(f"✅ Closed {pos_side} position: {close_quantity} contracts")
+                    
+                except Exception as close_error:
+                    error_msg = f"Failed to close {position.get('side', 'unknown')} position: {str(close_error)}"
+                    logger.error(error_msg)
+                    results['failed_closures'].append({
+                        'position': position,
+                        'error': error_msg
+                    })
+            
+            success_count = len(results['closed_positions'])
+            total_count = results['total_attempted']
+            
+            if success_count == total_count:
+                logger.info(f"✅ Successfully closed all {success_count}/{total_count} positions for {symbol}")
+            else:
+                logger.warning(f"⚠️ Closed {success_count}/{total_count} positions, {len(results['failed_closures'])} failed")
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"Error closing positions for {symbol}: {e}")
+            return {
+                'closed_positions': [],
+                'failed_closures': [{'error': f"Position closure error: {str(e)}"}],
+                'total_attempted': 0
             } 
