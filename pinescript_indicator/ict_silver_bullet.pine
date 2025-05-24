@@ -1,9 +1,10 @@
 //@version=6
+// © nioboi
 strategy("ICT Silver Bullet Strategy", overlay=true, max_bars_back=5000, max_lines_count=500, max_labels_count=500, max_boxes_count=500, default_qty_type=strategy.percent_of_equity, default_qty_value=10, initial_capital=10000, currency=currency.USD, pyramiding=10)
 
 //================ STRATEGY PARAMETERS ================
 // FVG Settings
-choice = input.string('All FVG', 'FVG Type', options=['All FVG', 'Only FVG in the same direction of trend', 'Strict', 'Super-Strict'], group='FVG Settings')
+choice = 'All FVG'
 cBullFVG = input.color(#4dd0e160, 'Bull FVG Color', inline='fvg', group='FVG Settings')
 cBearFVG = input.color(#ffc1b160, 'Bear FVG Color', inline='fvg', group='FVG Settings')
 extend = input.bool(true, 'extend FVG', inline='fvg', group='FVG Settings')
@@ -287,30 +288,31 @@ executeTrade(fvg, direction, tradeId) =>
     if direction == "Long"
         strategy.entry(tradeId, strategy.long, limit=entryPrice, comment="SB Long #" + str.tostring(current_long_trades + 1))
         
-        // Alert for long limit order creation
+        // Alert for long limit order
         alert('{"symbol":"' + syminfo.ticker + 
               '","side":"long",' + 
               '"entry":"' + str.tostring(entryPrice, "#.####") + '",' +
               '"stop_loss":"' + str.tostring(stopPrice, "#.####") + '",' + 
               '"take_profit":"' + str.tostring(tpPrice, "#.####") + '",' + 
               '"trigger_time":"' + str.tostring(timenow) + '",' +
-              '"order_id":"' + tradeId + '",' +
               '"max_lag":"20",' +
-              '"order_type":"sb_limit_long"}', alert.freq_once_per_bar_close)
-              
+              '"order_type":"limit",' +
+              '"priority":"1",' +
+              '"strategy_id":"silver_bullet"}', alert.freq_once_per_bar_close)
     else
         strategy.entry(tradeId, strategy.short, limit=entryPrice, comment="SB Short #" + str.tostring(current_short_trades + 1))
         
-        // Alert for short limit order creation  
+        // Alert for short limit order
         alert('{"symbol":"' + syminfo.ticker + 
               '","side":"short",' + 
               '"entry":"' + str.tostring(entryPrice, "#.####") + '",' +
               '"stop_loss":"' + str.tostring(stopPrice, "#.####") + '",' + 
               '"take_profit":"' + str.tostring(tpPrice, "#.####") + '",' + 
               '"trigger_time":"' + str.tostring(timenow) + '",' +
-              '"order_id":"' + tradeId + '",' +
               '"max_lag":"20",' +
-              '"order_type":"sb_limit_short"}', alert.freq_once_per_bar_close)
+              '"order_type":"limit",' +
+              '"priority":"1",' +
+              '"strategy_id":"silver_bullet"}', alert.freq_once_per_bar_close)
     
     // Set exit orders
     strategy.exit(tradeId + "_exit", tradeId, stop=stopPrice, limit=tpPrice)

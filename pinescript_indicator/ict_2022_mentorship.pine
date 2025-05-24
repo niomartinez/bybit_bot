@@ -1110,7 +1110,9 @@ if longEntrySignal and not longEntrySignal[1] and Entry_Method == 'FVG_Level_Lim
           '"take_profit":"' + str.tostring(longTp1Price, "#.####") + '",' + 
           '"trigger_time":"' + str.tostring(timenow) + '",' +
           '"max_lag":"20",' +
-          '"order_type":"limit"}', alert.freq_once_per_bar_close)
+          '"priority":"2",' +
+          '"order_type":"limit"}' +
+          '"strategy_id":"2022_mentorship"}', alert.freq_once_per_bar_close )
 
 if shortEntrySignal and not shortEntrySignal[1] and Entry_Method == 'FVG_Level_Limit_Order'
     alert('{"symbol":"' + syminfo.ticker + 
@@ -1120,7 +1122,9 @@ if shortEntrySignal and not shortEntrySignal[1] and Entry_Method == 'FVG_Level_L
           '"take_profit":"' + str.tostring(shortTp1Price, "#.####") + '",' + 
           '"trigger_time":"' + str.tostring(timenow) + '",' +
           '"max_lag":"20",' +
-          '"order_type":"limit"}', alert.freq_once_per_bar_close)
+          '"priority":"2",' +
+          '"order_type":"limit",' +
+          '"strategy_id":"2022_mentorship"}', alert.freq_once_per_bar_close)
 
 // SIMPLIFIED TEST ALERTS - triggered on simple candle colors
 // Test switch - set to 'true' to enable test alerts
