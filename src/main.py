@@ -11,9 +11,11 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 
-from src.models import TradingViewSignal
+from src.models import TradingViewSignal, SheetsConfig
 from src.signal_processor import SignalProcessor
 from src.bybit_service import BybitService
+from src.session_manager import SilverBulletSessionManager
+from src.sheets_service import SheetsService
 from src.config import config, logger
 
 # Create FastAPI app
@@ -35,11 +37,13 @@ app.add_middleware(
 # Initialize services
 bybit_service = None
 signal_processor = None
+session_manager = None
+sheets_service = None
 
 @app.on_event("startup")
 async def startup_event():
     """Startup event handler."""
-    global bybit_service, signal_processor
+    global bybit_service, signal_processor, session_manager, sheets_service
     
     logger.info("Starting Bybit Trading Bot...")
     
@@ -47,7 +51,39 @@ async def startup_event():
     try:
         bybit_service = BybitService()
         signal_processor = SignalProcessor()
+        session_manager = SilverBulletSessionManager(bybit_service)
+        
+        # Initialize Google Sheets service (optional)
+        try:
+            # Check if Google Sheets configuration exists
+            sheets_config = SheetsConfig(
+                spreadsheet_id=config.google_sheets.spreadsheet_id if hasattr(config, 'google_sheets') else "",
+                worksheet_name=config.google_sheets.worksheet_name if hasattr(config, 'google_sheets') else "Trade Journal",
+                credentials_file=config.google_sheets.credentials_file if hasattr(config, 'google_sheets') else "credentials.json"
+            )
+            
+            if sheets_config.spreadsheet_id:
+                sheets_service = SheetsService(sheets_config)
+                sheets_initialized = await sheets_service.initialize()
+                
+                if sheets_initialized:
+                    logger.info("✅ Google Sheets service initialized successfully")
+                    # Pass sheets service to signal processor
+                    signal_processor.set_sheets_service(sheets_service)
+                else:
+                    logger.warning("⚠️ Google Sheets service failed to initialize - continuing without journaling")
+            else:
+                logger.info("📝 Google Sheets not configured - trade journaling disabled")
+                
+        except Exception as sheets_error:
+            logger.warning(f"Google Sheets initialization failed: {sheets_error}")
+            logger.info("Continuing without Google Sheets integration")
+        
+        # Start the session monitoring background task
+        asyncio.create_task(session_manager.monitor_sessions())
+        
         logger.info("All services initialized successfully")
+        logger.info("🎯 Silver Bullet session monitoring started")
     except Exception as e:
         logger.error(f"Error initializing services: {e}")
         # We don't raise here to allow the server to start even with initialization errors
@@ -87,6 +123,19 @@ def get_signal_processor():
         raise HTTPException(status_code=503, detail="Service not available")
     return signal_processor
 
+def get_session_manager():
+    """Dependency to get the SessionManager instance."""
+    if session_manager is None:
+        logger.error("SessionManager not initialized")
+        raise HTTPException(status_code=503, detail="Session manager not available")
+    return session_manager
+
+def get_sheets_service():
+    """Dependency to get the SheetsService instance."""
+    if sheets_service is None:
+        raise HTTPException(status_code=503, detail="Google Sheets service not available")
+    return sheets_service
+
 @app.get("/")
 async def root():
     """
@@ -99,7 +148,9 @@ async def root():
         "message": "Bybit Trading Bot is running",
         "version": "0.1.0",
         "documentation": "/docs",
-        "health": "/health"
+        "health": "/health",
+        "sessions": "/sessions/status",
+        "journal": "/journal/status"
     }
 
 @app.get("/health")
@@ -113,7 +164,9 @@ async def health_check():
     # Check if services are initialized
     services_status = {
         "bybit_service": bybit_service is not None,
-        "signal_processor": signal_processor is not None
+        "signal_processor": signal_processor is not None,
+        "session_manager": session_manager is not None,
+        "sheets_service": sheets_service is not None and sheets_service.is_connected
     }
     
     # Get basic info like uptime
@@ -131,9 +184,84 @@ async def health_check():
             "risk_management": {
                 "var_type": config.risk_management.var_type,
                 "portfolio_currency": config.risk_management.portfolio_currency
+            },
+            "google_sheets": {
+                "enabled": sheets_service is not None and sheets_service.is_connected
             }
         }
     }
+
+@app.get("/sessions/status")
+async def get_session_status(session_manager: SilverBulletSessionManager = Depends(get_session_manager)):
+    """
+    Get current Silver Bullet session status.
+    
+    Returns:
+        dict: Session status information
+    """
+    try:
+        return session_manager.get_session_status()
+    except Exception as e:
+        logger.error(f"Error getting session status: {e}")
+        raise HTTPException(status_code=500, detail=f"Error getting session status: {str(e)}")
+
+@app.post("/sessions/cancel-orders")
+async def force_cancel_session_orders(session_manager: SilverBulletSessionManager = Depends(get_session_manager)):
+    """
+    Manually trigger cancellation of Silver Bullet orders (for testing/emergency).
+    
+    Returns:
+        dict: Cancellation results
+    """
+    try:
+        logger.info("Manual Silver Bullet order cancellation triggered via API")
+        result = await session_manager.cancel_session_orders()
+        return result
+    except Exception as e:
+        logger.error(f"Error in manual order cancellation: {e}")
+        raise HTTPException(status_code=500, detail=f"Error cancelling orders: {str(e)}")
+
+# Google Sheets Journal Endpoints
+@app.get("/journal/status")
+async def get_journal_status():
+    """
+    Get Google Sheets journal status.
+    
+    Returns:
+        dict: Journal status information
+    """
+    if sheets_service is None:
+        return {"connected": False, "message": "Google Sheets service not initialized"}
+    
+    return sheets_service.get_connection_status()
+
+@app.get("/journal/statistics")
+async def get_trade_statistics(sheets_service: SheetsService = Depends(get_sheets_service)):
+    """
+    Get trade statistics from Google Sheets.
+    
+    Returns:
+        dict: Trade statistics
+    """
+    try:
+        return await sheets_service.get_trade_statistics()
+    except Exception as e:
+        logger.error(f"Error getting trade statistics: {e}")
+        raise HTTPException(status_code=500, detail=f"Error getting trade statistics: {str(e)}")
+
+@app.post("/journal/backup")
+async def backup_trades(sheets_service: SheetsService = Depends(get_sheets_service)):
+    """
+    Create a backup of all trades from Google Sheets.
+    
+    Returns:
+        dict: Backup result
+    """
+    try:
+        return await sheets_service.backup_trades()
+    except Exception as e:
+        logger.error(f"Error creating trade backup: {e}")
+        raise HTTPException(status_code=500, detail=f"Error creating trade backup: {str(e)}")
 
 async def process_signal_task(signal_processor: SignalProcessor, signal: TradingViewSignal):
     """
@@ -183,7 +311,9 @@ async def webhook_tradingview(
         "take_profit": 67000.0,
         "trigger_time": "1747778400208",
         "max_lag": 20,
-        "order_type": "limit"
+        "order_type": "limit",
+        "priority": 1,
+        "strategy_id": "silver_bullet"
     }
     ```
     
@@ -258,6 +388,7 @@ async def webhook_tradingview(
                 "symbol": signal.symbol,
                 "side": signal.side,
                 "strategy_id": signal.strategy_id or "default",
+                "priority": signal.priority,
                 "processing": "async",
                 "response_time_ms": round(response_time, 2)
             }
@@ -311,6 +442,7 @@ async def webhook_test(
                 "symbol": signal.symbol,
                 "side": signal.side,
                 "strategy_id": signal.strategy_id or "default",
+                "priority": signal.priority,
                 "processing": "async",
                 "response_time_ms": round(response_time, 2)
             }

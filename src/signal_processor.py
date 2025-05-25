@@ -5,8 +5,9 @@ Signal processor for handling TradingView webhook signals.
 import math
 import traceback
 from decimal import Decimal, ROUND_DOWN
+from datetime import datetime
 from typing import Dict, Any, Optional, Tuple
-from src.models import TradingViewSignal, StrategyConfig
+from src.models import TradingViewSignal, StrategyConfig, TradeJournalEntry
 from src.bybit_service import BybitService
 from src.config import config, logger
 
@@ -18,7 +19,13 @@ class SignalProcessor:
     def __init__(self):
         """Initialize the signal processor."""
         self.bybit_service = BybitService()
+        self.sheets_service = None  # Will be set by main app if available
         logger.info("SignalProcessor initialized")
+    
+    def set_sheets_service(self, sheets_service):
+        """Set the Google Sheets service for trade journaling."""
+        self.sheets_service = sheets_service
+        logger.info("Google Sheets service connected to SignalProcessor")
     
     async def process_signal(self, signal: TradingViewSignal) -> Dict[str, Any]:
         """
@@ -194,6 +201,17 @@ class SignalProcessor:
             # Check if order placement was successful
             if order_result.get('success', False):
                 logger.info(f"Order placed successfully for strategy {strategy_id}: {order_result}")
+                
+                # Log trade to Google Sheets if available
+                await self._log_trade_entry(
+                    signal=signal,
+                    symbol=symbol,
+                    order_side=order_side,
+                    quantity=quantity,
+                    var_amount=var_amount,
+                    order_result=order_result
+                )
+                
                 return {
                     "success": True,
                     "message": "Order placed successfully",
@@ -243,6 +261,70 @@ class SignalProcessor:
                 "strategy_id": signal.strategy_id or "default",
                 "priority": getattr(signal, 'priority', 2)
             }
+    
+    async def _log_trade_entry(
+        self, 
+        signal: TradingViewSignal, 
+        symbol: str, 
+        order_side: str, 
+        quantity: float, 
+        var_amount: float, 
+        order_result: Dict[str, Any]
+    ) -> None:
+        """
+        Log trade entry to Google Sheets.
+        
+        Args:
+            signal: Original trading signal
+            symbol: Normalized symbol
+            order_side: Order side (Buy/Sell)
+            quantity: Order quantity
+            var_amount: Risk amount
+            order_result: Order placement result
+        """
+        if not self.sheets_service or not self.sheets_service.is_connected:
+            logger.debug("Google Sheets not available - skipping trade logging")
+            return
+        
+        try:
+            # Get order ID from result
+            order_id = order_result.get('order', {}).get('orderLinkId', '')
+            if not order_id:
+                order_id = order_result.get('order', {}).get('orderId', '')
+            
+            # Determine session type if it's a Silver Bullet strategy
+            session_type = None
+            if signal.strategy_id and 'silver_bullet' in signal.strategy_id.lower():
+                # You could integrate with session manager here to get current session
+                session_type = "Silver Bullet"
+            
+            # Create trade journal entry
+            trade_entry = TradeJournalEntry(
+                trade_id=order_id or f"{symbol}_{int(datetime.utcnow().timestamp())}",
+                symbol=symbol,
+                strategy=signal.strategy_id or "default",
+                priority=signal.priority or 2,
+                entry_time=datetime.utcnow(),
+                entry_price=signal.entry,
+                side=signal.side,  # Keep original side (long/short)
+                quantity=quantity,
+                stop_loss=signal.stop_loss,
+                take_profit=signal.take_profit,
+                risk_amount=var_amount,
+                session_type=session_type,
+                status="OPEN"
+            )
+            
+            # Log to Google Sheets
+            success = await self.sheets_service.log_trade_entry(trade_entry)
+            
+            if success:
+                logger.info(f"📝 Trade logged to Google Sheets: {trade_entry.trade_id}")
+            else:
+                logger.warning(f"Failed to log trade to Google Sheets: {trade_entry.trade_id}")
+                
+        except Exception as e:
+            logger.error(f"Error logging trade to Google Sheets: {e}")
     
     def _log_instrument_info(self, symbol: str, instrument_info: Dict[str, Any]) -> None:
         """

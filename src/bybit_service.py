@@ -728,11 +728,7 @@ class BybitService:
                 params['category'] = 'spot'    # Spot trading
                 logger.info(f"Setting category=spot for spot trading")
             
-            # Create unique order ID based on timestamp, symbol, and strategy
-            strategy_suffix = f"_{strategy_id}" if strategy_id else ""
-            order_link_id = f"tv_{int(time.time())}_{symbol.replace('/', '').replace(':', '')}{strategy_suffix}"
-            params['orderLinkId'] = order_link_id
-            
+            logger.info(f"Generated order ID: {order_id} (priority: {priority}, strategy: {strategy_id or 'default'})")
             logger.info(f"Final API params: {params}")
             
             # Place the order using the exact market ID found

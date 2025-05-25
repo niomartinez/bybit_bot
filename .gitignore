@@ -163,6 +163,11 @@ docker-compose.yml
 .gcloud/
 *.gcloudignore
 
+# Google Sheets credentials and backups
+credentials.json
+service-account-*.json
+documents/trade_backup_*.json
+
 # Terraform
 .terraform/
 *.tfstate

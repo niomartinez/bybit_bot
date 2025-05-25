@@ -3,7 +3,9 @@ Pydantic models for webhook payloads and configuration.
 """
 
 from pydantic import BaseModel, Field, validator
-from typing import Literal, Optional, Dict, Any, Union
+from typing import Literal, Optional, Dict, Any, Union, List
+from datetime import datetime
+from enum import Enum
 
 
 class TradingViewSignal(BaseModel):
@@ -109,3 +111,125 @@ class BotConfig(BaseModel):
     risk_management: RiskManagementConfig
     multi_strategy: Optional[MultiStrategyConfig] = None
     logging: LoggingConfig 
+
+
+class OrderSide(str, Enum):
+    LONG = "long"
+    SHORT = "short"
+
+class OrderType(str, Enum):
+    MARKET = "market"
+    LIMIT = "limit"
+
+class OrderStatus(str, Enum):
+    PENDING = "pending"
+    FILLED = "filled"
+    CANCELLED = "cancelled"
+    REJECTED = "rejected"
+
+class TradingSignal(BaseModel):
+    symbol: str = Field(..., description="Trading symbol (e.g., BTCUSDT.P)")
+    side: OrderSide = Field(..., description="Order side: long or short")
+    entry: float = Field(..., description="Entry price")
+    stop_loss: Optional[float] = Field(None, description="Stop loss price")
+    take_profit: Optional[float] = Field(None, description="Take profit price")
+    trigger_time: str = Field(..., description="Trigger timestamp from TradingView")
+    max_lag: Optional[int] = Field(20, description="Maximum lag in seconds")
+    order_type: OrderType = Field(OrderType.LIMIT, description="Order type")
+    priority: Optional[int] = Field(1, description="Order priority (1-5)")
+    strategy_id: Optional[str] = Field("default", description="Strategy identifier")
+
+class OrderResult(BaseModel):
+    success: bool
+    order_id: Optional[str] = None
+    message: str
+    symbol: str
+    side: str
+    entry_price: float
+    stop_loss: Optional[float] = None
+    take_profit: Optional[float] = None
+    timestamp: datetime
+    strategy_id: Optional[str] = None
+    priority: Optional[int] = None
+
+class TradeJournalEntry(BaseModel):
+    """Model for trade journal entries to be logged to Google Sheets"""
+    
+    # Trade Identification
+    trade_id: str = Field(..., description="Unique trade identifier")
+    symbol: str = Field(..., description="Trading symbol")
+    strategy: str = Field(..., description="Strategy name")
+    priority: int = Field(..., description="Order priority")
+    
+    # Entry Details
+    entry_time: datetime = Field(..., description="Entry timestamp")
+    entry_price: float = Field(..., description="Entry price")
+    side: str = Field(..., description="Long or Short")
+    quantity: float = Field(..., description="Position size")
+    
+    # Exit Details (filled when trade closes)
+    exit_time: Optional[datetime] = Field(None, description="Exit timestamp")
+    exit_price: Optional[float] = Field(None, description="Exit price")
+    exit_reason: Optional[str] = Field(None, description="Exit reason (TP/SL/Manual)")
+    
+    # Risk Management
+    stop_loss: Optional[float] = Field(None, description="Stop loss price")
+    take_profit: Optional[float] = Field(None, description="Take profit price")
+    risk_amount: Optional[float] = Field(None, description="Risk amount in USD")
+    
+    # Performance Metrics
+    pnl_usd: Optional[float] = Field(None, description="P&L in USD")
+    pnl_percentage: Optional[float] = Field(None, description="P&L percentage")
+    duration_minutes: Optional[int] = Field(None, description="Trade duration in minutes")
+    
+    # Market Context
+    session_type: Optional[str] = Field(None, description="Silver Bullet session type")
+    market_conditions: Optional[str] = Field(None, description="Market conditions")
+    
+    # Status
+    status: str = Field("OPEN", description="Trade status: OPEN/CLOSED/CANCELLED")
+    notes: Optional[str] = Field(None, description="Additional notes")
+    
+    # Metadata
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+class SheetsConfig(BaseModel):
+    """Configuration for Google Sheets integration"""
+    
+    spreadsheet_id: str = Field(..., description="Google Sheets spreadsheet ID")
+    worksheet_name: str = Field("Trade Journal", description="Worksheet name")
+    credentials_file: str = Field("credentials.json", description="Path to Google credentials file")
+    
+    # Column mapping for the spreadsheet
+    columns: Dict[str, str] = Field(default={
+        "A": "trade_id",
+        "B": "symbol", 
+        "C": "strategy",
+        "D": "priority",
+        "E": "entry_time",
+        "F": "entry_price",
+        "G": "side",
+        "H": "quantity",
+        "I": "exit_time",
+        "J": "exit_price", 
+        "K": "exit_reason",
+        "L": "stop_loss",
+        "M": "take_profit",
+        "N": "risk_amount",
+        "O": "pnl_usd",
+        "P": "pnl_percentage",
+        "Q": "duration_minutes",
+        "R": "session_type",
+        "S": "market_conditions",
+        "T": "status",
+        "U": "notes",
+        "V": "created_at",
+        "W": "updated_at"
+    })
+
+class HealthCheck(BaseModel):
+    status: str
+    timestamp: datetime
+    version: str = "1.0.0"
+    services: Dict[str, str] = {} 
