@@ -75,8 +75,8 @@ async def initialize_sheets_service():
             return None
         
         # Get sheets config from config.json
-        sheets_config_data = config.get("google_sheets", {})
-        if not sheets_config_data.get("enabled", False):
+        sheets_config_data = getattr(config, "google_sheets", {})
+        if not sheets_config_data or not sheets_config_data.get("enabled", False):
             logger.info("📊 Google Sheets integration disabled in config")
             return None
         
@@ -84,7 +84,7 @@ async def initialize_sheets_service():
         sheets_service = SheetsService(sheets_config)
         
         # Test the connection
-        await sheets_service.initialize_sheet()
+        await sheets_service.initialize()
         logger.info("✅ Google Sheets service initialized successfully")
         return sheets_service
         

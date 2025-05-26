@@ -111,6 +111,7 @@ class BotConfig(BaseModel):
     risk_management: RiskManagementConfig
     multi_strategy: Optional[MultiStrategyConfig] = None
     logging: LoggingConfig 
+    google_sheets: Optional[Dict[str, Any]] = None
 
 
 class OrderSide(str, Enum):
