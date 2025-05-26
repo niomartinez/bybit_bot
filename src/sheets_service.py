@@ -146,7 +146,7 @@ class SheetsService:
                             side: str, entry_price: float, quantity: float, 
                             stop_loss: float = None, take_profit: float = None,
                             order_id: str = None, session_type: str = None, 
-                            risk_amount: float = None):
+                            risk_amount: float = None, status: str = "OPEN"):
         """Log a trade entry to Google Sheets."""
         try:
             if not self.client or not self.worksheet:
@@ -169,10 +169,10 @@ class SheetsService:
                 take_profit=take_profit,
                 risk_amount=risk_amount,
                 session_type=session_type,
-                status="OPEN"
+                status=status
             )
             
-            # Store in active trades for exit tracking
+            # Store in active trades for exit tracking (including PENDING orders)
             self.active_trades[trade_id] = trade_entry
             
             # Add to worksheet using the column mapping
@@ -203,7 +203,7 @@ class SheetsService:
             ]
             
             self.worksheet.append_row(row_data)
-            logger.info(f"✅ Trade entry logged to sheets: {symbol} {side} @ {entry_price}")
+            logger.info(f"✅ Trade entry logged to sheets: {symbol} {side} @ {entry_price} (Status: {status})")
             return True
             
         except Exception as e:
@@ -462,4 +462,121 @@ class SheetsService:
             "last_sync": self.last_sync_time.strftime('%Y-%m-%d %H:%M:%S') if self.last_sync_time else None,
             "active_trades": len(self.active_trades),
             "credentials_file": self.config.credentials_file
-        } 
+        }
+    
+    async def update_trade_status(self, trade_id: str, new_status: str, fill_price: float = None, fill_time: float = None) -> bool:
+        """
+        Update the status of an existing trade.
+        
+        Args:
+            trade_id: Trade/Position ID to update
+            new_status: New status (PENDING, ACTIVE, CLOSED, CANCELLED)
+            fill_price: Actual fill price (if different from original entry price)
+            fill_time: Time when order was filled
+            
+        Returns:
+            bool: True if successful
+        """
+        try:
+            if not self.client or not self.worksheet:
+                logger.error("❌ Sheets service not properly initialized")
+                return False
+            
+            # Get the trade entry from active trades
+            if trade_id not in self.active_trades:
+                logger.warning(f"⚠️ Trade ID {trade_id} not found in active trades")
+                return False
+            
+            trade_entry = self.active_trades[trade_id]
+            
+            # Update trade entry with new status
+            trade_entry.status = new_status
+            trade_entry.updated_at = datetime.now(timezone.utc)
+            
+            # If transitioning to ACTIVE, update entry price if provided
+            if new_status == "ACTIVE" and fill_price is not None:
+                trade_entry.entry_price = fill_price
+                if fill_time:
+                    trade_entry.entry_time = datetime.fromtimestamp(fill_time, tz=timezone.utc)
+            
+            # Find the row in the spreadsheet for this trade
+            all_values = self.worksheet.get_all_values()
+            row_to_update = None
+            
+            for i, row in enumerate(all_values):
+                if len(row) > 0 and row[0] == trade_id:  # Trade ID is in column A
+                    row_to_update = i + 1  # Sheets is 1-indexed
+                    break
+            
+            if row_to_update:
+                # Update the status and related fields
+                updates = [
+                    ('T', new_status),  # Status
+                    ('W', trade_entry.updated_at.strftime("%Y-%m-%d %H:%M:%S"))  # Updated at
+                ]
+                
+                # If updating to ACTIVE with new fill price/time
+                if new_status == "ACTIVE" and fill_price is not None:
+                    updates.extend([
+                        ('E', trade_entry.entry_time.strftime("%Y-%m-%d %H:%M:%S")),  # Entry time
+                        ('F', str(fill_price))  # Entry price
+                    ])
+                
+                # Batch update all fields
+                for col, value in updates:
+                    self.worksheet.update(f'{col}{row_to_update}', value)
+                
+                logger.info(f"✅ Trade status updated: {trade_entry.symbol} {trade_id} → {new_status}")
+                return True
+            else:
+                logger.error(f"❌ Could not find row for trade ID {trade_id} in spreadsheet")
+                return False
+            
+        except Exception as e:
+            logger.error(f"❌ Error updating trade status: {e}")
+            logger.error(f"Error details: {traceback.format_exc()}")
+            return False
+    
+    async def remove_cancelled_trade(self, trade_id: str) -> bool:
+        """
+        Remove a cancelled trade from tracking and optionally from the spreadsheet.
+        
+        Args:
+            trade_id: Trade/Position ID to remove
+            
+        Returns:
+            bool: True if successful
+        """
+        try:
+            if not self.client or not self.worksheet:
+                logger.error("❌ Sheets service not properly initialized")
+                return False
+            
+            # Remove from active trades tracking
+            if trade_id in self.active_trades:
+                trade_entry = self.active_trades[trade_id]
+                logger.info(f"🗑️ Removing cancelled trade: {trade_entry.symbol} {trade_id}")
+                del self.active_trades[trade_id]
+            
+            # Find and remove the row from the spreadsheet
+            all_values = self.worksheet.get_all_values()
+            row_to_delete = None
+            
+            for i, row in enumerate(all_values):
+                if len(row) > 0 and row[0] == trade_id:  # Trade ID is in column A
+                    row_to_delete = i + 1  # Sheets is 1-indexed
+                    break
+            
+            if row_to_delete:
+                # Delete the row
+                self.worksheet.delete_rows(row_to_delete)
+                logger.info(f"✅ Removed cancelled trade from spreadsheet: {trade_id}")
+                return True
+            else:
+                logger.warning(f"⚠️ Could not find row for trade ID {trade_id} in spreadsheet")
+                return False
+            
+        except Exception as e:
+            logger.error(f"❌ Error removing cancelled trade: {e}")
+            logger.error(f"Error details: {traceback.format_exc()}")
+            return False 

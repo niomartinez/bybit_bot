@@ -202,15 +202,8 @@ class SignalProcessor:
             if order_result.get('success', False):
                 logger.info(f"Order placed successfully for strategy {strategy_id}: {order_result}")
                 
-                # Log trade to Google Sheets if available
-                await self._log_trade_entry(
-                    signal=signal,
-                    symbol=symbol,
-                    order_side=order_side,
-                    quantity=quantity,
-                    var_amount=var_amount,
-                    order_result=order_result
-                )
+                # ✅ REQUIREMENT #1: Do NOT journal when limit order is created
+                # Journaling will happen when the order gets filled via monitor_trade_entries_and_exits()
                 
                 return {
                     "success": True,
@@ -272,59 +265,11 @@ class SignalProcessor:
         order_result: Dict[str, Any]
     ) -> None:
         """
-        Log trade entry to Google Sheets.
-        
-        Args:
-            signal: Original trading signal
-            symbol: Normalized symbol
-            order_side: Order side (Buy/Sell)
-            quantity: Order quantity
-            var_amount: Risk amount
-            order_result: Order placement result
+        REMOVED: This method violated requirement #1 (don't journal when orders are placed).
+        Journaling now happens in monitor_trade_entries_and_exits() when orders get filled.
         """
-        if not self.sheets_service or not self.sheets_service.is_connected:
-            logger.debug("Google Sheets not available - skipping trade logging")
-            return
-        
-        try:
-            # Get order ID from result
-            order_id = order_result.get('order', {}).get('orderLinkId', '')
-            if not order_id:
-                order_id = order_result.get('order', {}).get('orderId', '')
-            
-            # Determine session type if it's a Silver Bullet strategy
-            session_type = None
-            if signal.strategy_id and 'silver_bullet' in signal.strategy_id.lower():
-                # You could integrate with session manager here to get current session
-                session_type = "Silver Bullet"
-            
-            # Create trade journal entry
-            trade_entry = TradeJournalEntry(
-                trade_id=order_id or f"{symbol}_{int(datetime.utcnow().timestamp())}",
-                symbol=symbol,
-                strategy=signal.strategy_id or "default",
-                priority=signal.priority or 2,
-                entry_time=datetime.utcnow(),
-                entry_price=signal.entry,
-                side=signal.side,  # Keep original side (long/short)
-                quantity=quantity,
-                stop_loss=signal.stop_loss,
-                take_profit=signal.take_profit,
-                risk_amount=var_amount,
-                session_type=session_type,
-                status="OPEN"
-            )
-            
-            # Log to Google Sheets
-            success = await self.sheets_service.log_trade_entry(trade_entry)
-            
-            if success:
-                logger.info(f"📝 Trade logged to Google Sheets: {trade_entry.trade_id}")
-            else:
-                logger.warning(f"Failed to log trade to Google Sheets: {trade_entry.trade_id}")
-                
-        except Exception as e:
-            logger.error(f"Error logging trade to Google Sheets: {e}")
+        logger.debug("_log_trade_entry method removed - journaling moved to monitor_trade_entries_and_exits()")
+        pass
     
     def _log_instrument_info(self, symbol: str, instrument_info: Dict[str, Any]) -> None:
         """

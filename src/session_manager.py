@@ -458,15 +458,39 @@ class SilverBulletSessionManager:
                     # Cancel the order using the market symbol format
                     cancel_result = self.bybit_service.exchange.cancel_order(order_id, market_symbol)
                     
-                    cancellation_results["cancelled_orders"].append({
-                        "symbol": symbol,
-                        "market_symbol": market_symbol,
-                        "order_id": order_id,
-                        "order_link_id": order_link_id,
-                        "cancel_result": cancel_result
-                    })
-                    
-                    logger.info(f"✅ Cancelled Silver Bullet order: {order_link_id}")
+                    if cancel_result:
+                        cancelled_orders = cancellation_results["cancelled_orders"]
+                        cancelled_orders.append({
+                            "order_id": order_id,
+                            "order_link_id": order_link_id,
+                            "symbol": symbol,
+                            "market_symbol": market_symbol,
+                            "result": cancel_result
+                        })
+                        success_count = len(cancelled_orders)
+                        logger.info(f"✅ Cancelled Silver Bullet order: {order_link_id} ({symbol})")
+                        
+                        # 🔗 NEW: Integrate with journaling system
+                        # If this order was journaled as PENDING, remove it from the journal
+                        try:
+                            from src.main import sheets_service
+                            if sheets_service and order_link_id in sheets_service.active_trades:
+                                trade_entry = sheets_service.active_trades[order_link_id]
+                                if trade_entry.status == "PENDING":
+                                    await sheets_service.remove_cancelled_trade(order_link_id)
+                                    logger.info(f"📝 Removed cancelled Silver Bullet order from journal: {order_link_id}")
+                        except Exception as journal_error:
+                            logger.warning(f"Could not update journal for cancelled order {order_link_id}: {journal_error}")
+                        
+                    else:
+                        failed_orders = cancellation_results["failed_cancellations"]
+                        failed_orders.append({
+                            "order_id": order_id,
+                            "order_link_id": order_link_id,
+                            "symbol": symbol,
+                            "error": "Cancel order returned None/False"
+                        })
+                        logger.warning(f"⚠️ Failed to cancel Silver Bullet order: {order_link_id} ({symbol}) - Cancel returned None/False")
                 
                 except Exception as cancel_error:
                     error_msg = f"Failed to cancel Silver Bullet order {order_info.get('order_link_id', 'Unknown')}: {str(cancel_error)}"
