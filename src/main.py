@@ -289,10 +289,59 @@ async def manual_cancel_orders():
         raise HTTPException(status_code=503, detail="Session manager not initialized")
     
     try:
-        result = await session_manager.cancel_silver_bullet_orders()
+        result = await session_manager.cancel_session_orders()
         return {"success": True, "result": result}
     except Exception as e:
         logger.error(f"Manual cancellation failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/sessions/debug-orders")
+async def debug_silver_bullet_orders():
+    """Debug endpoint to check all current orders and Silver Bullet detection."""
+    if not session_manager:
+        raise HTTPException(status_code=503, detail="Session manager not initialized")
+    
+    try:
+        # Get all current orders for analysis
+        orders_analysis = await session_manager.get_silver_bullet_orders_for_cancellation()
+        
+        # Also get a sample of recent orders for comparison
+        recent_orders = await signal_processor.bybit_service.get_recent_orders(limit=50)
+        open_orders = [order for order in recent_orders if order.get('status') == 'open']
+        
+        # Analyze each open order
+        order_analysis = []
+        for order in open_orders:
+            order_link_id = order.get('clientOrderId', order.get('info', {}).get('orderLinkId', ''))
+            symbol = order.get('symbol', '')
+            
+            # Test the detection logic
+            is_silver_bullet = session_manager._is_silver_bullet_order(order_link_id)
+            
+            order_analysis.append({
+                'order_id': order.get('id'),
+                'order_link_id': order_link_id,
+                'symbol': symbol,
+                'side': order.get('side'),
+                'amount': order.get('amount'),
+                'price': order.get('price'),
+                'is_silver_bullet': is_silver_bullet,
+                'analysis': {
+                    'has_priority_1': order_link_id.startswith('prio1_') or order_link_id.startswith('p1_'),
+                    'has_silver_keyword': any(keyword in order_link_id.lower() for keyword in 
+                                            ['silver_bullet', 'silverbullet', '_sb_', 'ict_strategy', 'ict_', 'silver'])
+                }
+            })
+        
+        return {
+            "silver_bullet_orders_found": len(orders_analysis),
+            "total_open_orders": len(open_orders),
+            "order_analysis": order_analysis,
+            "silver_bullet_orders": orders_analysis
+        }
+        
+    except Exception as e:
+        logger.error(f"Debug orders failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # Google Sheets endpoints
@@ -451,10 +500,14 @@ def custom_openapi():
 
 app.openapi = custom_openapi
 
-if __name__ == "__main__":
+def start():
+    """Start the FastAPI application with uvicorn."""
     uvicorn.run(
         "src.main:app",
-        host=config["server"]["host"],
-        port=config["server"]["port"],
+        host=config.server.host,
+        port=config.server.port,
         reload=True
-    ) 
+    )
+
+if __name__ == "__main__":
+    start() 

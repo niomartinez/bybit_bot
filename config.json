@@ -17,9 +17,9 @@
     "enabled": true,
     "hedge_mode": false,
     "auto_switch_to_hedge": false,
-    "max_strategies_per_symbol": 5,
+    "max_strategies_per_symbol": 1,
     "allow_pyramiding": true,
-    "max_pyramiding_orders": 3,
+    "max_pyramiding_orders": 1,
     "strategy_configs": {
       "default": {
         "var_multiplier": 1.0,

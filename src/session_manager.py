@@ -178,7 +178,7 @@ class SilverBulletSessionManager:
     
     async def get_silver_bullet_orders_for_cancellation(self) -> List[Dict[str, Any]]:
         """
-        Get all Silver Bullet strategy orders that should be cancelled.
+        Get all Silver Bullet strategy orders that should be cancelled across ALL symbols.
         
         Returns:
             List[Dict[str, Any]]: List of orders to cancel
@@ -186,46 +186,162 @@ class SilverBulletSessionManager:
         orders_to_cancel = []
         
         try:
-            # Get all active symbols that might have SB orders
-            # For now, we'll check common crypto symbols, but this could be enhanced
-            # to track symbols dynamically based on order history
-            common_symbols = [
-                "BTCUSDT", "ETHUSDT", "SOLUSDT", "ADAUSDT", "DOTUSDT", 
-                "LINKUSDT", "AVAXUSDT", "MATICUSDT", "ATOMUSDT", "NEARUSDT"
-            ]
+            logger.info("🔍 Checking ALL symbols for Silver Bullet orders to cancel...")
             
-            logger.info(f"Checking {len(common_symbols)} symbols for Silver Bullet orders to cancel")
-            
-            for symbol in common_symbols:
-                try:
-                    # Get existing orders for this symbol
-                    existing_orders = await self.bybit_service.get_existing_orders(symbol)
-                    
-                    for order in existing_orders:
-                        order_link_id = order.get('clientOrderId', order.get('info', {}).get('orderLinkId', ''))
-                        
-                        # Check if this is a Silver Bullet order
-                        if self._is_silver_bullet_order(order_link_id):
-                            orders_to_cancel.append({
-                                'symbol': symbol,
-                                'order_id': order.get('id'),
-                                'order_link_id': order_link_id,
-                                'side': order.get('side', ''),
-                                'amount': order.get('amount', 0),
-                                'order': order
-                            })
-                            logger.info(f"Found Silver Bullet order to cancel: {order_link_id} ({symbol})")
+            # Get ALL open orders across ALL symbols using the Bybit V5 API
+            # This is much more efficient than checking individual symbols
+            try:
+                # Use the bybit_service exchange directly to get all open orders
+                # Set parameters for Bybit V5 unified account
+                params = {
+                    'category': 'linear',  # Check linear perpetuals (most common for crypto trading)
+                    'settleCoin': 'USDT'   # Focus on USDT-settled contracts
+                }
                 
-                except Exception as e:
-                    logger.warning(f"Error checking orders for {symbol}: {e}")
+                # Get all open orders across all symbols
+                all_open_orders = self.bybit_service.exchange.fetch_open_orders(
+                    symbol=None,  # None means all symbols
+                    since=None,
+                    limit=200,    # Increase limit to catch more orders
+                    params=params
+                )
+                
+                logger.info(f"Retrieved {len(all_open_orders)} total open orders across all linear USDT symbols")
+                
+                # Also check USDC contracts
+                try:
+                    params_usdc = {
+                        'category': 'linear',
+                        'settleCoin': 'USDC'
+                    }
+                    
+                    usdc_orders = self.bybit_service.exchange.fetch_open_orders(
+                        symbol=None,
+                        since=None,
+                        limit=100,
+                        params=params_usdc
+                    )
+                    
+                    all_open_orders.extend(usdc_orders)
+                    logger.info(f"Added {len(usdc_orders)} USDC orders, total: {len(all_open_orders)}")
+                    
+                except Exception as usdc_error:
+                    logger.warning(f"Could not fetch USDC orders: {usdc_error}")
+                
+                # Also check inverse contracts for completeness
+                try:
+                    params_inverse = {
+                        'category': 'inverse'
+                    }
+                    
+                    inverse_orders = self.bybit_service.exchange.fetch_open_orders(
+                        symbol=None,
+                        since=None,
+                        limit=50,
+                        params=params_inverse
+                    )
+                    
+                    all_open_orders.extend(inverse_orders)
+                    logger.info(f"Added {len(inverse_orders)} inverse orders, total: {len(all_open_orders)}")
+                    
+                except Exception as inverse_error:
+                    logger.warning(f"Could not fetch inverse orders: {inverse_error}")
+                
+            except Exception as api_error:
+                logger.error(f"Error fetching all open orders via API: {api_error}")
+                
+                # Fallback: Use the existing get_recent_orders method which includes open orders
+                logger.info("Falling back to get_recent_orders method...")
+                recent_orders = await self.bybit_service.get_recent_orders(limit=300)
+                
+                # Filter for only open orders
+                all_open_orders = [order for order in recent_orders if order.get('status') == 'open']
+                logger.info(f"Fallback: Found {len(all_open_orders)} open orders from recent orders")
+            
+            # Now filter for Silver Bullet orders across all the orders we found
+            unique_symbols = set()
+            
+            for order in all_open_orders:
+                try:
+                    # Extract order info
+                    order_link_id = order.get('clientOrderId', order.get('info', {}).get('orderLinkId', ''))
+                    symbol = order.get('symbol', '')
+                    
+                    # Normalize symbol for tracking (remove trading pair format)
+                    normalized_symbol = self._normalize_symbol_for_tracking(symbol)
+                    if normalized_symbol:
+                        unique_symbols.add(normalized_symbol)
+                    
+                    # Check if this is a Silver Bullet order
+                    if self._is_silver_bullet_order(order_link_id):
+                        orders_to_cancel.append({
+                            'symbol': normalized_symbol,  # Use normalized symbol
+                            'market_symbol': symbol,      # Keep original for API calls
+                            'order_id': order.get('id'),
+                            'order_link_id': order_link_id,
+                            'side': order.get('side', ''),
+                            'amount': order.get('amount', 0),
+                            'order': order
+                        })
+                        logger.info(f"Found Silver Bullet order to cancel: {order_link_id} ({normalized_symbol})")
+                
+                except Exception as order_error:
+                    logger.warning(f"Error processing order: {order_error}")
                     continue
             
-            logger.info(f"Found {len(orders_to_cancel)} Silver Bullet orders to cancel")
+            logger.info(f"🎯 Scanned {len(all_open_orders)} orders across {len(unique_symbols)} unique symbols")
+            logger.info(f"📋 Symbols checked: {sorted(list(unique_symbols))[:20]}{'...' if len(unique_symbols) > 20 else ''}")
+            logger.info(f"🚨 Found {len(orders_to_cancel)} Silver Bullet orders to cancel")
+            
             return orders_to_cancel
         
         except Exception as e:
             logger.error(f"Error getting Silver Bullet orders for cancellation: {e}")
             return []
+    
+    def _normalize_symbol_for_tracking(self, symbol: str) -> str:
+        """
+        Normalize symbol from various Bybit market formats to a standard tracking format.
+        
+        Examples:
+        - BTC/USDT:USDT -> BTCUSDT
+        - ETH/USDC:USDC -> ETHUSDC  
+        - BTC/USD:BTC -> BTCUSD
+        - BTCUSDT -> BTCUSDT
+        
+        Args:
+            symbol (str): Original symbol from Bybit API
+        
+        Returns:
+            str: Normalized symbol for tracking
+        """
+        if not symbol:
+            return ""
+        
+        try:
+            # Handle perpetual futures format (most common)
+            if '/USDT:USDT' in symbol:
+                return symbol.replace('/USDT:USDT', 'USDT')
+            
+            if '/USDC:USDC' in symbol:
+                return symbol.replace('/USDC:USDC', 'USDC')
+            
+            # Handle inverse perpetuals (e.g., BTC/USD:BTC -> BTCUSD)
+            if '/USD:' in symbol:
+                base = symbol.split('/USD:')[0]
+                return f"{base}USD"
+            
+            # Handle regular spot format (e.g., BTC/USDT -> BTCUSDT)
+            if '/' in symbol and ':' not in symbol:
+                return symbol.replace('/', '')
+            
+            # Already in normalized format
+            return symbol.upper()
+            
+        except Exception as e:
+            logger.warning(f"Error normalizing symbol '{symbol}': {e}")
+            # Fallback: just remove special characters
+            return symbol.replace('/', '').replace(':', '').upper()
     
     def _is_silver_bullet_order(self, order_link_id: str) -> bool:
         """
@@ -240,24 +356,46 @@ class SilverBulletSessionManager:
         if not order_link_id:
             return False
         
-        # Check for priority 1 orders (Silver Bullet should be priority 1)
+        order_link_lower = order_link_id.lower()
+        
+        # Debug: Log all order IDs being checked
+        logger.debug(f"Checking order ID for Silver Bullet: {order_link_id}")
+        
+        # Check for priority 1 orders (Silver Bullet should typically be priority 1)
         is_priority_1 = (
             order_link_id.startswith('prio1_') or 
             order_link_id.startswith('p1_')
         )
         
-        # Check for silver_bullet strategy ID
+        # Check for silver_bullet strategy ID (multiple possible formats)
         has_silver_bullet_strategy = (
-            'silver_bullet' in order_link_id.lower() or
-            '_sb_' in order_link_id.lower() or
-            'ict_strategy' in order_link_id.lower()  # Alternative strategy naming
+            'silver_bullet' in order_link_lower or
+            'silverbullet' in order_link_lower or
+            '_sb_' in order_link_lower or
+            'ict_strategy' in order_link_lower or
+            'ict_' in order_link_lower or
+            'silver' in order_link_lower
         )
         
-        # Must be priority 1 AND have silver bullet strategy identifier
-        is_sb_order = is_priority_1 and has_silver_bullet_strategy
+        # Silver Bullet orders can be identified by:
+        # 1. Priority 1 + Silver Bullet strategy identifier (strict match)
+        # 2. Any order with silver bullet strategy identifier (looser match for missed orders)
+        
+        # Strict match: Priority 1 + SB strategy
+        is_strict_sb_order = is_priority_1 and has_silver_bullet_strategy
+        
+        # Looser match: Any order with clear Silver Bullet indicators
+        is_loose_sb_order = has_silver_bullet_strategy
+        
+        # Use strict match for now, but log both for debugging
+        is_sb_order = is_strict_sb_order
         
         if is_sb_order:
-            logger.info(f"Identified Silver Bullet order: {order_link_id} (priority_1: {is_priority_1}, sb_strategy: {has_silver_bullet_strategy})")
+            logger.info(f"✅ Identified Silver Bullet order: {order_link_id} (priority_1: {is_priority_1}, sb_strategy: {has_silver_bullet_strategy})")
+        elif is_loose_sb_order:
+            logger.info(f"🔍 Potential Silver Bullet order (loose match): {order_link_id} (priority_1: {is_priority_1}, sb_strategy: {has_silver_bullet_strategy})")
+        else:
+            logger.debug(f"❌ Not a Silver Bullet order: {order_link_id} (priority_1: {is_priority_1}, sb_strategy: {has_silver_bullet_strategy})")
         
         return is_sb_order
     
@@ -310,17 +448,19 @@ class SilverBulletSessionManager:
             
             for order_info in orders_to_cancel:
                 try:
-                    symbol = order_info["symbol"]
+                    symbol = order_info["symbol"]  # Normalized symbol for logging
+                    market_symbol = order_info.get("market_symbol", symbol)  # API-compatible symbol
                     order_id = order_info["order_id"]
                     order_link_id = order_info["order_link_id"]
                     
                     logger.info(f"Cancelling Silver Bullet order: {order_link_id} ({symbol})")
                     
-                    # Cancel the order
-                    cancel_result = self.bybit_service.exchange.cancel_order(order_id, symbol)
+                    # Cancel the order using the market symbol format
+                    cancel_result = self.bybit_service.exchange.cancel_order(order_id, market_symbol)
                     
                     cancellation_results["cancelled_orders"].append({
                         "symbol": symbol,
+                        "market_symbol": market_symbol,
                         "order_id": order_id,
                         "order_link_id": order_link_id,
                         "cancel_result": cancel_result
