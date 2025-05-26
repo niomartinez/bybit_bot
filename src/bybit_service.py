@@ -1134,6 +1134,7 @@ class BybitService:
     async def get_recent_orders(self, limit: int = 50) -> List[Dict[str, Any]]:
         """
         Get recent orders across all symbols (both open and filled).
+        Updated for Bybit V5 UTA account compatibility.
         
         Args:
             limit (int): Maximum number of orders to return
@@ -1142,29 +1143,97 @@ class BybitService:
             List[Dict[str, Any]]: List of recent orders
         """
         try:
-            # Use Bybit API to get recent order history
-            # This includes both open and filled orders
+            all_orders = []
+            
+            # Bybit V5 API params for UTA accounts
             params = {
                 'category': 'linear',
-                'limit': min(limit, 50),  # Bybit limits to 50 per request
                 'settleCoin': 'USDT'
             }
             
-            # Fetch order history using CCXT
-            orders = self.exchange.fetch_orders(symbol=None, since=None, limit=limit, params=params)
+            # 1. Get recent closed/filled orders (most important for trade exit detection)
+            try:
+                closed_orders = self.exchange.fetch_closed_orders(
+                    symbol=None, 
+                    since=None, 
+                    limit=min(limit, 50), 
+                    params=params
+                )
+                all_orders.extend(closed_orders)
+                logger.debug(f"Retrieved {len(closed_orders)} closed orders")
+            except Exception as e:
+                logger.warning(f"Error getting closed orders: {e}")
             
-            logger.debug(f"Retrieved {len(orders)} recent orders")
-            return orders
+            # 2. Get current open orders
+            try:
+                open_orders = self.exchange.fetch_open_orders(
+                    symbol=None, 
+                    since=None, 
+                    limit=min(limit, 50), 
+                    params=params
+                )
+                all_orders.extend(open_orders)
+                logger.debug(f"Retrieved {len(open_orders)} open orders")
+            except Exception as e:
+                logger.warning(f"Error getting open orders: {e}")
+            
+            # 3. Get recent cancelled orders (for completeness)
+            try:
+                cancelled_orders = self.exchange.fetch_canceled_orders(
+                    symbol=None, 
+                    since=None, 
+                    limit=min(limit // 4, 20),  # Limit cancelled orders to avoid noise
+                    params=params
+                )
+                all_orders.extend(cancelled_orders)
+                logger.debug(f"Retrieved {len(cancelled_orders)} cancelled orders")
+            except Exception as e:
+                logger.warning(f"Error getting cancelled orders: {e}")
+            
+            # Sort by timestamp (most recent first) and limit total results
+            if all_orders:
+                # Filter out orders without timestamps and sort
+                valid_orders = [order for order in all_orders if order.get('timestamp')]
+                valid_orders.sort(key=lambda x: x.get('timestamp', 0), reverse=True)
+                
+                # Limit to requested number
+                final_orders = valid_orders[:limit]
+                
+                logger.debug(f"Retrieved {len(final_orders)} total recent orders (closed: {len([o for o in final_orders if o.get('status') in ['closed', 'filled']])}, open: {len([o for o in final_orders if o.get('status') == 'open'])}, cancelled: {len([o for o in final_orders if o.get('status') == 'canceled'])})")
+                return final_orders
+            else:
+                logger.debug("No recent orders found")
+                return []
             
         except Exception as e:
-            logger.error(f"Error getting recent orders: {e}")
-            # Fallback: try to get orders without params
+            logger.error(f"Error getting recent orders with V5 API: {e}")
+            
+            # Enhanced fallback: try individual methods
             try:
-                orders = self.exchange.fetch_orders(limit=limit)
-                logger.debug(f"Retrieved {len(orders)} recent orders (fallback)")
-                return orders
-            except Exception as e2:
-                logger.error(f"Fallback also failed: {e2}")
+                logger.info("Trying individual API calls as fallback...")
+                fallback_orders = []
+                
+                # Try each method individually with more specific error handling
+                for method_name, method_func in [
+                    ("fetchClosedOrders", self.exchange.fetch_closed_orders),
+                    ("fetchOpenOrders", self.exchange.fetch_open_orders)
+                ]:
+                    try:
+                        orders = method_func(limit=min(limit, 25))
+                        fallback_orders.extend(orders)
+                        logger.debug(f"Fallback {method_name}: retrieved {len(orders)} orders")
+                    except Exception as method_error:
+                        logger.warning(f"Fallback {method_name} failed: {method_error}")
+                
+                if fallback_orders:
+                    logger.debug(f"Fallback retrieved {len(fallback_orders)} total orders")
+                    return fallback_orders[:limit]
+                else:
+                    logger.warning("All fallback methods failed")
+                    return []
+                    
+            except Exception as fallback_error:
+                logger.error(f"Enhanced fallback also failed: {fallback_error}")
                 return []
     
     def determine_position_idx(self, side: str, strategy_id: str, existing_positions: List[Dict[str, Any]]) -> int:
