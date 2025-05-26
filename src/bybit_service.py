@@ -1131,6 +1131,42 @@ class BybitService:
             logger.error(f"Error getting orders for {symbol}: {e}")
             return []
     
+    async def get_recent_orders(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """
+        Get recent orders across all symbols (both open and filled).
+        
+        Args:
+            limit (int): Maximum number of orders to return
+        
+        Returns:
+            List[Dict[str, Any]]: List of recent orders
+        """
+        try:
+            # Use Bybit API to get recent order history
+            # This includes both open and filled orders
+            params = {
+                'category': 'linear',
+                'limit': min(limit, 50),  # Bybit limits to 50 per request
+                'settleCoin': 'USDT'
+            }
+            
+            # Fetch order history using CCXT
+            orders = self.exchange.fetch_orders(symbol=None, since=None, limit=limit, params=params)
+            
+            logger.debug(f"Retrieved {len(orders)} recent orders")
+            return orders
+            
+        except Exception as e:
+            logger.error(f"Error getting recent orders: {e}")
+            # Fallback: try to get orders without params
+            try:
+                orders = self.exchange.fetch_orders(limit=limit)
+                logger.debug(f"Retrieved {len(orders)} recent orders (fallback)")
+                return orders
+            except Exception as e2:
+                logger.error(f"Fallback also failed: {e2}")
+                return []
+    
     def determine_position_idx(self, side: str, strategy_id: str, existing_positions: List[Dict[str, Any]]) -> int:
         """
         Determine the appropriate positionIdx for hedge mode based on side and existing positions.

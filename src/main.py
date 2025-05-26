@@ -108,48 +108,111 @@ async def monitor_trade_exits():
     logger.info("🔍 Starting trade exit monitoring for journaling...")
     monitoring_active = True
     
-    # Track last known positions to detect exits
-    last_positions = {}
+    # Track processed orders to avoid duplicates
+    processed_orders = set()
     
     while monitoring_active:
         try:
-            # Get current positions from Bybit
+            # Get all recent orders (filled ones indicate trade entries/exits)
+            orders = await signal_processor.bybit_service.get_recent_orders(limit=50)
+            
+            for order in orders:
+                order_id = order.get('clientOrderId') or order.get('id')
+                if not order_id or order_id in processed_orders:
+                    continue
+                
+                order_status = order.get('status', '').lower()
+                symbol = order.get('symbol', '').replace('/USDT:USDT', '').replace('/', '')
+                
+                # Check if this is a filled order (entry or exit)
+                if order_status in ['filled', 'closed']:
+                    processed_orders.add(order_id)
+                    
+                    # Check if this is a trade exit by looking for corresponding entry
+                    side = order.get('side', '').lower()
+                    price = float(order.get('price') or order.get('average') or 0)
+                    quantity = float(order.get('amount') or order.get('filled') or 0)
+                    timestamp = order.get('timestamp')
+                    
+                    # Convert timestamp to proper format if needed
+                    if timestamp:
+                        if isinstance(timestamp, (int, float)):
+                            # Already in timestamp format
+                            exit_time = timestamp / 1000 if timestamp > 1e10 else timestamp
+                        else:
+                            # Try to parse as datetime string
+                            try:
+                                from datetime import datetime
+                                dt = datetime.fromisoformat(str(timestamp).replace('Z', '+00:00'))
+                                exit_time = dt.timestamp()
+                            except:
+                                exit_time = time.time()  # Fallback to current time
+                    else:
+                        exit_time = time.time()  # Fallback to current time
+                    
+                    # Look for matching active trade in our sheets service
+                    matching_trade = None
+                    for trade_id, trade_entry in sheets_service.active_trades.items():
+                        if (trade_entry.symbol == symbol and 
+                            trade_entry.status == "OPEN" and
+                            trade_entry.side.lower() != side):  # Opposite side = exit
+                            matching_trade = (trade_id, trade_entry)
+                            break
+                    
+                    if matching_trade:
+                        trade_id, trade_entry = matching_trade
+                        
+                        # Determine exit reason
+                        exit_reason = "Manual"
+                        if trade_entry.take_profit and abs(price - trade_entry.take_profit) < abs(price - trade_entry.stop_loss or 999999):
+                            exit_reason = "Take Profit"
+                        elif trade_entry.stop_loss and abs(price - (trade_entry.stop_loss or 0)) < abs(price - (trade_entry.take_profit or 999999)):
+                            exit_reason = "Stop Loss"
+                        
+                        # Calculate PnL
+                        if trade_entry.side.upper() == "LONG":
+                            pnl = (price - trade_entry.entry_price) * quantity
+                        else:
+                            pnl = (trade_entry.entry_price - price) * quantity
+                        
+                        # Log the trade exit
+                        await sheets_service.log_trade_exit(
+                            trade_id=trade_id,
+                            exit_price=price,
+                            exit_time=exit_time,
+                            exit_reason=exit_reason,
+                            quantity=quantity,
+                            pnl=pnl
+                        )
+                        
+                        logger.info(f"📝 Trade exit logged: {symbol} {exit_reason} @ {price} (PnL: ${pnl:.2f})")
+            
+            # Also check current positions to detect any that were closed
             current_positions = await signal_processor.bybit_service.get_all_positions()
             
-            # Check for position exits (positions that were active but now closed)
-            for symbol, last_pos in last_positions.items():
-                current_pos = current_positions.get(symbol)
+            # Check for trades that should be closed but still show as OPEN
+            for trade_id, trade_entry in list(sheets_service.active_trades.items()):
+                symbol_key = trade_entry.symbol
+                current_pos = current_positions.get(symbol_key)
                 
-                # Position was closed
-                if last_pos.get('size', 0) != 0 and (not current_pos or current_pos.get('size', 0) == 0):
-                    logger.info(f"📝 Position exit detected for {symbol} - logging to sheets")
-                    
-                    # Get recent trade history for this symbol
-                    try:
-                        trades = await signal_processor.bybit_service.get_trade_history(symbol, limit=10)
-                        
-                        for trade in trades:
-                            # Log the trade exit
-                            await sheets_service.log_trade_exit(
-                                symbol=symbol,
-                                exit_price=float(trade.get('price', 0)),
-                                exit_time=trade.get('timestamp'),
-                                quantity=float(trade.get('amount', 0)),
-                                pnl=float(trade.get('realizedPnl', 0)),
-                                fee=float(trade.get('fee', 0))
-                            )
-                            
-                    except Exception as e:
-                        logger.error(f"❌ Error logging trade exit for {symbol}: {e}")
-            
-            # Update last known positions
-            last_positions = current_positions.copy()
+                # If no position exists or position size is 0, this trade is closed
+                if not current_pos or current_pos.get('size', 0) == 0:
+                    # Mark as closed if we don't already have exit data
+                    if trade_entry.status == "OPEN":
+                        await sheets_service.log_trade_exit(
+                            trade_id=trade_id,
+                            exit_price=0,  # Unknown exit price
+                            exit_reason="Position Closed",
+                            pnl=0  # Will be calculated from actual trade data if available
+                        )
+                        logger.info(f"📝 Position closed detected for {symbol_key} - marked as exited")
             
             # Check every 30 seconds
             await asyncio.sleep(30)
             
         except Exception as e:
             logger.error(f"❌ Error in trade monitoring: {e}")
+            logger.error(f"Error details: {traceback.format_exc()}")
             await asyncio.sleep(60)  # Wait longer on error
 
 @app.on_event("startup")
@@ -318,6 +381,17 @@ async def receive_webhook(request: Request, background_tasks: BackgroundTasks):
         logger.error(f"Traceback: {traceback.format_exc()}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
+async def get_current_session_type():
+    """Get the current Silver Bullet session type."""
+    try:
+        if session_manager:
+            status = session_manager.get_session_status()
+            if status.get('in_session'):
+                return status.get('session_name', 'Unknown')
+        return "Outside Session"
+    except Exception:
+        return "Unknown"
+
 async def process_signal_background(signal: TradingViewSignal):
     """Process trading signal in background."""
     try:
@@ -334,20 +408,29 @@ async def process_signal_background(signal: TradingViewSignal):
         # If sheets service is available and order was placed, log the entry
         if sheets_service and result.get('success') and 'order' in result:
             try:
+                # Generate a unique trade ID
+                import hashlib
+                import time
+                trade_id = f"{signal.strategy_id}_{int(time.time())}_{signal.symbol}_{signal.side}"
+                
                 await sheets_service.log_trade_entry(
+                    trade_id=trade_id,
                     symbol=signal.symbol,
+                    strategy=signal.strategy_id or "unknown",
+                    priority=signal.priority or 2,
                     side=signal.side,
                     entry_price=signal.entry,
                     quantity=result.get('quantity', 0),
                     stop_loss=signal.stop_loss,
                     take_profit=signal.take_profit,
-                    strategy_id=signal.strategy_id,
                     order_id=result['order'].get('clientOrderId', ''),
-                    timestamp=time.time()
+                    session_type=await get_current_session_type(),
+                    risk_amount=result.get('risk_amount', 0)
                 )
                 logger.info(f"📝 Trade entry logged to Google Sheets for {signal.symbol}")
             except Exception as e:
-                logger.error(f"❌ Failed to log trade entry to sheets: {e}")
+                logger.error(f"❌ Error logging trade entry: {e}")
+                logger.error(f"Error details: {traceback.format_exc()}")
         
     except Exception as e:
         logger.error(f"Error processing signal in background: {e}")
