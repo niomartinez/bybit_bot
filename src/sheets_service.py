@@ -40,29 +40,41 @@ class SheetsService:
         
         logger.info("SheetsService initialized")
     
-    async def initialize(self) -> bool:
+    async def initialize(self, credentials_dict: Dict[str, Any] = None) -> bool:
         """
         Initialize Google Sheets connection.
+        
+        Args:
+            credentials_dict: Optional credentials dictionary (from env var)
         
         Returns:
             bool: True if connection successful
         """
         try:
-            # Check if credentials file exists
-            if not os.path.exists(self.config.credentials_file):
-                logger.error(f"Google Sheets credentials file not found: {self.config.credentials_file}")
-                return False
-            
-            # Load credentials
+            # Load credentials from dict (env var) or file
             scope = [
                 'https://spreadsheets.google.com/feeds',
                 'https://www.googleapis.com/auth/drive'
             ]
             
-            credentials = Credentials.from_service_account_file(
-                self.config.credentials_file, 
-                scopes=scope
-            )
+            if credentials_dict:
+                # Use credentials from environment variable
+                logger.info("📄 Using Google credentials from environment variable")
+                credentials = Credentials.from_service_account_info(
+                    credentials_dict,
+                    scopes=scope
+                )
+            else:
+                # Fallback to file (for local development)
+                if not os.path.exists(self.config.credentials_file):
+                    logger.error(f"Google Sheets credentials file not found: {self.config.credentials_file}")
+                    return False
+                
+                logger.info("📄 Using Google credentials from file")
+                credentials = Credentials.from_service_account_file(
+                    self.config.credentials_file, 
+                    scopes=scope
+                )
             
             # Initialize gspread client
             self.client = gspread.authorize(credentials)

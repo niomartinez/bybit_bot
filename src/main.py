@@ -83,8 +83,12 @@ async def initialize_sheets_service():
         sheets_config = SheetsConfig(**sheets_config_data)
         sheets_service = SheetsService(sheets_config)
         
-        # Test the connection
-        await sheets_service.initialize()
+        # Initialize with credentials from environment variable
+        success = await sheets_service.initialize(credentials)
+        if not success:
+            logger.error("❌ Failed to initialize Google Sheets connection")
+            return None
+        
         logger.info("✅ Google Sheets service initialized successfully")
         return sheets_service
         
