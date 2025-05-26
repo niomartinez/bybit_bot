@@ -158,7 +158,9 @@ async def startup_event():
         
         # Initialize core services
         signal_processor = SignalProcessor()
-        session_manager = SilverBulletSessionManager()
+        
+        # Initialize session manager with bybit service
+        session_manager = SilverBulletSessionManager(signal_processor.bybit_service)
         
         # Initialize Google Sheets service
         sheets_service = await initialize_sheets_service()
