@@ -13,6 +13,7 @@ from google.auth.exceptions import GoogleAuthError
 from google.oauth2.service_account import Credentials
 from src.config import logger
 from src.models import TradeJournalEntry, SheetsConfig
+import time
 
 class SheetsService:
     """
@@ -128,152 +129,162 @@ class SheetsService:
         except Exception as e:
             logger.error(f"Error initializing headers: {e}")
     
-    async def log_trade_entry(self, trade: TradeJournalEntry) -> bool:
-        """
-        Log a new trade entry to Google Sheets.
-        
-        Args:
-            trade (TradeJournalEntry): Trade entry to log
-            
-        Returns:
-            bool: True if successful
-        """
-        if not self.is_connected:
-            logger.warning("Google Sheets not connected - cannot log trade entry")
-            return False
-        
+    async def log_trade_entry(self, symbol: str, side: str, entry_price: float, 
+                            quantity: float, stop_loss: float = None, take_profit: float = None,
+                            strategy_id: str = None, order_id: str = None, timestamp: float = None):
+        """Log a trade entry to Google Sheets."""
         try:
-            # Store in active trades
-            self.active_trades[trade.trade_id] = trade
-            
-            # Prepare row data
-            row_data = self._trade_to_row_data(trade)
-            
-            # Append to spreadsheet
-            self.worksheet.append_row(row_data)
-            
-            logger.info(f"📝 Logged trade entry to Google Sheets: {trade.trade_id} ({trade.symbol} {trade.side})")
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error logging trade entry to Google Sheets: {e}")
-            return False
-    
-    async def update_trade_exit(self, trade_id: str, exit_data: Dict[str, Any]) -> bool:
-        """
-        Update trade with exit information.
-        
-        Args:
-            trade_id (str): Trade ID to update
-            exit_data (Dict[str, Any]): Exit data (price, time, reason, P&L)
-            
-        Returns:
-            bool: True if successful
-        """
-        if not self.is_connected:
-            logger.warning("Google Sheets not connected - cannot update trade exit")
-            return False
-        
-        try:
-            # Find trade in active trades
-            if trade_id not in self.active_trades:
-                logger.warning(f"Trade {trade_id} not found in active trades")
+            if not self.client or not self.worksheet:
+                logger.error("❌ Sheets service not properly initialized")
                 return False
             
-            trade = self.active_trades[trade_id]
+            # Create trade entry data
+            entry_time = datetime.fromtimestamp(timestamp or time.time(), tz=timezone.utc)
             
-            # Update trade with exit data
-            trade.exit_time = exit_data.get('exit_time', datetime.utcnow())
-            trade.exit_price = exit_data.get('exit_price')
-            trade.exit_reason = exit_data.get('exit_reason', 'Manual')
-            trade.pnl_usd = exit_data.get('pnl_usd')
-            trade.pnl_percentage = exit_data.get('pnl_percentage')
-            trade.status = "CLOSED"
-            trade.updated_at = datetime.utcnow()
+            trade_entry = TradeJournalEntry(
+                symbol=symbol,
+                strategy_id=strategy_id or "unknown",
+                entry_time=entry_time,
+                side=side,
+                entry_price=entry_price,
+                quantity=quantity,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                order_id=order_id,
+                status="open"
+            )
             
-            # Calculate duration
-            if trade.entry_time and trade.exit_time:
-                duration = trade.exit_time - trade.entry_time
-                trade.duration_minutes = int(duration.total_seconds() / 60)
+            # Add to worksheet
+            row_data = [
+                trade_entry.entry_time.strftime("%Y-%m-%d %H:%M:%S"),
+                trade_entry.symbol,
+                trade_entry.strategy_id,
+                trade_entry.side.upper(),
+                trade_entry.entry_price,
+                trade_entry.quantity,
+                trade_entry.stop_loss or "",
+                trade_entry.take_profit or "",
+                "", # Exit price (empty for new entry)
+                "", # Exit time (empty for new entry)
+                "", # PnL (empty for new entry)
+                "", # Fee (empty for new entry)
+                trade_entry.status,
+                trade_entry.order_id or ""
+            ]
             
-            # Find row in spreadsheet and update
-            row_number = await self._find_trade_row(trade_id)
-            if row_number:
-                row_data = self._trade_to_row_data(trade)
-                range_name = f'A{row_number}:W{row_number}'
-                self.worksheet.update(range_name, [row_data])
-                
-                logger.info(f"📊 Updated trade exit in Google Sheets: {trade_id} (P&L: ${trade.pnl_usd:.2f})")
-            
-            # Remove from active trades
-            del self.active_trades[trade_id]
-            
+            self.worksheet.append_row(row_data)
+            logger.info(f"✅ Trade entry logged to sheets: {symbol} {side} @ {entry_price}")
             return True
             
         except Exception as e:
-            logger.error(f"Error updating trade exit in Google Sheets: {e}")
+            logger.error(f"❌ Error logging trade entry: {e}")
             return False
     
-    async def _find_trade_row(self, trade_id: str) -> Optional[int]:
-        """
-        Find the row number for a specific trade ID.
-        
-        Args:
-            trade_id (str): Trade ID to find
-            
-        Returns:
-            Optional[int]: Row number if found
-        """
+    async def log_trade_exit(self, symbol: str, exit_price: float, exit_time: float = None,
+                           quantity: float = None, pnl: float = None, fee: float = None):
+        """Log a trade exit to Google Sheets."""
         try:
-            # Get all trade IDs from column A
-            trade_ids = self.worksheet.col_values(1)  # Column A
+            if not self.client or not self.worksheet:
+                logger.error("❌ Sheets service not properly initialized")
+                return False
             
-            for i, cell_trade_id in enumerate(trade_ids):
-                if cell_trade_id == trade_id:
-                    return i + 1  # gspread uses 1-based indexing
+            # Find the open trade for this symbol
+            all_values = self.worksheet.get_all_values()
             
-            return None
+            # Find the most recent open trade for this symbol
+            for i in range(len(all_values) - 1, 0, -1):  # Start from bottom, skip header
+                row = all_values[i]
+                if len(row) >= 13 and row[1] == symbol and row[12] == "open":
+                    # Update this row with exit information
+                    exit_datetime = datetime.fromtimestamp(exit_time or time.time(), tz=timezone.utc)
+                    
+                    # Calculate PnL if not provided
+                    if pnl is None and len(row) >= 6:
+                        try:
+                            entry_price = float(row[4])
+                            side = row[3].lower()
+                            qty = float(row[5]) if quantity is None else quantity
+                            
+                            if side == "long":
+                                pnl = (exit_price - entry_price) * qty
+                            else:
+                                pnl = (entry_price - exit_price) * qty
+                        except (ValueError, IndexError):
+                            pnl = 0
+                    
+                    # Update the row
+                    row_num = i + 1  # Sheets is 1-indexed
+                    self.worksheet.update(f'I{row_num}', exit_price)  # Exit price
+                    self.worksheet.update(f'J{row_num}', exit_datetime.strftime("%Y-%m-%d %H:%M:%S"))  # Exit time
+                    self.worksheet.update(f'K{row_num}', pnl or 0)  # PnL
+                    self.worksheet.update(f'L{row_num}', fee or 0)  # Fee
+                    self.worksheet.update(f'M{row_num}', "closed")  # Status
+                    
+                    logger.info(f"✅ Trade exit logged to sheets: {symbol} @ {exit_price} (PnL: {pnl})")
+                    return True
+            
+            logger.warning(f"⚠️ No open trade found for {symbol} to update with exit")
+            return False
             
         except Exception as e:
-            logger.error(f"Error finding trade row: {e}")
-            return None
+            logger.error(f"❌ Error logging trade exit: {e}")
+            return False
     
-    def _trade_to_row_data(self, trade: TradeJournalEntry) -> List[Any]:
-        """
-        Convert trade entry to spreadsheet row data.
-        
-        Args:
-            trade (TradeJournalEntry): Trade entry
+    async def get_status(self):
+        """Get the status of the Google Sheets service."""
+        try:
+            status = {
+                "connected": self.is_connected,
+                "spreadsheet_id": self.config.spreadsheet_id,
+                "worksheet_name": self.config.worksheet_name,
+                "last_update": None,
+                "total_trades": 0
+            }
             
-        Returns:
-            List[Any]: Row data for spreadsheet
-        """
-        return [
-            trade.trade_id,
-            trade.symbol,
-            trade.strategy,
-            trade.priority,
-            trade.entry_time.strftime('%Y-%m-%d %H:%M:%S') if trade.entry_time else '',
-            trade.entry_price,
-            trade.side,
-            trade.quantity,
-            trade.exit_time.strftime('%Y-%m-%d %H:%M:%S') if trade.exit_time else '',
-            trade.exit_price or '',
-            trade.exit_reason or '',
-            trade.stop_loss or '',
-            trade.take_profit or '',
-            trade.risk_amount or '',
-            trade.pnl_usd or '',
-            trade.pnl_percentage or '',
-            trade.duration_minutes or '',
-            trade.session_type or '',
-            trade.market_conditions or '',
-            trade.status,
-            trade.notes or '',
-            trade.created_at.strftime('%Y-%m-%d %H:%M:%S'),
-            trade.updated_at.strftime('%Y-%m-%d %H:%M:%S')
-        ]
+            if self.worksheet:
+                try:
+                    # Get basic info about the sheet
+                    all_values = self.worksheet.get_all_values()
+                    status["total_trades"] = len(all_values) - 1  # Subtract header row
+                    status["last_update"] = datetime.now(timezone.utc).isoformat()
+                except Exception as e:
+                    logger.warning(f"Could not get sheet details: {e}")
+            
+            return status
+            
+        except Exception as e:
+            logger.error(f"❌ Error getting sheets status: {e}")
+            return {"connected": False, "error": str(e)}
+    
+    async def test_connection(self):
+        """Test the Google Sheets connection."""
+        try:
+            if not self.client:
+                return {"success": False, "message": "Not authenticated"}
+            
+            if not self.worksheet:
+                return {"success": False, "message": "Worksheet not accessible"}
+            
+            # Try to read the first cell
+            test_value = self.worksheet.cell(1, 1).value
+            
+            # Try to get sheet info
+            sheet_info = {
+                "title": self.worksheet.title,
+                "row_count": self.worksheet.row_count,
+                "col_count": self.worksheet.col_count,
+                "test_read": test_value
+            }
+            
+            return {
+                "success": True,
+                "message": "Connection successful",
+                "sheet_info": sheet_info
+            }
+            
+        except Exception as e:
+            logger.error(f"❌ Sheets connection test failed: {e}")
+            return {"success": False, "message": str(e)}
     
     async def get_trade_statistics(self) -> Dict[str, Any]:
         """

@@ -1625,4 +1625,79 @@ class BybitService:
                 'closed_positions': [],
                 'failed_closures': [{'error': f"Position closure error: {str(e)}"}],
                 'total_attempted': 0
-            } 
+            }
+    
+    async def get_balance(self, currency="USDT"):
+        """Get account balance for a specific currency."""
+        try:
+            # Get wallet balance using V5 unified account
+            balance = self.exchange.fetch_balance({'type': 'unified'})
+            return balance.get(currency, {}).get('free', 0.0)
+        except Exception as e:
+            logger.error(f"Error fetching balance: {e}")
+            return 0.0
+    
+    async def get_all_positions(self):
+        """Get all active positions."""
+        try:
+            positions = self.exchange.fetch_positions()
+            active_positions = {}
+            
+            for position in positions:
+                symbol = position.get('symbol', '')
+                size = float(position.get('contracts', 0))
+                
+                if size != 0:  # Only include active positions
+                    # Normalize symbol (e.g., BTC/USDT:USDT -> BTCUSDT)
+                    normalized_symbol = symbol.replace('/USDT:USDT', '').replace('/USDC:USDC', '').replace('/', '')
+                    active_positions[normalized_symbol] = {
+                        'symbol': symbol,
+                        'size': size,
+                        'side': position.get('side'),
+                        'contracts': position.get('contracts', 0),
+                        'notional': position.get('notional', 0),
+                        'unrealizedPnl': position.get('unrealizedPnl', 0),
+                        'percentage': position.get('percentage', 0)
+                    }
+            
+            return active_positions
+            
+        except Exception as e:
+            logger.error(f"Error fetching positions: {e}")
+            return {}
+    
+    async def get_trade_history(self, symbol, limit=50):
+        """Get recent trade history for a symbol."""
+        try:
+            # Normalize symbol for market lookup
+            normalized_symbol = self._normalize_symbol(symbol)
+            market_id = self._find_market_id(normalized_symbol)
+            
+            if not market_id:
+                logger.error(f"Could not find market for {symbol}")
+                return []
+            
+            # Fetch recent trades
+            trades = self.exchange.fetch_my_trades(market_id, limit=limit)
+            
+            # Process trades for easier consumption
+            processed_trades = []
+            for trade in trades:
+                processed_trades.append({
+                    'id': trade.get('id'),
+                    'symbol': trade.get('symbol'),
+                    'side': trade.get('side'),
+                    'amount': trade.get('amount'),
+                    'price': trade.get('price'),
+                    'cost': trade.get('cost'),
+                    'fee': trade.get('fee', {}).get('cost', 0),
+                    'timestamp': trade.get('timestamp'),
+                    'datetime': trade.get('datetime'),
+                    'realizedPnl': trade.get('info', {}).get('closedPnl', 0)
+                })
+            
+            return processed_trades
+            
+        except Exception as e:
+            logger.error(f"Error fetching trade history for {symbol}: {e}")
+            return [] 
