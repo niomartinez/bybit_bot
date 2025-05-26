@@ -226,6 +226,16 @@ class SheetsService:
             
             trade_entry = self.active_trades[trade_id]
             
+            # Validate trade_entry has required attributes
+            if not hasattr(trade_entry, 'symbol') or not hasattr(trade_entry, 'side'):
+                logger.error(f"❌ Invalid trade entry for {trade_id}: missing required attributes")
+                return False
+            
+            # Validate exit_price
+            if not isinstance(exit_price, (int, float)) or exit_price <= 0:
+                logger.error(f"❌ Invalid exit price for {trade_id}: {exit_price}")
+                return False
+            
             # Update trade entry with exit information
             exit_datetime = datetime.fromtimestamp(exit_time or time.time(), tz=timezone.utc) if exit_time else datetime.now(timezone.utc)
             trade_entry.exit_time = exit_datetime
@@ -235,24 +245,45 @@ class SheetsService:
             
             # Calculate PnL if not provided
             if pnl is None and exit_price > 0:
-                entry_price = trade_entry.entry_price
-                qty = quantity or trade_entry.quantity
-                
-                if trade_entry.side.upper() == "LONG":
-                    pnl = (exit_price - entry_price) * qty
-                else:
-                    pnl = (entry_price - exit_price) * qty
+                try:
+                    entry_price = trade_entry.entry_price or 0
+                    qty = quantity or trade_entry.quantity or 0
+                    
+                    if trade_entry.side.upper() == "LONG":
+                        pnl = (exit_price - entry_price) * qty
+                    else:
+                        pnl = (entry_price - exit_price) * qty
+                        
+                    # Ensure pnl is a valid number
+                    if not isinstance(pnl, (int, float)) or not abs(pnl) < float('inf'):
+                        pnl = 0
+                        
+                except Exception as e:
+                    logger.warning(f"⚠️ Error calculating PnL for {trade_id}: {e}")
+                    pnl = 0
             
+            # Ensure pnl is never None
+            pnl = pnl if pnl is not None else 0
             trade_entry.pnl_usd = pnl
             
             # Calculate duration in minutes
             if trade_entry.entry_time and trade_entry.exit_time:
-                duration = (trade_entry.exit_time - trade_entry.entry_time).total_seconds() / 60
-                trade_entry.duration_minutes = int(duration)
+                try:
+                    duration = (trade_entry.exit_time - trade_entry.entry_time).total_seconds() / 60
+                    trade_entry.duration_minutes = int(duration) if duration >= 0 else 0
+                except Exception as e:
+                    logger.warning(f"⚠️ Error calculating duration for {trade_id}: {e}")
+                    trade_entry.duration_minutes = 0
             
             # Calculate PnL percentage
-            if pnl and trade_entry.risk_amount:
-                trade_entry.pnl_percentage = (pnl / trade_entry.risk_amount) * 100
+            try:
+                if pnl and trade_entry.risk_amount and trade_entry.risk_amount > 0:
+                    trade_entry.pnl_percentage = (pnl / trade_entry.risk_amount) * 100
+                else:
+                    trade_entry.pnl_percentage = 0
+            except Exception as e:
+                logger.warning(f"⚠️ Error calculating PnL percentage for {trade_id}: {e}")
+                trade_entry.pnl_percentage = 0
             
             trade_entry.updated_at = datetime.now(timezone.utc)
             
@@ -266,24 +297,40 @@ class SheetsService:
                     break
             
             if row_to_update:
-                # Update the specific cells for exit information
-                # Using the column mapping from SheetsConfig
-                updates = [
-                    ('I', trade_entry.exit_time.strftime("%Y-%m-%d %H:%M:%S")),  # Exit time
-                    ('J', str(exit_price)),  # Exit price
-                    ('K', trade_entry.exit_reason),  # Exit reason
-                    ('O', str(pnl or 0)),  # PnL USD
-                    ('P', str(trade_entry.pnl_percentage or 0)),  # PnL %
-                    ('Q', str(trade_entry.duration_minutes or 0)),  # Duration
-                    ('T', 'CLOSED'),  # Status
-                    ('W', trade_entry.updated_at.strftime("%Y-%m-%d %H:%M:%S"))  # Updated at
+                # Prepare values ensuring they're all valid for Google Sheets
+                exit_time_str = trade_entry.exit_time.strftime("%Y-%m-%d %H:%M:%S") if trade_entry.exit_time else ""
+                exit_price_str = str(exit_price) if exit_price is not None else ""
+                exit_reason_str = str(trade_entry.exit_reason) if trade_entry.exit_reason is not None else "Unknown"
+                pnl_str = f"{pnl:.2f}" if pnl is not None else "0"
+                pnl_pct_str = f"{trade_entry.pnl_percentage:.2f}" if trade_entry.pnl_percentage is not None else "0"
+                duration_str = str(trade_entry.duration_minutes) if trade_entry.duration_minutes is not None else "0"
+                updated_str = trade_entry.updated_at.strftime("%Y-%m-%d %H:%M:%S") if trade_entry.updated_at else ""
+                
+                # Use batch update with proper range for better reliability
+                range_name = f'I{row_to_update}:W{row_to_update}'
+                values = [
+                    exit_time_str,     # I - Exit time
+                    exit_price_str,    # J - Exit price
+                    exit_reason_str,   # K - Exit reason
+                    "",                # L - (skip)
+                    "",                # M - (skip)
+                    "",                # N - (skip)
+                    pnl_str,          # O - PnL USD
+                    pnl_pct_str,      # P - PnL %
+                    duration_str,     # Q - Duration
+                    "",                # R - (skip)
+                    "",                # S - (skip)
+                    "CLOSED",         # T - Status
+                    "",                # U - (skip)
+                    "",                # V - (skip)
+                    updated_str       # W - Updated at
                 ]
                 
-                # Batch update all exit fields
-                for col, value in updates:
-                    self.worksheet.update(f'{col}{row_to_update}', value)
+                # Batch update all exit fields at once
+                self.worksheet.update(range_name, [values])
                 
-                logger.info(f"✅ Trade exit logged to sheets: {trade_entry.symbol} @ {exit_price} (PnL: ${pnl:.2f})")
+                pnl_display = f"${pnl:.2f}" if pnl is not None else "$0.00"
+                logger.info(f"✅ Trade exit logged to sheets: {trade_entry.symbol} @ {exit_price} (PnL: {pnl_display})")
                 
                 # Remove from active trades
                 del self.active_trades[trade_id]
@@ -509,22 +556,23 @@ class SheetsService:
                     break
             
             if row_to_update:
-                # Update the status and related fields
-                updates = [
-                    ('T', new_status),  # Status
-                    ('W', trade_entry.updated_at.strftime("%Y-%m-%d %H:%M:%S"))  # Updated at
-                ]
+                # Prepare values ensuring they're all valid for Google Sheets
+                status_str = str(new_status) if new_status is not None else "PENDING"
+                updated_str = trade_entry.updated_at.strftime("%Y-%m-%d %H:%M:%S") if trade_entry.updated_at else ""
                 
-                # If updating to ACTIVE with new fill price/time
+                # First update the status and updated_at fields
+                status_range = f'T{row_to_update}:W{row_to_update}'
+                status_values = [status_str, "", "", updated_str]  # T, U, V, W
+                self.worksheet.update(status_range, [status_values])
+                
+                # If updating to ACTIVE with new fill price/time, update entry fields
                 if new_status == "ACTIVE" and fill_price is not None:
-                    updates.extend([
-                        ('E', trade_entry.entry_time.strftime("%Y-%m-%d %H:%M:%S")),  # Entry time
-                        ('F', str(fill_price))  # Entry price
-                    ])
-                
-                # Batch update all fields
-                for col, value in updates:
-                    self.worksheet.update(f'{col}{row_to_update}', value)
+                    entry_time_str = trade_entry.entry_time.strftime("%Y-%m-%d %H:%M:%S") if trade_entry.entry_time else ""
+                    fill_price_str = str(fill_price) if fill_price is not None else ""
+                    
+                    entry_range = f'E{row_to_update}:F{row_to_update}'
+                    entry_values = [entry_time_str, fill_price_str]  # E, F
+                    self.worksheet.update(entry_range, [entry_values])
                 
                 logger.info(f"✅ Trade status updated: {trade_entry.symbol} {trade_id} → {new_status}")
                 return True
