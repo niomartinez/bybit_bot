@@ -285,10 +285,22 @@ class SheetsService:
             
             # Calculate PnL percentage
             try:
-                if pnl and trade_entry.risk_amount and trade_entry.risk_amount > 0:
-                    trade_entry.pnl_percentage = (pnl / trade_entry.risk_amount) * 100
-                else:
-                    trade_entry.pnl_percentage = 0
+                trade_entry.pnl_percentage = 0
+                if pnl and pnl != 0:
+                    # Method 1: Use risk amount if available (preferred)
+                    if trade_entry.risk_amount and trade_entry.risk_amount > 0:
+                        trade_entry.pnl_percentage = (pnl / trade_entry.risk_amount) * 100
+                    # Method 2: Calculate based on position value
+                    elif trade_entry.entry_price and trade_entry.quantity:
+                        position_value = trade_entry.entry_price * trade_entry.quantity
+                        if position_value > 0:
+                            trade_entry.pnl_percentage = (pnl / position_value) * 100
+                    # Method 3: Calculate based on entry price percentage
+                    elif trade_entry.entry_price and trade_entry.entry_price > 0:
+                        price_change_pct = (pnl / trade_entry.quantity) / trade_entry.entry_price * 100 if trade_entry.quantity > 0 else 0
+                        trade_entry.pnl_percentage = price_change_pct
+                        
+                logger.debug(f"P&L calculation for {trade_id}: ${pnl:.2f} ({trade_entry.pnl_percentage:.2f}%)")
             except Exception as e:
                 logger.warning(f"⚠️ Error calculating PnL percentage for {trade_id}: {e}")
                 trade_entry.pnl_percentage = 0
@@ -314,23 +326,29 @@ class SheetsService:
                 duration_str = str(trade_entry.duration_minutes) if trade_entry.duration_minutes is not None else "0"
                 updated_str = trade_entry.updated_at.strftime("%Y-%m-%d %H:%M:%S") if trade_entry.updated_at else ""
                 
+                # Preserve original SL/TP values from trade entry
+                sl_str = str(trade_entry.stop_loss) if trade_entry.stop_loss is not None else ""
+                tp_str = str(trade_entry.take_profit) if trade_entry.take_profit is not None else ""
+                risk_amount_str = str(trade_entry.risk_amount) if trade_entry.risk_amount is not None else ""
+                session_type_str = str(trade_entry.session_type) if trade_entry.session_type is not None else ""
+                
                 # Use batch update with proper range for better reliability
                 range_name = f'I{row_to_update}:W{row_to_update}'
                 values = [
                     exit_time_str,     # I - Exit time
                     exit_price_str,    # J - Exit price
                     exit_reason_str,   # K - Exit reason
-                    "",                # L - (skip)
-                    "",                # M - (skip)
-                    "",                # N - (skip)
+                    sl_str,           # L - Stop Loss (preserve original)
+                    tp_str,           # M - Take Profit (preserve original)
+                    risk_amount_str,  # N - Risk Amount (preserve original)
                     pnl_str,          # O - PnL USD
                     pnl_pct_str,      # P - PnL %
                     duration_str,     # Q - Duration
-                    "",                # R - (skip)
-                    "",                # S - (skip)
+                    session_type_str, # R - Session Type (preserve original)
+                    "",               # S - Market Conditions (empty for now)
                     "CLOSED",         # T - Status
-                    "",                # U - (skip)
-                    "",                # V - (skip)
+                    "",               # U - Notes (empty for now)
+                    "",               # V - Created At (preserve original, don't update)
                     updated_str       # W - Updated at
                 ]
                 

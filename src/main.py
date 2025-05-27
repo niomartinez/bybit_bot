@@ -130,7 +130,43 @@ async def monitor_trade_lifecycle():
             if actual_position_count != tracked_active_count:
                 logger.warning(f"📊 Position tracking mismatch: {tracked_active_count} TRACKED active, {actual_position_count} ACTUAL positions")
                 logger.info(f"📊 Actual positions: {list(current_positions.keys())}")
-                logger.info(f"📊 Tracked active trades: {[trade.symbol for trade in active_trades.values()]}")
+                logger.info(f"📊 Tracked active trades: {[trade.symbol.replace('.P', '') for trade in active_trades.values()]}")
+                
+                # Debug: Check for symbol format mismatches
+                actual_symbols = set(current_positions.keys())
+                tracked_symbols = set(trade.symbol.replace('.P', '') for trade in active_trades.values())
+                
+                # Also try alternative symbol normalizations for better matching
+                def normalize_symbol(symbol):
+                    """Normalize symbol to base format like BTCUSDT"""
+                    # Remove .P suffix
+                    symbol = symbol.replace('.P', '')
+                    # Handle exchange formats like BTC/USDT:USDT -> BTCUSDT
+                    if '/USDT:USDT' in symbol:
+                        symbol = symbol.replace('/USDT:USDT', 'USDT')
+                    elif '/USDC:USDC' in symbol:
+                        symbol = symbol.replace('/USDC:USDC', 'USDC')
+                    elif '/' in symbol and ':' in symbol:
+                        # Generic format like BTC/USDT:USDT
+                        parts = symbol.split('/')
+                        if len(parts) == 2:
+                            base = parts[0]
+                            quote_part = parts[1].split(':')[0]  # Get USDT from USDT:USDT
+                            symbol = base + quote_part
+                    
+                    return symbol.upper()
+                
+                # Re-normalize tracked symbols for better comparison
+                tracked_symbols_normalized = set(normalize_symbol(trade.symbol) for trade in active_trades.values())
+                
+                untracked_positions = actual_symbols - tracked_symbols_normalized
+                tracked_without_position = tracked_symbols_normalized - actual_symbols
+                
+                if untracked_positions:
+                    logger.warning(f"🔍 Untracked positions (likely manual): {list(untracked_positions)}")
+                if tracked_without_position:
+                    logger.warning(f"🔍 Tracked trades without positions: {list(tracked_without_position)}")
+                
             else:
                 logger.info(f"📊 Monitoring: {len(pending_trades)} PENDING, {len(active_trades)} ACTIVE trades, {actual_position_count} positions")
             
@@ -172,12 +208,18 @@ async def monitor_trade_lifecycle():
             # Step 2: Check ACTIVE positions for exits (ACTIVE → CLOSED)
             for trade_id, trade_entry in active_trades.items():
                 symbol = trade_entry.symbol
+                symbol_clean = symbol.replace('.P', '')  # Remove .P suffix for comparison
                 
-                # Check if position still exists
-                current_pos = current_positions.get(symbol)
-                position_size = current_pos.get('size', 0) if current_pos else 0
+                # Check if position still exists (more robust checking)
+                current_pos = current_positions.get(symbol_clean)
+                position_size = abs(current_pos.get('size', 0)) if current_pos else 0
+                position_contracts = abs(current_pos.get('contracts', 0)) if current_pos else 0
                 
-                if position_size == 0:
+                # More robust position closure detection
+                position_exists = position_size > 0 or position_contracts > 0
+                
+                # Only consider position closed if we're CERTAIN it's closed
+                if not position_exists:
                     # Position is closed - look for exit order
                     exit_found = False
                     
@@ -237,34 +279,79 @@ async def monitor_trade_lifecycle():
                                 exit_found = True
                                 break
                     
-                    # If no exit order found but position is closed, mark as closed anyway
+                    # If no exit order found but position is closed, get proper exit price
                     if not exit_found:
-                        # Try to get a reasonable exit price from recent market data or use entry price
                         exit_price = 0
+                        exit_reason = "Position Closed"
+                        
                         try:
-                            # Option 1: Use last known price from recent orders for this symbol
-                            symbol_orders = [o for o in recent_orders if o.get('symbol', '').replace('/USDT:USDT', '').replace('/USDC:USDC', '').replace('/', '') == symbol]
+                            # Option 1: Look for recent market orders for this symbol (any side)
+                            symbol_orders = [o for o in recent_orders 
+                                           if o.get('symbol', '').replace('/USDT:USDT', '').replace('/USDC:USDC', '').replace('/', '') == symbol_clean
+                                           and o.get('status', '').lower() in ['filled', 'closed']
+                                           and o.get('timestamp', 0) > 0]
+                            
                             if symbol_orders:
+                                # Get the most recent filled order for this symbol
                                 latest_order = max(symbol_orders, key=lambda x: x.get('timestamp', 0))
                                 exit_price = float(latest_order.get('price') or latest_order.get('average') or 0)
-                                logger.info(f"Using recent order price as exit price: {exit_price}")
+                                
+                                # Try to determine if it was TP/SL based on price proximity
+                                if exit_price > 0:
+                                    entry_price = trade_entry.entry_price or 0
+                                    tp_price = trade_entry.take_profit or 0
+                                    sl_price = trade_entry.stop_loss or 0
+                                    
+                                    # Check which is closer - TP or SL
+                                    if tp_price > 0 and sl_price > 0:
+                                        tp_distance = abs(exit_price - tp_price)
+                                        sl_distance = abs(exit_price - sl_price)
+                                        if tp_distance < sl_distance and tp_distance < abs(entry_price * 0.02):  # Within 2% of TP
+                                            exit_reason = "Take Profit"
+                                        elif sl_distance < abs(entry_price * 0.02):  # Within 2% of SL
+                                            exit_reason = "Stop Loss"
+                                    
+                                logger.info(f"Using recent market order price as exit: {exit_price} ({exit_reason})")
                             
-                            # Option 2: Fallback to entry price if no recent orders
-                            if exit_price == 0 and hasattr(trade_entry, 'entry_price'):
-                                exit_price = trade_entry.entry_price
-                                logger.info(f"Using entry price as exit price fallback: {exit_price}")
+                            # Option 2: Try to fetch current market price for the symbol
+                            if exit_price == 0:
+                                try:
+                                    # Get current market price from exchange
+                                    market_id = signal_processor.bybit_service.get_market_id(symbol_clean, 'linear')
+                                    ticker = signal_processor.bybit_service.exchange.fetch_ticker(market_id)
+                                    exit_price = float(ticker.get('last', 0) or ticker.get('close', 0) or 0)
+                                    if exit_price > 0:
+                                        exit_reason = "Market Close"
+                                        logger.info(f"Using current market price as exit: {exit_price}")
+                                except Exception as ticker_error:
+                                    logger.warning(f"Could not fetch market price for {symbol_clean}: {ticker_error}")
+                            
+                            # Option 3: Last resort - use entry price but mark as unknown exit
+                            if exit_price == 0:
+                                exit_price = trade_entry.entry_price or 0
+                                exit_reason = "Position Closed (Unknown Price)"
+                                logger.warning(f"Using entry price as last resort: {exit_price}")
                                 
                         except Exception as e:
-                            logger.warning(f"Could not determine exit price for {symbol}: {e}")
-                            exit_price = 0
+                            logger.warning(f"Error determining exit price for {symbol}: {e}")
+                            exit_price = trade_entry.entry_price or 0
+                            exit_reason = "Position Closed (Error)"
+                        
+                        # Calculate proper P&L
+                        pnl = 0
+                        if exit_price > 0 and trade_entry.entry_price > 0 and trade_entry.quantity > 0:
+                            if trade_entry.side.upper() == "LONG":
+                                pnl = (exit_price - trade_entry.entry_price) * trade_entry.quantity
+                            else:
+                                pnl = (trade_entry.entry_price - exit_price) * trade_entry.quantity
                         
                         await sheets_service.log_trade_exit(
                             trade_id=trade_id,
                             exit_price=exit_price,
-                            exit_reason="Position Closed (TP/SL)",
-                            pnl=0
+                            exit_reason=exit_reason,
+                            pnl=pnl
                         )
-                        logger.info(f"📝 Position closed detected (no exit order): {symbol} @ {exit_price}")
+                        logger.info(f"📝 Position closed detected: {symbol} @ {exit_price} (PnL: ${pnl:.2f}, Reason: {exit_reason})")
             
             # Step 3: Check PENDING orders for cancellations (PENDING → remove)
             for trade_id, trade_entry in list(pending_trades.items()):
@@ -551,6 +638,7 @@ async def process_signal_background(signal: TradingViewSignal):
                     
                     # Get session type
                     session_type = await get_current_session_type()
+                    logger.debug(f"Session type for {signal.symbol}: {session_type}")
                     
                     # Journal the order as PENDING
                     await sheets_service.log_trade_entry(
