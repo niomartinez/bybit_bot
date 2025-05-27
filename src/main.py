@@ -123,7 +123,16 @@ async def monitor_trade_lifecycle():
             pending_trades = {tid: trade for tid, trade in sheets_service.active_trades.items() if trade.status == "PENDING"}
             active_trades = {tid: trade for tid, trade in sheets_service.active_trades.items() if trade.status == "ACTIVE"}
             
-            logger.info(f"📊 Monitoring: {len(pending_trades)} PENDING, {len(active_trades)} ACTIVE trades")
+            # Enhanced monitoring: also show actual positions vs tracked trades
+            actual_position_count = len(current_positions)
+            tracked_active_count = len(active_trades)
+            
+            if actual_position_count != tracked_active_count:
+                logger.warning(f"📊 Position tracking mismatch: {tracked_active_count} TRACKED active, {actual_position_count} ACTUAL positions")
+                logger.info(f"📊 Actual positions: {list(current_positions.keys())}")
+                logger.info(f"📊 Tracked active trades: {[trade.symbol for trade in active_trades.values()]}")
+            else:
+                logger.info(f"📊 Monitoring: {len(pending_trades)} PENDING, {len(active_trades)} ACTIVE trades, {actual_position_count} positions")
             
             # Step 1: Check PENDING orders for fills (PENDING → ACTIVE)
             for trade_id, trade_entry in pending_trades.items():
@@ -230,13 +239,32 @@ async def monitor_trade_lifecycle():
                     
                     # If no exit order found but position is closed, mark as closed anyway
                     if not exit_found:
+                        # Try to get a reasonable exit price from recent market data or use entry price
+                        exit_price = 0
+                        try:
+                            # Option 1: Use last known price from recent orders for this symbol
+                            symbol_orders = [o for o in recent_orders if o.get('symbol', '').replace('/USDT:USDT', '').replace('/USDC:USDC', '').replace('/', '') == symbol]
+                            if symbol_orders:
+                                latest_order = max(symbol_orders, key=lambda x: x.get('timestamp', 0))
+                                exit_price = float(latest_order.get('price') or latest_order.get('average') or 0)
+                                logger.info(f"Using recent order price as exit price: {exit_price}")
+                            
+                            # Option 2: Fallback to entry price if no recent orders
+                            if exit_price == 0 and hasattr(trade_entry, 'entry_price'):
+                                exit_price = trade_entry.entry_price
+                                logger.info(f"Using entry price as exit price fallback: {exit_price}")
+                                
+                        except Exception as e:
+                            logger.warning(f"Could not determine exit price for {symbol}: {e}")
+                            exit_price = 0
+                        
                         await sheets_service.log_trade_exit(
                             trade_id=trade_id,
-                            exit_price=0,
-                            exit_reason="Position Closed",
+                            exit_price=exit_price,
+                            exit_reason="Position Closed (TP/SL)",
                             pnl=0
                         )
-                        logger.info(f"📝 Position closed detected (no exit order): {symbol}")
+                        logger.info(f"📝 Position closed detected (no exit order): {symbol} @ {exit_price}")
             
             # Step 3: Check PENDING orders for cancellations (PENDING → remove)
             for trade_id, trade_entry in list(pending_trades.items()):

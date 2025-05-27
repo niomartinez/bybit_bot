@@ -231,10 +231,18 @@ class SheetsService:
                 logger.error(f"❌ Invalid trade entry for {trade_id}: missing required attributes")
                 return False
             
-            # Validate exit_price
-            if not isinstance(exit_price, (int, float)) or exit_price <= 0:
+            # Validate exit_price (allow 0 for position closure detection)
+            if not isinstance(exit_price, (int, float)) or exit_price < 0:
                 logger.error(f"❌ Invalid exit price for {trade_id}: {exit_price}")
                 return False
+            
+            # Special handling for exit_price = 0 (position closure without exit order found)
+            if exit_price == 0:
+                logger.warning(f"⚠️ Exit price is 0 for {trade_id} - using position closure detection")
+                # Try to get a reasonable exit price from the position or use entry price as fallback
+                if hasattr(trade_entry, 'entry_price') and trade_entry.entry_price > 0:
+                    exit_price = trade_entry.entry_price  # Neutral exit for unknown price
+                    logger.info(f"Using entry price as exit price fallback: {exit_price}")
             
             # Update trade entry with exit information
             exit_datetime = datetime.fromtimestamp(exit_time or time.time(), tz=timezone.utc) if exit_time else datetime.now(timezone.utc)

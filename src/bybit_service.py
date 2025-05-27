@@ -1418,6 +1418,7 @@ class BybitService:
                 })
             
             # Analyze existing positions and determine if they need to be closed
+            # 🚨 CRITICAL: Only close positions we can PROVE were created by our bot
             active_positions = []
             for position in existing_positions:
                 pos_size = position.get('size', 0)
@@ -1425,19 +1426,52 @@ class BybitService:
                 pos_side = position.get('side', '').lower()
                 
                 if pos_size != 0 or pos_contracts != 0:  # Active position
-                    # For now, assume all positions are Priority 2 unless we implement position tracking by priority
-                    # This could be enhanced later by tracking position creation with order IDs
-                    position_priority = 2  # Default assumption for existing positions
+                    # 🔒 SAFETY: Never assume a position is bot-created without proof
+                    # Only consider positions as bot-created if we can identify them through:
+                    # 1. Active tracking in sheets service (if available)
+                    # 2. Position creation correlation with our order IDs
+                    # 3. Explicit bot position markers (future enhancement)
                     
+                    position_priority = None  # Unknown until proven
+                    is_bot_position = False
+                    
+                    # Check if this position is being tracked by our sheets service
+                    # This is the safest way to identify our own positions
+                    tracked_trade_id = None
+                    try:
+                        # Import sheets service to check active trades (if available)
+                        from src.main import sheets_service
+                        if sheets_service and hasattr(sheets_service, 'active_trades'):
+                            for trade_id, trade_entry in sheets_service.active_trades.items():
+                                if (trade_entry.symbol.replace('.P', '') == symbol and 
+                                    trade_entry.side.lower() == pos_side and 
+                                    trade_entry.status == "ACTIVE"):
+                                    # This position matches our tracked trade
+                                    is_bot_position = True
+                                    position_priority = trade_entry.priority if hasattr(trade_entry, 'priority') else 2
+                                    tracked_trade_id = trade_id
+                                    logger.info(f"✅ Identified bot position: {pos_side} | Tracked trade: {trade_id} | Priority: {position_priority}")
+                                    break
+                    except Exception as e:
+                        logger.warning(f"Could not check sheets service for position tracking: {e}")
+                    
+                    # If we cannot identify this as our position, treat it as MANUAL/PROTECTED
+                    if not is_bot_position:
+                        logger.warning(f"🔒 PROTECTED POSITION: {pos_side} | Size: {pos_size} | NOT tracked by bot - will NOT be closed")
+                        continue  # Skip this position - don't add to positions_to_close
+                    
+                    # Only add confirmed bot positions that can be safely closed
                     active_positions.append({
                         'side': pos_side,
                         'size': pos_size,
                         'contracts': pos_contracts,
                         'priority': position_priority,
-                        'position': position
+                        'position': position,
+                        'is_bot_position': is_bot_position,
+                        'tracked_trade_id': tracked_trade_id if is_bot_position else None
                     })
                     
-                    logger.info(f"Active position: {pos_side} | Size: {pos_size} | Contracts: {pos_contracts} | Assumed Priority: {position_priority}")
+                    logger.info(f"Bot position: {pos_side} | Size: {pos_size} | Contracts: {pos_contracts} | Priority: {position_priority}")
             
             # Priority conflict resolution logic
             if requested_priority == 1:
@@ -1448,16 +1482,21 @@ class BybitService:
                         conflict_info['orders_to_cancel'].append(p2_order)
                         conflict_info['conflicts_found'].append(f"Priority 2 order {p2_order['order_link_id']} will be cancelled")
                 
-                # Close any active Priority 2 positions 
+                # Close any active Priority 2 BOT positions (manual positions are protected)
                 requested_direction = 'long' if requested_side.lower() == 'buy' else 'short'
                 for pos in active_positions:
-                    if pos['priority'] == 2:  # Priority 2 position
+                    if pos['priority'] == 2 and pos.get('is_bot_position', False):  # Only bot positions with Priority 2
                         # Close regardless of direction to allow Priority 1 full control
                         conflict_info['positions_to_close'].append(pos)
+                        tracked_id = pos.get('tracked_trade_id', 'Unknown')
                         if pos['side'] != requested_direction:
-                            conflict_info['conflicts_found'].append(f"Priority 2 {pos['side']} position will be closed for direction change")
+                            conflict_info['conflicts_found'].append(f"Bot Priority 2 {pos['side']} position will be closed for direction change (Trade: {tracked_id})")
                         else:
-                            conflict_info['conflicts_found'].append(f"Priority 2 {pos['side']} position will be closed for Priority 1 override")
+                            conflict_info['conflicts_found'].append(f"Bot Priority 2 {pos['side']} position will be closed for Priority 1 override (Trade: {tracked_id})")
+                    elif pos['priority'] == 2 and not pos.get('is_bot_position', False):
+                        logger.info(f"🔒 Skipping manual/untracked position: {pos['side']} (not closing)")
+                    elif pos['priority'] == 1:
+                        logger.info(f"🎯 Keeping Priority 1 bot position: {pos['side']}")
                 
                 # Also check for existing Priority 1 orders for direction conflicts or pyramiding
                 if 1 in conflict_info['existing_priorities']:
@@ -1515,11 +1554,20 @@ class BybitService:
                         
                         for pos in active_positions:
                             if pos['side'] != requested_direction:
-                                # Priority 2 cannot reverse positions
-                                conflict_info['allow_order'] = False
-                                conflict_info['reason'] = f"Priority 2 cannot reverse position from {pos['side']} to {requested_direction}"
-                                logger.warning(conflict_info['reason'])
-                                break
+                                # Check if this is a bot position or manual position
+                                if pos.get('is_bot_position', False):
+                                    # Priority 2 cannot reverse BOT positions
+                                    conflict_info['allow_order'] = False
+                                    tracked_id = pos.get('tracked_trade_id', 'Unknown')
+                                    conflict_info['reason'] = f"Priority 2 cannot reverse bot position from {pos['side']} to {requested_direction} (Trade: {tracked_id})"
+                                    logger.warning(conflict_info['reason'])
+                                    break
+                                else:
+                                    # Manual position - Priority 2 also cannot reverse but warn differently
+                                    conflict_info['allow_order'] = False
+                                    conflict_info['reason'] = f"Priority 2 blocked: Manual {pos['side']} position exists (cannot reverse manual positions)"
+                                    logger.warning(f"🔒 Priority 2 blocked by manual position: {pos['side']}")
+                                    break
             
             logger.info(f"Priority conflict resolution: {conflict_info['reason']}")
             return conflict_info
@@ -1751,20 +1799,30 @@ class BybitService:
             for position in positions:
                 symbol = position.get('symbol', '')
                 size = float(position.get('contracts', 0))
+                position_size = float(position.get('size', 0))  # Also check size field
                 
-                if size != 0:  # Only include active positions
+                # Check both size and contracts fields to catch all active positions
+                if size != 0 or position_size != 0:  # Only include active positions
                     # Normalize symbol (e.g., BTC/USDT:USDT -> BTCUSDT)
                     normalized_symbol = symbol.replace('/USDT:USDT', '').replace('/USDC:USDC', '').replace('/', '')
+                    
+                    # Use the non-zero value for size
+                    actual_size = size if size != 0 else position_size
+                    
                     active_positions[normalized_symbol] = {
                         'symbol': symbol,
-                        'size': size,
+                        'size': actual_size,
                         'side': position.get('side'),
                         'contracts': position.get('contracts', 0),
                         'notional': position.get('notional', 0),
                         'unrealizedPnl': position.get('unrealizedPnl', 0),
-                        'percentage': position.get('percentage', 0)
+                        'percentage': position.get('percentage', 0),
+                        'raw_position': position  # Keep raw data for debugging
                     }
+                    
+                    logger.debug(f"Active position found: {normalized_symbol} | Size: {actual_size} | Side: {position.get('side')}")
             
+            logger.info(f"Found {len(active_positions)} active positions: {list(active_positions.keys())}")
             return active_positions
             
         except Exception as e:
