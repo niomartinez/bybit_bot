@@ -34,20 +34,20 @@ class PnLTrailingStopManager:
         self.monitoring_active = False
         self.last_check_time: Optional[datetime] = None
         
-        logger.info(f"PnL Trailing Stop Manager initialized - Threshold: {self.config.pnl_threshold_percentage}%")
+        logger.info(f"PnL Trailing Stop Manager initialized - Target: {self.config.target_percentage}%")
         logger.info(f"Configuration: {self.config.dict()}")
     
     async def start_monitoring(self):
-        """Start the PnL monitoring background task."""
+        """Start the target monitoring background task."""
         if not self.config.enabled:
             logger.info("💤 PnL trailing stop monitoring is disabled in configuration")
             return
         
         if self.monitoring_active:
-            logger.warning("⚠️ PnL monitoring is already active")
+            logger.warning("⚠️ Target monitoring is already active")
             return
         
-        logger.info(f"🎯 Starting PnL trailing stop monitoring (threshold: {self.config.pnl_threshold_percentage}%, interval: {self.config.monitoring_interval_seconds}s)")
+        logger.info(f"🎯 Starting target-based trailing stop monitoring (target: {self.config.target_percentage}%, interval: {self.config.monitoring_interval_seconds}s)")
         self.monitoring_active = True
         
         while self.monitoring_active:
@@ -56,16 +56,16 @@ class PnLTrailingStopManager:
                 await asyncio.sleep(self.config.monitoring_interval_seconds)
                 
             except Exception as e:
-                logger.error(f"❌ Error in PnL monitoring: {e}")
+                logger.error(f"❌ Error in target monitoring: {e}")
                 await asyncio.sleep(self.config.monitoring_interval_seconds)
     
     def stop_monitoring(self):
-        """Stop the PnL monitoring."""
-        logger.info("🛑 Stopping PnL trailing stop monitoring")
+        """Stop the target monitoring."""
+        logger.info("🛑 Stopping target-based trailing stop monitoring")
         self.monitoring_active = False
     
     async def _monitor_positions(self):
-        """Monitor all active positions for PnL threshold breaches."""
+        """Monitor all active positions for target threshold breaches."""
         try:
             # Get all active positions
             positions = await self.bybit_service.get_all_positions()
@@ -104,7 +104,7 @@ class PnLTrailingStopManager:
             logger.debug(f"Cleaned up creation time tracking for: {symbol}")
     
     async def _check_position_for_trailing_stop(self, symbol: str, position_data: Dict[str, Any]):
-        """Check a single position for PnL threshold and apply trailing stop if needed."""
+        """Check a single position for target threshold and apply trailing stop if needed."""
         try:
             # Skip if already adjusted
             if symbol in self.adjusted_positions:
@@ -124,19 +124,48 @@ class PnLTrailingStopManager:
                 logger.debug(f"Position {symbol} too young ({position_age.total_seconds():.0f}s < {min_age_delta.total_seconds():.0f}s)")
                 return
             
-            # Calculate current PnL percentage
-            pnl_percentage = await self.bybit_service.get_position_pnl_percentage(symbol)
+            # Get position details
+            raw_position = position_data.get('raw_position', {})
+            entry_price = float(raw_position.get('avgPrice', 0))
+            current_price = float(raw_position.get('markPrice', 0))
+            side = position_data.get('side', '').lower()
             
-            if pnl_percentage is None:
-                logger.debug(f"Could not calculate PnL percentage for {symbol}")
+            if entry_price <= 0 or current_price <= 0:
+                logger.debug(f"Invalid prices for {symbol}: entry={entry_price}, current={current_price}")
                 return
             
-            # Check if PnL threshold is reached
-            if pnl_percentage >= self.config.pnl_threshold_percentage:
-                logger.info(f"🎯 PnL threshold reached for {symbol}: {pnl_percentage:.2f}% >= {self.config.pnl_threshold_percentage}%")
+            # Try to get take profit target from sheets service (tracked trades)
+            take_profit_target = await self._get_take_profit_target(symbol)
+            
+            if take_profit_target:
+                # Use target-based logic
+                target_reached = self._check_target_percentage_reached(entry_price, current_price, take_profit_target, side)
+                threshold_type = "target"
+                threshold_value = self.config.target_percentage
+            else:
+                # Fallback to PnL-based logic
+                if not self.config.fallback_to_pnl:
+                    logger.debug(f"No take profit target for {symbol} and PnL fallback disabled, skipping")
+                    return
                 
-                # Get position details for stop loss calculation
-                success = await self._apply_trailing_stop(symbol, position_data, pnl_percentage)
+                pnl_percentage = await self.bybit_service.get_position_pnl_percentage(symbol)
+                if pnl_percentage is None:
+                    logger.debug(f"Could not calculate PnL percentage for {symbol}")
+                    return
+                
+                target_reached = pnl_percentage >= self.config.fallback_pnl_percentage
+                threshold_type = "PnL"
+                threshold_value = self.config.fallback_pnl_percentage
+                current_value = pnl_percentage
+            
+            if target_reached:
+                if take_profit_target:
+                    current_value = self._calculate_target_percentage(entry_price, current_price, take_profit_target, side)
+                
+                logger.info(f"🎯 {threshold_type} threshold reached for {symbol}: {current_value:.2f}% >= {threshold_value}%")
+                
+                # Apply trailing stop
+                success = await self._apply_trailing_stop(symbol, position_data, current_value, threshold_type)
                 
                 if success:
                     # Mark this position as adjusted
@@ -145,12 +174,67 @@ class PnLTrailingStopManager:
                 else:
                     logger.warning(f"⚠️ Failed to apply trailing stop for {symbol}")
             else:
-                logger.debug(f"Position {symbol}: PnL {pnl_percentage:.2f}% < threshold {self.config.pnl_threshold_percentage}%")
+                if take_profit_target:
+                    current_value = self._calculate_target_percentage(entry_price, current_price, take_profit_target, side)
+                logger.debug(f"Position {symbol}: {threshold_type} {current_value:.2f}% < threshold {threshold_value}%")
                 
         except Exception as e:
             logger.error(f"Error checking position {symbol} for trailing stop: {e}")
     
-    async def _apply_trailing_stop(self, symbol: str, position_data: Dict[str, Any], current_pnl_pct: float) -> bool:
+    async def _get_take_profit_target(self, symbol: str) -> Optional[float]:
+        """Get the take profit target for a position from sheets service."""
+        try:
+            # Try to get take profit from sheets service (tracked trades)
+            from src.main import sheets_service
+            if sheets_service and hasattr(sheets_service, 'active_trades'):
+                symbol_clean = symbol.replace('.P', '')
+                for trade_id, trade_entry in sheets_service.active_trades.items():
+                    if (trade_entry.symbol.replace('.P', '') == symbol_clean and 
+                        trade_entry.status == "ACTIVE" and
+                        trade_entry.take_profit):
+                        logger.debug(f"Found take profit target for {symbol}: ${trade_entry.take_profit}")
+                        return float(trade_entry.take_profit)
+            
+            # Could also check for TP/SL set on the exchange itself in future
+            # For now, return None if no target found
+            return None
+            
+        except Exception as e:
+            logger.debug(f"Error getting take profit target for {symbol}: {e}")
+            return None
+    
+    def _check_target_percentage_reached(self, entry_price: float, current_price: float, take_profit: float, side: str) -> bool:
+        """Check if current price has reached X% of distance to take profit target."""
+        try:
+            target_percentage = self._calculate_target_percentage(entry_price, current_price, take_profit, side)
+            return target_percentage >= self.config.target_percentage
+        except Exception as e:
+            logger.error(f"Error checking target percentage: {e}")
+            return False
+    
+    def _calculate_target_percentage(self, entry_price: float, current_price: float, take_profit: float, side: str) -> float:
+        """Calculate what percentage of the distance to target has been reached."""
+        try:
+            if side == 'long':
+                # Long: target is above entry
+                total_distance = take_profit - entry_price
+                current_distance = current_price - entry_price
+            else:
+                # Short: target is below entry  
+                total_distance = entry_price - take_profit
+                current_distance = entry_price - current_price
+            
+            if total_distance <= 0:
+                return 0.0
+            
+            percentage = (current_distance / total_distance) * 100
+            return max(0.0, percentage)  # Don't return negative percentages
+            
+        except Exception as e:
+            logger.error(f"Error calculating target percentage: {e}")
+            return 0.0
+    
+    async def _apply_trailing_stop(self, symbol: str, position_data: Dict[str, Any], current_value: float, threshold_type: str) -> bool:
         """Apply trailing stop (set stop loss to break-even) for a position."""
         try:
             # Get position details
@@ -196,7 +280,7 @@ class PnLTrailingStopManager:
             logger.info(f"   Side: {side.upper()}")
             logger.info(f"   Entry Price: ${entry_price:.4f}")
             logger.info(f"   Current Price: ${current_price:.4f}")
-            logger.info(f"   PnL: {current_pnl_pct:.2f}%")
+            logger.info(f"   {threshold_type}: {current_value:.2f}%")
             logger.info(f"   Stop Loss: ${stop_loss_price:.4f}")
             
             # Apply the stop loss using the trading stop API
@@ -214,7 +298,7 @@ class PnLTrailingStopManager:
                     from src.main import sheets_service
                     if sheets_service:
                         # Add a note to the trade journal about the trailing stop activation
-                        note = f"PnL Trailing Stop activated at {current_pnl_pct:.2f}% profit - SL set to break-even at ${stop_loss_price:.4f}"
+                        note = f"PnL Trailing Stop activated at {current_value:.2f}% {threshold_type} - SL set to break-even at ${stop_loss_price:.4f}"
                         # This would require a method to add notes to existing trades
                         # sheets_service.add_trade_note(symbol, note)
                         logger.debug(f"Note for journal: {note}")
@@ -236,7 +320,9 @@ class PnLTrailingStopManager:
         return {
             "enabled": self.config.enabled,
             "monitoring_active": self.monitoring_active,
-            "pnl_threshold_percentage": self.config.pnl_threshold_percentage,
+            "target_percentage": self.config.target_percentage,
+            "fallback_pnl_percentage": self.config.fallback_pnl_percentage,
+            "fallback_to_pnl": self.config.fallback_to_pnl,
             "break_even_offset": self.config.break_even_offset,
             "monitoring_interval_seconds": self.config.monitoring_interval_seconds,
             "adjusted_positions_count": len(self.adjusted_positions),

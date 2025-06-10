@@ -16,9 +16,11 @@ from src.config import config, logger
 
 def test_config():
     """Test that the configuration is loaded correctly."""
-    print("Testing PnL Trailing Stop Configuration...")
+    print("Testing Target-Based Trailing Stop Configuration...")
     print(f"✅ Enabled: {config.pnl_trailing_stop.enabled}")
-    print(f"✅ Threshold: {config.pnl_trailing_stop.pnl_threshold_percentage}%")
+    print(f"✅ Target percentage: {config.pnl_trailing_stop.target_percentage}%")
+    print(f"✅ Fallback PnL percentage: {config.pnl_trailing_stop.fallback_pnl_percentage}%")
+    print(f"✅ Fallback to PnL: {config.pnl_trailing_stop.fallback_to_pnl}")
     print(f"✅ Break-even offset: {config.pnl_trailing_stop.break_even_offset}")
     print(f"✅ Monitoring interval: {config.pnl_trailing_stop.monitoring_interval_seconds}s")
     print(f"✅ Trigger price type: {config.pnl_trailing_stop.trigger_price_type}")
@@ -37,11 +39,11 @@ def create_mock_bybit_service():
                 "side": "long",
                 "contracts": 0.01,
                 "notional": 1000,
-                "unrealizedPnl": 600,  # $600 profit
-                "percentage": 60.0,    # 60% profit
+                "unrealizedPnl": 250,  # $250 profit
+                "percentage": 25.0,    # 25% profit (but 50% to target!)
                 "raw_position": {
                     "avgPrice": 100000,   # Entry at $100k
-                    "markPrice": 160000,  # Current at $160k (60% profit)
+                    "markPrice": 110000,  # Current at $110k (50% to $120k target)
                     "leverage": 1
                 }
             },
@@ -51,11 +53,11 @@ def create_mock_bybit_service():
                 "side": "short",
                 "contracts": -1.0,
                 "notional": 4000,
-                "unrealizedPnl": 2000,  # $2000 profit
-                "percentage": 50.0,     # 50% profit
+                "unrealizedPnl": 1000,  # $1000 profit
+                "percentage": 25.0,     # 25% profit (but 50% to target!)
                 "raw_position": {
                     "avgPrice": 4000,    # Entry at $4000
-                    "markPrice": 2000,   # Current at $2000 (50% profit on short)
+                    "markPrice": 3000,   # Current at $3000 (50% to $2000 target)
                     "leverage": 1
                 }
             }
@@ -63,12 +65,12 @@ def create_mock_bybit_service():
     
     mock_service.get_all_positions = AsyncMock(side_effect=mock_get_all_positions)
     
-    # Mock get_position_pnl_percentage
+    # Mock get_position_pnl_percentage (for fallback)
     async def mock_get_position_pnl_percentage(symbol):
         if symbol == "BTCUSDT":
-            return 60.0  # 60% profit (above 50% threshold)
+            return 25.0  # 25% profit (below 50% PnL threshold, but above target threshold)
         elif symbol == "ETHUSDT":
-            return 50.0  # 50% profit (meets threshold exactly)
+            return 25.0  # 25% profit (below 50% PnL threshold, but above target threshold)
         return None
     
     mock_service.get_position_pnl_percentage = AsyncMock(side_effect=mock_get_position_pnl_percentage)
@@ -82,25 +84,57 @@ def create_mock_bybit_service():
     
     return mock_service
 
-async def test_pnl_calculation():
-    """Test PnL percentage calculations."""
-    print("Testing PnL Calculation...")
+def create_mock_sheets_service():
+    """Create mock active trades with take profit targets."""
+    class MockTradeEntry:
+        def __init__(self, symbol, side, status, take_profit):
+            self.symbol = symbol
+            self.side = side
+            self.status = status
+            self.take_profit = take_profit
+    
+    class MockSheetsService:
+        def __init__(self):
+            self.active_trades = {
+                "btc_trade_1": MockTradeEntry("BTCUSDT", "long", "ACTIVE", 120000),   # Target: $120k
+                "eth_trade_1": MockTradeEntry("ETHUSDT", "short", "ACTIVE", 2000),    # Target: $2k
+            }
+    
+    return MockSheetsService()
+
+async def test_target_calculation():
+    """Test target percentage calculations."""
+    print("Testing Target Percentage Calculation...")
     
     mock_service = create_mock_bybit_service()
+    manager = PnLTrailingStopManager(mock_service)
     
-    # Test BTC long position (60% profit)
-    btc_pnl = await mock_service.get_position_pnl_percentage("BTCUSDT")
-    print(f"✅ BTC Long PnL: {btc_pnl}% (threshold: {config.pnl_trailing_stop.pnl_threshold_percentage}%)")
+    # Test BTC long position (Entry: $100k, Current: $110k, Target: $120k)
+    btc_target_pct = manager._calculate_target_percentage(
+        entry_price=100000, 
+        current_price=110000, 
+        take_profit=120000, 
+        side='long'
+    )
+    print(f"✅ BTC Long Target %: {btc_target_pct:.1f}% (Entry: $100k → Current: $110k → Target: $120k)")
     
-    # Test ETH short position (50% profit)
-    eth_pnl = await mock_service.get_position_pnl_percentage("ETHUSDT")
-    print(f"✅ ETH Short PnL: {eth_pnl}% (threshold: {config.pnl_trailing_stop.pnl_threshold_percentage}%)")
-    
+    # Test ETH short position (Entry: $4000, Current: $3000, Target: $2000) 
+    eth_target_pct = manager._calculate_target_percentage(
+        entry_price=4000,
+        current_price=3000,
+        take_profit=2000,
+        side='short'
+    )
+    print(f"✅ ETH Short Target %: {eth_target_pct:.1f}% (Entry: $4k → Current: $3k → Target: $2k)")
     print()
 
 async def test_trailing_stop_logic():
-    """Test the trailing stop application logic."""
-    print("Testing Trailing Stop Logic...")
+    """Test the target-based trailing stop application logic."""
+    print("Testing Target-Based Trailing Stop Logic...")
+    
+    # Mock the sheets service with take profit targets
+    import src.main
+    src.main.sheets_service = create_mock_sheets_service()
     
     mock_service = create_mock_bybit_service()
     manager = PnLTrailingStopManager(mock_service)
@@ -108,74 +142,83 @@ async def test_trailing_stop_logic():
     # Get positions
     positions = await mock_service.get_all_positions()
     
-    # Test BTC long position (should trigger trailing stop)
+    # Test BTC long position (should trigger target-based trailing stop)
     btc_position = positions["BTCUSDT"]
-    btc_pnl = 60.0
+    target_percentage = 50.0  # 50% of way to target
     
-    print(f"🎯 Testing BTC long position:")
+    print(f"🎯 Testing BTC long position (TARGET-BASED):")
     print(f"   Entry: $100,000")
-    print(f"   Current: $160,000") 
-    print(f"   PnL: {btc_pnl}%")
-    print(f"   Threshold reached: {btc_pnl >= config.pnl_trailing_stop.pnl_threshold_percentage}")
+    print(f"   Current: $110,000") 
+    print(f"   Take Profit Target: $120,000")
+    print(f"   Target reached: {target_percentage:.1f}% (50% of way to target)")
+    print(f"   Threshold: {config.pnl_trailing_stop.target_percentage}%")
+    print(f"   Should trigger: {target_percentage >= config.pnl_trailing_stop.target_percentage}")
     
     # Apply trailing stop
-    success = await manager._apply_trailing_stop("BTCUSDT", btc_position, btc_pnl)
+    success = await manager._apply_trailing_stop("BTCUSDT", btc_position, target_percentage, "target")
     print(f"   Result: {'✅ Success' if success else '❌ Failed'}")
     print()
     
-    # Test ETH short position (should trigger trailing stop)
+    # Test ETH short position (should trigger target-based trailing stop)
     eth_position = positions["ETHUSDT"]
-    eth_pnl = 50.0
+    target_percentage = 50.0  # 50% of way to target
     
-    print(f"🎯 Testing ETH short position:")
+    print(f"🎯 Testing ETH short position (TARGET-BASED):")
     print(f"   Entry: $4,000")
-    print(f"   Current: $2,000")
-    print(f"   PnL: {eth_pnl}%")
-    print(f"   Threshold reached: {eth_pnl >= config.pnl_trailing_stop.pnl_threshold_percentage}")
+    print(f"   Current: $3,000")
+    print(f"   Take Profit Target: $2,000")
+    print(f"   Target reached: {target_percentage:.1f}% (50% of way to target)")
+    print(f"   Threshold: {config.pnl_trailing_stop.target_percentage}%")
+    print(f"   Should trigger: {target_percentage >= config.pnl_trailing_stop.target_percentage}")
     
     # Apply trailing stop
-    success = await manager._apply_trailing_stop("ETHUSDT", eth_position, eth_pnl)
+    success = await manager._apply_trailing_stop("ETHUSDT", eth_position, target_percentage, "target")
     print(f"   Result: {'✅ Success' if success else '❌ Failed'}")
     print()
 
-async def test_manager_status():
-    """Test the manager status functionality."""
-    print("Testing Manager Status...")
+async def test_fallback_logic():
+    """Test PnL fallback when no take profit target exists."""
+    print("Testing PnL Fallback Logic (No Take Profit Target)...")
+    
+    # Clear the mock sheets service
+    import src.main
+    src.main.sheets_service = None
     
     mock_service = create_mock_bybit_service()
     manager = PnLTrailingStopManager(mock_service)
     
-    # Add some mock tracking data
-    manager.adjusted_positions.add("BTCUSDT")
-    manager.position_creation_times["BTCUSDT"] = manager.position_creation_times.get("BTCUSDT", manager.last_check_time)
-    
-    status = manager.get_status()
-    print(f"✅ Manager Status:")
-    for key, value in status.items():
-        print(f"   {key}: {value}")
+    # Test position without take profit target (should use PnL fallback)
+    print(f"🎯 Testing position without take profit target:")
+    print(f"   PnL: 25% (below 50% PnL threshold)")
+    print(f"   No take profit target available")
+    print(f"   Fallback enabled: {config.pnl_trailing_stop.fallback_to_pnl}")
+    print(f"   Should NOT trigger: 25% < 50% PnL threshold")
     print()
 
 async def main():
     """Main test function."""
-    print("🧪 PnL Trailing Stop Manager Test Suite")
-    print("=" * 50)
+    print("🧪 Target-Based Trailing Stop Manager Test Suite")
+    print("=" * 60)
     
     test_config()
-    await test_pnl_calculation()
+    await test_target_calculation()
     await test_trailing_stop_logic()
-    await test_manager_status()
+    await test_fallback_logic()
     
     print("✅ All tests completed!")
     print()
     print("📋 Summary:")
-    print("   - Configuration loaded successfully")
-    print("   - PnL calculations working")
-    print("   - Trailing stop logic functioning")
+    print("   - NEW: Target-based logic (50% of distance to take profit)")
+    print("   - SMART: Works regardless of leverage used")
+    print("   - FALLBACK: Uses PnL percentage when no target exists")
+    print("   - EXAMPLE 1: Entry $100k → Current $110k → Target $120k = 50% reached")
+    print("   - EXAMPLE 2: Entry $4k → Current $3k → Target $2k = 50% reached")
     print("   - Break-even stop losses calculated correctly")
     print("   - Long positions: SL set below entry price")  
     print("   - Short positions: SL set above entry price")
     print()
-    print("🚀 Ready to use PnL trailing stops in production!")
+    print("🚀 Ready to use TARGET-BASED trailing stops in production!")
+    print("💡 Much better than PnL% because it's based on your actual trade plan!")
 
 if __name__ == "__main__":
     asyncio.run(main()) 

@@ -82,12 +82,14 @@ class RiskManagementConfig(BaseModel):
 class PnLTrailingStopConfig(BaseModel):
     """Configuration for PnL-based trailing stop functionality."""
     enabled: bool = Field(True, description="Enable PnL-based trailing stop")
-    pnl_threshold_percentage: float = Field(50.0, description="PnL percentage threshold to trigger trailing stop (default: 50%)")
+    target_percentage: float = Field(50.0, description="Percentage of distance to take profit target to trigger trailing stop (default: 50%)")
     break_even_offset: float = Field(0.0, description="Offset from entry price for break-even stop (in price units)")
-    monitoring_interval_seconds: int = Field(60, description="How often to check positions for PnL threshold (default: 60 seconds)")
+    monitoring_interval_seconds: int = Field(60, description="How often to check positions for target threshold (default: 60 seconds)")
     trigger_price_type: Literal["LastPrice", "MarkPrice", "IndexPrice"] = Field("LastPrice", description="Price type for stop loss trigger")
     max_adjustments_per_position: int = Field(1, description="Maximum number of stop loss adjustments per position")
     min_position_age_minutes: int = Field(5, description="Minimum position age before applying trailing stop (minutes)")
+    fallback_to_pnl: bool = Field(True, description="If no take profit target, fallback to PnL percentage")
+    fallback_pnl_percentage: float = Field(50.0, description="PnL percentage to use when no take profit target exists")
 
 
 class LoggingConfig(BaseModel):

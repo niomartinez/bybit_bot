@@ -627,13 +627,14 @@ async def get_positions_with_pnl():
             positions_with_pnl[symbol] = {
                 "position_data": position_data,
                 "pnl_percentage": pnl_percentage,
-                "threshold_reached": pnl_percentage >= config.pnl_trailing_stop.pnl_threshold_percentage if pnl_percentage is not None else False,
+                "threshold_reached": pnl_percentage >= config.pnl_trailing_stop.target_percentage if pnl_percentage is not None else False,
                 "already_adjusted": symbol in pnl_trailing_stop_manager.adjusted_positions
             }
         
         return {
             "positions": positions_with_pnl,
-            "threshold_percentage": config.pnl_trailing_stop.pnl_threshold_percentage,
+            "target_percentage": config.pnl_trailing_stop.target_percentage,
+            "fallback_pnl_percentage": config.pnl_trailing_stop.fallback_pnl_percentage,
             "total_positions": len(positions),
             "positions_above_threshold": len([p for p in positions_with_pnl.values() if p["threshold_reached"]])
         }

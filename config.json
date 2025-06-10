@@ -15,12 +15,14 @@
   },
   "pnl_trailing_stop": {
     "enabled": true,
-    "pnl_threshold_percentage": 50.0,
+    "target_percentage": 50.0,
     "break_even_offset": 0.0,
     "monitoring_interval_seconds": 60,
     "trigger_price_type": "LastPrice",
     "max_adjustments_per_position": 1,
-    "min_position_age_minutes": 5
+    "min_position_age_minutes": 1,
+    "fallback_to_pnl": true,
+    "fallback_pnl_percentage": 50.0
   },
   "multi_strategy": {
     "enabled": true,
