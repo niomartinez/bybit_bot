@@ -10,8 +10,17 @@
   },
   "risk_management": {
     "var_type": "fixed_amount",
-    "var_value": 2,
+    "var_value": 1,
     "portfolio_currency": "USDT"
+  },
+  "pnl_trailing_stop": {
+    "enabled": true,
+    "pnl_threshold_percentage": 50.0,
+    "break_even_offset": 0.0,
+    "monitoring_interval_seconds": 60,
+    "trigger_price_type": "LastPrice",
+    "max_adjustments_per_position": 1,
+    "min_position_age_minutes": 5
   },
   "multi_strategy": {
     "enabled": true,

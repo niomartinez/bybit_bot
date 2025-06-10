@@ -79,6 +79,17 @@ class RiskManagementConfig(BaseModel):
     portfolio_currency: str = "USDT"
 
 
+class PnLTrailingStopConfig(BaseModel):
+    """Configuration for PnL-based trailing stop functionality."""
+    enabled: bool = Field(True, description="Enable PnL-based trailing stop")
+    pnl_threshold_percentage: float = Field(50.0, description="PnL percentage threshold to trigger trailing stop (default: 50%)")
+    break_even_offset: float = Field(0.0, description="Offset from entry price for break-even stop (in price units)")
+    monitoring_interval_seconds: int = Field(60, description="How often to check positions for PnL threshold (default: 60 seconds)")
+    trigger_price_type: Literal["LastPrice", "MarkPrice", "IndexPrice"] = Field("LastPrice", description="Price type for stop loss trigger")
+    max_adjustments_per_position: int = Field(1, description="Maximum number of stop loss adjustments per position")
+    min_position_age_minutes: int = Field(5, description="Minimum position age before applying trailing stop (minutes)")
+
+
 class LoggingConfig(BaseModel):
     """Configuration for logging."""
     level: str
@@ -109,6 +120,7 @@ class BotConfig(BaseModel):
     server: ServerConfig
     bybit_api: BybitApiConfig
     risk_management: RiskManagementConfig
+    pnl_trailing_stop: Optional[PnLTrailingStopConfig] = Field(default_factory=PnLTrailingStopConfig)
     multi_strategy: Optional[MultiStrategyConfig] = None
     logging: LoggingConfig 
     google_sheets: Optional[Dict[str, Any]] = None

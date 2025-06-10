@@ -1863,4 +1863,162 @@ class BybitService:
             
         except Exception as e:
             logger.error(f"Error fetching trade history for {symbol}: {e}")
-            return [] 
+            return []
+    
+    async def set_trading_stop(
+        self, 
+        symbol: str, 
+        take_profit: Optional[float] = None,
+        stop_loss: Optional[float] = None,
+        trailing_stop: Optional[float] = None,
+        tp_trigger_by: str = "LastPrice",
+        sl_trigger_by: str = "LastPrice",
+        position_idx: int = 0
+    ) -> Dict[str, Any]:
+        """
+        Set trading stop (TP/SL/Trailing Stop) for a position.
+        
+        Args:
+            symbol (str): Symbol to set trading stop for (e.g., 'BTCUSDT')
+            take_profit (Optional[float]): Take profit price (None to cancel TP)
+            stop_loss (Optional[float]): Stop loss price (None to cancel SL) 
+            trailing_stop (Optional[float]): Trailing stop distance (None to cancel TS)
+            tp_trigger_by (str): TP trigger price type ("LastPrice", "MarkPrice", "IndexPrice")
+            sl_trigger_by (str): SL trigger price type ("LastPrice", "MarkPrice", "IndexPrice")
+            position_idx (int): Position index (0 for one-way mode, 1 for long, 2 for short in hedge mode)
+        
+        Returns:
+            Dict[str, Any]: API response
+        """
+        try:
+            # Get market ID for the symbol
+            market_id = self.get_market_id(symbol, 'linear')
+            
+            # Prepare parameters for Bybit V5 API
+            params = {
+                'category': 'linear',
+                'symbol': symbol.replace('/', '').upper(),  # Remove any slashes, ensure uppercase
+                'positionIdx': position_idx
+            }
+            
+            # Add trading stop parameters if provided
+            if take_profit is not None:
+                if take_profit <= 0:
+                    params['takeProfit'] = "0"  # Cancel TP
+                else:
+                    params['takeProfit'] = str(take_profit)
+                    params['tpTriggerBy'] = tp_trigger_by
+            
+            if stop_loss is not None:
+                if stop_loss <= 0:
+                    params['stopLoss'] = "0"  # Cancel SL
+                else:
+                    params['stopLoss'] = str(stop_loss)
+                    params['slTriggerBy'] = sl_trigger_by
+            
+            if trailing_stop is not None:
+                if trailing_stop <= 0:
+                    params['trailingStop'] = "0"  # Cancel TS
+                else:
+                    params['trailingStop'] = str(trailing_stop)
+            
+            logger.info(f"Setting trading stop for {symbol}: TP={take_profit}, SL={stop_loss}, TS={trailing_stop}")
+            
+            # Make the API call using CCXT's private API method
+            try:
+                response = self.exchange.privatePostV5PositionTradingStop(params)
+                logger.info(f"✅ Successfully set trading stop for {symbol}")
+                return {
+                    'success': True,
+                    'response': response,
+                    'params': params
+                }
+                
+            except ccxt.ExchangeError as e:
+                error_msg = str(e)
+                logger.error(f"Exchange error setting trading stop for {symbol}: {error_msg}")
+                
+                # Handle specific Bybit error codes
+                if "110001" in error_msg:
+                    return {'success': False, 'error': 'User ID is invalid'}
+                elif "110003" in error_msg:
+                    return {'success': False, 'error': 'Invalid API key'}
+                elif "110012" in error_msg:
+                    return {'success': False, 'error': 'Invalid symbol'}
+                elif "110025" in error_msg:
+                    return {'success': False, 'error': 'Position does not exist'}
+                elif "110058" in error_msg:
+                    return {'success': False, 'error': 'Insufficient position size for TP/SL'}
+                else:
+                    return {'success': False, 'error': f"Exchange error: {error_msg}"}
+                    
+        except Exception as e:
+            logger.error(f"Error setting trading stop for {symbol}: {e}")
+            return {'success': False, 'error': str(e)}
+    
+    async def get_position_pnl_percentage(self, symbol: str, leverage: Optional[float] = None) -> Optional[float]:
+        """
+        Calculate PnL percentage for a position considering leverage.
+        
+        Args:
+            symbol (str): Symbol to check (e.g., 'BTCUSDT')
+            leverage (Optional[float]): Position leverage (will fetch if not provided)
+        
+        Returns:
+            Optional[float]: PnL percentage considering leverage, None if no position
+        """
+        try:
+            # Get current positions
+            positions = await self.get_all_positions()
+            
+            # Normalize symbol for lookup
+            symbol_clean = symbol.replace('.P', '').replace('/', '').upper()
+            
+            position = positions.get(symbol_clean)
+            if not position:
+                logger.debug(f"No position found for {symbol_clean}")
+                return None
+            
+            # Get position data
+            unrealized_pnl = float(position.get('unrealizedPnl', 0))
+            notional = float(position.get('notional', 0))
+            size = float(position.get('size', 0))
+            
+            if unrealized_pnl == 0 or size == 0:
+                return 0.0
+            
+            # If leverage not provided, try to get it from position or use default
+            if leverage is None:
+                # Try to get leverage from position data
+                leverage = float(position.get('raw_position', {}).get('leverage', 1))
+                if leverage <= 0:
+                    leverage = 1  # Default to 1x if can't determine
+            
+            # Calculate PnL percentage with leverage consideration
+            # Method 1: Using unrealized PnL and notional value
+            if notional > 0:
+                pnl_percentage = (unrealized_pnl / notional) * 100 * leverage
+            else:
+                # Method 2: Fallback calculation
+                # Get current price and entry price from position
+                raw_pos = position.get('raw_position', {})
+                entry_price = float(raw_pos.get('avgPrice', 0))
+                mark_price = float(raw_pos.get('markPrice', 0))
+                
+                if entry_price > 0 and mark_price > 0:
+                    price_change_pct = ((mark_price - entry_price) / entry_price) * 100
+                    pnl_percentage = price_change_pct * leverage
+                    
+                    # Adjust for short positions (invert the percentage)
+                    side = position.get('side', '').lower()
+                    if side == 'short':
+                        pnl_percentage = -pnl_percentage
+                else:
+                    return None
+            
+            logger.debug(f"Position {symbol_clean}: PnL={unrealized_pnl}, Notional={notional}, Leverage={leverage}x, PnL%={pnl_percentage:.2f}%")
+            return pnl_percentage
+            
+        except Exception as e:
+            logger.error(f"Error calculating PnL percentage for {symbol}: {e}")
+            return None

@@ -13,12 +13,14 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from datetime import datetime, timezone
+from typing import Optional
 
 from src.models import TradingViewSignal, SheetsConfig
 from src.signal_processor import SignalProcessor
 from src.bybit_service import BybitService
 from src.session_manager import SilverBulletSessionManager
 from src.sheets_service import SheetsService
+from src.pnl_trailing_stop_manager import PnLTrailingStopManager
 from src.config import config, logger
 
 # Create FastAPI app
@@ -41,6 +43,7 @@ app.add_middleware(
 signal_processor: SignalProcessor = None
 session_manager: SilverBulletSessionManager = None
 sheets_service: SheetsService = None
+pnl_trailing_stop_manager: PnLTrailingStopManager = None
 monitoring_active = False
 
 def get_credentials_from_env():
@@ -389,7 +392,7 @@ async def monitor_trade_lifecycle():
 @app.on_event("startup")
 async def startup_event():
     """Initialize services on startup."""
-    global signal_processor, session_manager, sheets_service
+    global signal_processor, session_manager, sheets_service, pnl_trailing_stop_manager
     
     try:
         logger.info("Starting Bybit Trading Bot...")
@@ -402,6 +405,9 @@ async def startup_event():
         
         # Initialize Google Sheets service
         sheets_service = await initialize_sheets_service()
+        
+        # Initialize PnL Trailing Stop Manager
+        pnl_trailing_stop_manager = PnLTrailingStopManager(signal_processor.bybit_service)
         
         # Connect sheets service to signal processor
         if sheets_service and signal_processor:
@@ -418,6 +424,11 @@ async def startup_event():
             asyncio.create_task(monitor_trade_lifecycle())
             logger.info("📊 Trade lifecycle monitoring started")
         
+        # Start PnL trailing stop monitoring
+        if pnl_trailing_stop_manager:
+            asyncio.create_task(pnl_trailing_stop_manager.start_monitoring())
+            logger.info("💰 PnL trailing stop monitoring started")
+        
     except Exception as e:
         logger.error(f"Failed to initialize services: {e}")
         raise
@@ -425,9 +436,14 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     """Cleanup on shutdown."""
-    global monitoring_active
+    global monitoring_active, pnl_trailing_stop_manager
     logger.info("Shutting down Bybit Trading Bot...")
     monitoring_active = False
+    
+    # Stop PnL trailing stop monitoring
+    if pnl_trailing_stop_manager:
+        pnl_trailing_stop_manager.stop_monitoring()
+        logger.info("💰 PnL trailing stop monitoring stopped")
 
 # Health check endpoint
 @app.get("/health")
@@ -440,7 +456,9 @@ async def health_check():
             "signal_processor": signal_processor is not None,
             "session_manager": session_manager is not None,
             "sheets_service": sheets_service is not None,
-            "trade_monitoring": monitoring_active
+            "pnl_trailing_stop_manager": pnl_trailing_stop_manager is not None,
+            "trade_monitoring": monitoring_active,
+            "pnl_monitoring": pnl_trailing_stop_manager.monitoring_active if pnl_trailing_stop_manager else False
         }
     }
 
@@ -539,6 +557,88 @@ async def test_sheets_integration():
         return {"success": True, "result": result}
     except Exception as e:
         logger.error(f"Sheets test failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# PnL Trailing Stop endpoints
+@app.get("/pnl-trailing-stop/status")
+async def get_pnl_trailing_stop_status():
+    """Get current status of PnL trailing stop manager."""
+    if not pnl_trailing_stop_manager:
+        raise HTTPException(status_code=503, detail="PnL trailing stop manager not initialized")
+    
+    return pnl_trailing_stop_manager.get_status()
+
+@app.post("/pnl-trailing-stop/start")
+async def start_pnl_monitoring():
+    """Manually start PnL trailing stop monitoring."""
+    if not pnl_trailing_stop_manager:
+        raise HTTPException(status_code=503, detail="PnL trailing stop manager not initialized")
+    
+    try:
+        # Start monitoring in background if not already running
+        if not pnl_trailing_stop_manager.monitoring_active:
+            asyncio.create_task(pnl_trailing_stop_manager.start_monitoring())
+            return {"success": True, "message": "PnL trailing stop monitoring started"}
+        else:
+            return {"success": True, "message": "PnL trailing stop monitoring already active"}
+    except Exception as e:
+        logger.error(f"Failed to start PnL monitoring: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/pnl-trailing-stop/stop")
+async def stop_pnl_monitoring():
+    """Manually stop PnL trailing stop monitoring."""
+    if not pnl_trailing_stop_manager:
+        raise HTTPException(status_code=503, detail="PnL trailing stop manager not initialized")
+    
+    try:
+        pnl_trailing_stop_manager.stop_monitoring()
+        return {"success": True, "message": "PnL trailing stop monitoring stopped"}
+    except Exception as e:
+        logger.error(f"Failed to stop PnL monitoring: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/pnl-trailing-stop/reset")
+async def reset_pnl_tracking(symbol: Optional[str] = None):
+    """Reset PnL trailing stop tracking for a specific symbol or all symbols."""
+    if not pnl_trailing_stop_manager:
+        raise HTTPException(status_code=503, detail="PnL trailing stop manager not initialized")
+    
+    try:
+        pnl_trailing_stop_manager.reset_position_tracking(symbol)
+        message = f"Reset tracking for {symbol}" if symbol else "Reset tracking for all positions"
+        return {"success": True, "message": message}
+    except Exception as e:
+        logger.error(f"Failed to reset PnL tracking: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/pnl-trailing-stop/positions")
+async def get_positions_with_pnl():
+    """Get all positions with their current PnL percentages."""
+    if not pnl_trailing_stop_manager:
+        raise HTTPException(status_code=503, detail="PnL trailing stop manager not initialized")
+    
+    try:
+        positions = await pnl_trailing_stop_manager.bybit_service.get_all_positions()
+        positions_with_pnl = {}
+        
+        for symbol, position_data in positions.items():
+            pnl_percentage = await pnl_trailing_stop_manager.bybit_service.get_position_pnl_percentage(symbol)
+            positions_with_pnl[symbol] = {
+                "position_data": position_data,
+                "pnl_percentage": pnl_percentage,
+                "threshold_reached": pnl_percentage >= config.pnl_trailing_stop.pnl_threshold_percentage if pnl_percentage is not None else False,
+                "already_adjusted": symbol in pnl_trailing_stop_manager.adjusted_positions
+            }
+        
+        return {
+            "positions": positions_with_pnl,
+            "threshold_percentage": config.pnl_trailing_stop.pnl_threshold_percentage,
+            "total_positions": len(positions),
+            "positions_above_threshold": len([p for p in positions_with_pnl.values() if p["threshold_reached"]])
+        }
+    except Exception as e:
+        logger.error(f"Failed to get positions with PnL: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # Trading webhook endpoint

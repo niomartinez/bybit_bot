@@ -1,6 +1,6 @@
 //@version=6
 // © nioboi
-strategy("ICT Silver Bullet Strategy", overlay=true, max_bars_back=5000, max_lines_count=500, max_labels_count=500, max_boxes_count=500, default_qty_type=strategy.percent_of_equity, default_qty_value=10, initial_capital=10000, currency=currency.USD, pyramiding=10)
+strategy("ICT Silver Bullet [THE ASCENT]", overlay=true, max_bars_back=5000, max_lines_count=500, max_labels_count=500, max_boxes_count=500, default_qty_type=strategy.percent_of_equity, default_qty_value=10, initial_capital=10000, currency=currency.USD, pyramiding=1)
 
 //================ IMPORT LIBRARIES ================ courtesy of @TFlab
 //import Order Block Refiner
@@ -31,8 +31,7 @@ SFVGShow = input.bool(true, 'Show Supply FVG', group='FVG Settings')
 showSB = input.bool(true, 'Show SB session', inline='SB', group='Silver Bullet Session')
 col_SB = input.color(#b2b5be50, '', inline='SB', group='Silver Bullet Session')
 
-// Trade Management Settings
-max_pyramiding = input.int(3, 'Max Pyramiding Trades', minval=1, maxval=10, group='Trade Management', tooltip='Maximum number of same-direction trades allowed per session')
+// Trade Management Settings (Pyramiding Removed - Only 1 trade per direction)
 
 // Entry Settings
 entry_method = input.string('Proximal', 'Entry Level', options=['Proximal', '50% OB', 'Distal'], group='Entry Settings', tooltip='Determines where to place limit orders within the Fair Value Gap')
@@ -44,6 +43,10 @@ atr_multiplier = input.float(2.0, 'ATR Multiplier', minval=0.1, step=0.1, group=
 
 // Take Profit Settings
 risk_reward_ratio = input.float(2.0, 'Risk:Reward Ratio', minval=0.1, step=0.1, group='Take Profit Settings')
+
+// Breakeven Settings
+enable_breakeven = input.bool(true, 'Enable Breakeven Stop Loss', group='Breakeven Settings', tooltip='Move stop loss to breakeven when price reaches halfway to take profit')
+breakeven_buffer_pips = input.float(2.0, 'Breakeven Buffer (Pips)', minval=0.0, step=0.1, group='Breakeven Settings', tooltip='Additional pips beyond entry price to account for fees')
 
 // Display Settings
 show_trade_levels = input.bool(true, 'Show Entry/SL/TP Levels', group='Display Settings')
@@ -90,17 +93,27 @@ type OrderVisuals
     label sl_label
     label tp_label
 
+//================ BREAKEVEN TRACKING TYPE ================
+type BreakevenTracker
+    string trade_id
+    float entry_price
+    float original_stop
+    float take_profit
+    float halfway_price
+    bool is_long
+    bool breakeven_triggered
+
 //================ SESSION TRACKING VARIABLES ================
 var bool sessionActive = false
 var FVG_Data[] untapped_fvgs = array.new<FVG_Data>()
 var int sessionStartBar = 0
-var int current_long_trades = 0
-var int current_short_trades = 0
 var bool was_in_position_last_bar = false
 var int cancelled_orders_count = 0
 var OrderStatus[] tracked_orders = array.new<OrderStatus>()
 var OrderVisuals[] active_order_visuals = array.new<OrderVisuals>()
+var BreakevenTracker breakeven_tracker = na
 var int trade_counter = 0
+var bool has_pending_order = false
 
 // Reset session tracking when new session starts
 if strSB
@@ -108,9 +121,8 @@ if strSB
     sessionStartBar := bar_index
     // Clear previous session FVGs
     array.clear(untapped_fvgs)
-    current_long_trades := 0
-    current_short_trades := 0
     trade_counter := 0  // Reset trade counter for new session
+    has_pending_order := false  // Reset pending order flag
     
     // Clean up old order tracking data from previous sessions
     // Keep only pending orders that might still be relevant
@@ -128,8 +140,9 @@ if strSB
 if endSB
     sessionActive := false
     array.clear(untapped_fvgs)
-    current_long_trades := 0
-    current_short_trades := 0
+    
+    // DON'T clear breakeven tracker - keep it active even after session ends
+    // breakeven_tracker := na  // REMOVED - let it continue managing the position
     
     // Smart cancellation: only cancel orders that are still "pending"
     var string[] pending_to_cancel = array.new<string>()
@@ -156,6 +169,7 @@ if endSB
             //         style=label.style_label_left, size=size.tiny)
                          
         cancelled_orders_count := cancelled_orders_count + array.size(pending_to_cancel)
+        has_pending_order := false  // Clear pending order flag when orders are cancelled
         
         // Visual indication of cancelled orders
         // if showSB
@@ -191,16 +205,13 @@ bool just_exited_long = strategy.position_size[1] > 0 and strategy.position_size
 bool just_exited_short = strategy.position_size[1] < 0 and strategy.position_size == 0
 bool currently_in_position = strategy.position_size != 0
 
-// Update position counters
-if strategy.position_size > 0 and strategy.position_size[1] <= 0
-    current_long_trades := current_long_trades + 1
-    
-if strategy.position_size < 0 and strategy.position_size[1] >= 0
-    current_short_trades := current_short_trades + 1
+// Position counters removed - single trade only
 
 // Update order status when positions change (orders get filled)
 if strategy.position_size != strategy.position_size[1]
     // Position changed - check if any pending orders got filled
+    has_pending_order := false  // Clear pending order flag when position changes
+    
     if array.size(tracked_orders) > 0
         for i = 0 to array.size(tracked_orders) - 1
             tracked_order = array.get(tracked_orders, i)
@@ -294,11 +305,11 @@ findNextFVG(preferBullish) =>
     result
 
 //================ TRADE EXECUTION LOGIC ================
-// Check if we can enter a long trade
-canEnterLong = sessionActive and current_long_trades < max_pyramiding and strategy.position_size >= 0
+// Check if we can enter a long trade (no position and no pending orders)
+canEnterLong = sessionActive and strategy.position_size == 0 and not has_pending_order
 
-// Check if we can enter a short trade  
-canEnterShort = sessionActive and current_short_trades < max_pyramiding and strategy.position_size <= 0
+// Check if we can enter a short trade (no position and no pending orders)
+canEnterShort = sessionActive and strategy.position_size == 0 and not has_pending_order
 
 // Function to execute trade
 executeTrade(fvg, direction, tradeId) =>
@@ -319,7 +330,7 @@ executeTrade(fvg, direction, tradeId) =>
     
     // Enter trade
     if direction == "Long"
-        strategy.entry(tradeId, strategy.long, limit=entryPrice, comment="SB Long #" + str.tostring(current_long_trades + 1))
+        strategy.entry(tradeId, strategy.long, limit=entryPrice, comment="SB Long")
         
         // Alert for long limit order
         alert('{"symbol":"' + syminfo.ticker + 
@@ -333,7 +344,7 @@ executeTrade(fvg, direction, tradeId) =>
               '"priority":"1",' +
               '"strategy_id":"silver_bullet"}', alert.freq_once_per_bar_close)
     else
-        strategy.entry(tradeId, strategy.short, limit=entryPrice, comment="SB Short #" + str.tostring(current_short_trades + 1))
+        strategy.entry(tradeId, strategy.short, limit=entryPrice, comment="SB Short")
         
         // Alert for short limit order
         alert('{"symbol":"' + syminfo.ticker + 
@@ -394,6 +405,19 @@ if sessionActive
                 trade_counter := trade_counter + 1
                 tradeId = "Long_" + str.tostring(trade_counter)
                 executeTrade(nextBullFVG, "Long", tradeId)
+                has_pending_order := true  // Mark that we have a pending order
+                
+                // Create breakeven tracker after trade execution
+                if enable_breakeven
+                    entryPrice = getEntryPrice(nextBullFVG.high_price, nextBullFVG.low_price, nextBullFVG.is_bullish)
+                    stopPrice = getStopLoss(entryPrice, nextBullFVG.is_bullish)
+                    tpPrice = getTakeProfit(entryPrice, stopPrice)
+                    halfwayPrice = entryPrice + (tpPrice - entryPrice) / 2
+                    breakeven_tracker := BreakevenTracker.new(tradeId, entryPrice, stopPrice, tpPrice, halfwayPrice, true, false)
+                    
+                    // Debug: Show breakeven setup
+                    debug_text = "BREAKEVEN SETUP\nEntry: " + str.tostring(entryPrice, "#.##") + "\nHalfway: " + str.tostring(halfwayPrice, "#.##") + "\nTP: " + str.tostring(tpPrice, "#.##")
+                    label.new(bar_index + 5, entryPrice, debug_text, color=color.yellow, textcolor=color.black, style=label.style_label_right, size=size.tiny)
     
     if canEnterShort  
         nextBearFVG = findNextFVG(false)
@@ -402,6 +426,19 @@ if sessionActive
                 trade_counter := trade_counter + 1
                 tradeId = "Short_" + str.tostring(trade_counter)
                 executeTrade(nextBearFVG, "Short", tradeId)
+                has_pending_order := true  // Mark that we have a pending order
+                
+                // Create breakeven tracker after trade execution
+                if enable_breakeven
+                    entryPrice = getEntryPrice(nextBearFVG.high_price, nextBearFVG.low_price, nextBearFVG.is_bullish)
+                    stopPrice = getStopLoss(entryPrice, nextBearFVG.is_bullish)
+                    tpPrice = getTakeProfit(entryPrice, stopPrice)
+                    halfwayPrice = entryPrice - (entryPrice - tpPrice) / 2
+                    breakeven_tracker := BreakevenTracker.new(tradeId, entryPrice, stopPrice, tpPrice, halfwayPrice, false, false)
+                    
+                    // Debug: Show breakeven setup
+                    debug_text = "BREAKEVEN SETUP\nEntry: " + str.tostring(entryPrice, "#.##") + "\nHalfway: " + str.tostring(halfwayPrice, "#.##") + "\nTP: " + str.tostring(tpPrice, "#.##")
+                    label.new(bar_index + 5, entryPrice, debug_text, color=color.yellow, textcolor=color.black, style=label.style_label_right, size=size.tiny)
     
     // Check for post-exit opportunities (after TP)
     if just_exited_long and canEnterLong
@@ -410,6 +447,19 @@ if sessionActive
             trade_counter := trade_counter + 1
             tradeId = "Long_" + str.tostring(trade_counter)
             executeTrade(nextBullFVG, "Long", tradeId)
+            has_pending_order := true  // Mark that we have a pending order
+            
+            // Create breakeven tracker after trade execution
+            if enable_breakeven
+                entryPrice = getEntryPrice(nextBullFVG.high_price, nextBullFVG.low_price, nextBullFVG.is_bullish)
+                stopPrice = getStopLoss(entryPrice, nextBullFVG.is_bullish)
+                tpPrice = getTakeProfit(entryPrice, stopPrice)
+                halfwayPrice = entryPrice + (tpPrice - entryPrice) / 2
+                breakeven_tracker := BreakevenTracker.new(tradeId, entryPrice, stopPrice, tpPrice, halfwayPrice, true, false)
+                
+                // Debug: Show breakeven setup
+                debug_text = "BREAKEVEN SETUP\nEntry: " + str.tostring(entryPrice, "#.##") + "\nHalfway: " + str.tostring(halfwayPrice, "#.##") + "\nTP: " + str.tostring(tpPrice, "#.##")
+                label.new(bar_index + 5, entryPrice, debug_text, color=color.yellow, textcolor=color.black, style=label.style_label_right, size=size.tiny)
     
     if just_exited_short and canEnterShort
         nextBearFVG = findNextFVG(false) 
@@ -417,6 +467,19 @@ if sessionActive
             trade_counter := trade_counter + 1
             tradeId = "Short_" + str.tostring(trade_counter)
             executeTrade(nextBearFVG, "Short", tradeId)
+            has_pending_order := true  // Mark that we have a pending order
+            
+            // Create breakeven tracker after trade execution
+            if enable_breakeven
+                entryPrice = getEntryPrice(nextBearFVG.high_price, nextBearFVG.low_price, nextBearFVG.is_bullish)
+                stopPrice = getStopLoss(entryPrice, nextBearFVG.is_bullish)
+                tpPrice = getTakeProfit(entryPrice, stopPrice)
+                halfwayPrice = entryPrice - (entryPrice - tpPrice) / 2
+                breakeven_tracker := BreakevenTracker.new(tradeId, entryPrice, stopPrice, tpPrice, halfwayPrice, false, false)
+                
+                // Debug: Show breakeven setup
+                debug_text = "BREAKEVEN SETUP\nEntry: " + str.tostring(entryPrice, "#.##") + "\nHalfway: " + str.tostring(halfwayPrice, "#.##") + "\nTP: " + str.tostring(tpPrice, "#.##")
+                label.new(bar_index + 5, entryPrice, debug_text, color=color.yellow, textcolor=color.black, style=label.style_label_right, size=size.tiny)
 
 // Function to clean up visuals for completed/cancelled orders
 cleanupOrderVisuals() =>
@@ -470,6 +533,53 @@ cleanupOrderVisuals() =>
 
 // Clean up visuals on each bar
 cleanupOrderVisuals()
+
+//================ BREAKEVEN STOP LOSS MANAGEMENT ================
+if enable_breakeven and not na(breakeven_tracker)
+    // Check if this trade is still active
+    if strategy.position_size != 0
+        // Check if price has reached halfway point and breakeven hasn't been triggered yet
+        if not breakeven_tracker.breakeven_triggered
+            price_reached_halfway = false
+            
+            // Debug: Show we're checking for breakeven every bar (only show occasionally)
+            if bar_index % 10 == 0 and show_trade_labels
+                debug_text = "CHECKING BREAKEVEN\nCurrent: " + str.tostring(close, "#.##") + "\nHalfway: " + str.tostring(breakeven_tracker.halfway_price, "#.##")
+                label.new(bar_index, low - (high - low) * 0.05, debug_text, color=color.gray, textcolor=color.white, style=label.style_label_up, size=size.tiny)
+            
+            if breakeven_tracker.is_long
+                // For long trades, check if high reached halfway price (catches intrabar movements)
+                price_reached_halfway := high >= breakeven_tracker.halfway_price
+            else
+                // For short trades, check if low reached halfway price (catches intrabar movements)
+                price_reached_halfway := low <= breakeven_tracker.halfway_price
+            
+            if price_reached_halfway
+                // Calculate breakeven stop loss with buffer
+                buffer_amount = breakeven_buffer_pips * syminfo.mintick * 10  // Convert pips to price
+                new_stop_loss = breakeven_tracker.is_long ? 
+                               breakeven_tracker.entry_price + buffer_amount : 
+                               breakeven_tracker.entry_price - buffer_amount
+                
+                // IMPORTANT: Cancel the old exit order first, then create new one
+                strategy.cancel(breakeven_tracker.trade_id + "_exit")
+                strategy.exit(breakeven_tracker.trade_id + "_exit_be", breakeven_tracker.trade_id, stop=new_stop_loss, limit=breakeven_tracker.take_profit)
+                
+                // Mark as triggered
+                breakeven_tracker.breakeven_triggered := true
+                
+                // Debug: Always show breakeven activation
+                be_text = "BREAKEVEN ACTIVATED\nOld SL: " + str.tostring(breakeven_tracker.original_stop, "#.##") + "\nNew SL: " + str.tostring(new_stop_loss, "#.##")
+                be_color = breakeven_tracker.is_long ? color.green : color.red
+                label.new(bar_index, new_stop_loss, be_text, color=be_color, textcolor=color.white, style=label.style_label_right, size=size.small)
+        else
+            // Debug: Show that breakeven was already triggered
+            if barstate.islast and show_trade_labels
+                debug_text = "BREAKEVEN\nALREADY ACTIVE"
+                label.new(bar_index, close, debug_text, color=color.blue, textcolor=color.white, style=label.style_label_left, size=size.tiny)
+    else
+        // Position is closed, clear the tracker
+        breakeven_tracker := na
 
 //================ VISUALIZATIONS ================
 // Session lines
@@ -555,7 +665,9 @@ if barstate.islast
     
     table.cell(statsTable, 3, 6, str.tostring(pending_count), text_color=color.yellow, text_size=size.small)
     
-    table.cell(statsTable, 0, 7, "Positions:", text_color=color.white, text_size=size.small)
-    table.cell(statsTable, 1, 7, "L:" + str.tostring(current_long_trades) + " S:" + str.tostring(current_short_trades), text_color=color.white, text_size=size.small)
+    table.cell(statsTable, 0, 7, "Position:", text_color=color.white, text_size=size.small)
+    position_text = strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "NONE"
+    position_color = strategy.position_size > 0 ? color.green : strategy.position_size < 0 ? color.red : color.white
+    table.cell(statsTable, 1, 7, position_text, text_color=position_color, text_size=size.small)
     table.cell(statsTable, 2, 7, "Cancelled:", text_color=color.white, text_size=size.small)
     table.cell(statsTable, 3, 7, str.tostring(cancelled_orders_count), text_color=color.orange, text_size=size.small)
